@@ -7,6 +7,8 @@
 - **默认只用本地 Ollama**：模型和命令都在你自己机器上，不联网
 - **也可以接云端**：像 DSH 一样添加"模型提供商"，填接口地址和 API Key，就能用 DeepSeek / OpenAI / Kimi / 智谱等任何 OpenAI 兼容接口
 
+![图标](icon.png)
+
 ![主界面](screenshot.png)
 
 ![设置 - 模型提供商](screenshot-settings.png)
@@ -300,9 +302,17 @@
 | `build.cmd` | 重新编译 |
 | `src/AhzScribe.cs` | 全部源码（单文件） |
 | `src/app.manifest` | DPI 感知声明（150% 缩放下界面才不会被拉伸模糊） |
+| `src/app.ico` | 程序图标（圆角方块 + 白色 spark，7 个尺寸 16–256） |
+| `devtools/make-icon.cmd` | 重新生成 `src/app.ico`（改了图标设计跑它，再重跑 `build.cmd`） |
+| `创建桌面快捷方式.cmd` | 在桌面放一个带图标的快捷方式 |
+| `devtools/lessons.json` | 踩坑本：同一台机器上做错过的招，下次不重来（自动生成） |
+| `devtools/iterations.json` | 自我迭代记录：每次「申请—批准—执行—回滚」都留痕（自动生成） |
 | `config.json` | 首次运行后生成：提供商、API Key、模型、目录等设置 |
 | `screenshot.png` / `screenshot-chat.png` / `screenshot-settings.png` | 界面预览 |
 | `devtools/bench/run-ui-tests.cmd` | 一键自测（界面流式刷新 + 规矩文件 + 可选真实模型） |
+| `devtools/scorecard/run-scorecard.ps1` | 执行力记分卡（12 题 + 护栏 9 项，跑完自动归档到 `history.csv` 并打印与上次的分差） |
+| `devtools/filelock.cmd` | 查"是谁锁着这个文件"（编译写不进去时用） |
+| `devtools/uiobserve.cmd` | 不看像素看控件树：`tree` / `inside` / `popovers` / `shot` |
 | `python-version/` | 最早的 Python 版实现（可删） |
 
 ## 双击时被 Windows 拦一下（SmartScreen）是怎么回事
