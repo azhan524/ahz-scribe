@@ -1,0 +1,12 @@
+﻿{
+  "servers": [
+    {
+      "name": "web",
+      "host": "在这里填你的服务器 IP 或域名",
+      "port": 22,
+      "user": "root",
+      "key": "C:\\Users\\你的用户名\\.ssh\\id_ed25519",
+      "note": "示例：填好后把 host/user/key 换成真实的"
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+@echo off
+chcp 65001 >nul
+rem ============================================================================
+rem 给 AhzScribe.exe / ahzscribe-cli.exe 签名（可选）
+rem
+rem 用法：拿到代码签名证书后，把本文件改名为 sign.cmd 放在 build.cmd 旁边，
+rem       按下面两种方式之一填好自己的证书信息，然后重新双击 build.cmd。
+rem       build.cmd 检测到 sign.cmd 会自动在编译完成后调用它。
+rem
+rem 注意：自签名证书对 SmartScreen 没用（系统不认，照样提示"未知发布者"），
+rem       必须是正规 CA 签发的代码签名证书，或微软的 Trusted Signing。
+rem ============================================================================
+
+rem ---- 方式一：有 .pfx 文件（证书 + 私钥都在文件里）----
+set "PFX=D:\certs\my-codesign.pfx"
+set "PFXPWD=这里填pfx密码"
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$p=Get-PfxCertificate '%PFX%'; Set-AuthenticodeSignature -FilePath '%~1' -Certificate $p -TimestampServer http://timestamp.digicert.com; Set-AuthenticodeSignature -FilePath '%~2' -Certificate $p -TimestampServer http://timestamp.digicert.com" || exit /b 1
+
+rem ---- 方式二：证书已经装在"个人"证书库里（用指纹指定）----
+rem   把上面方式一的两行用 rem 注释掉，改用下面两行（指纹去掉空格）：
+rem set "THUMB=你的证书指纹"
+rem powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+rem   "$c=Get-ChildItem Cert:\CurrentUser\My\%THUMB%; Set-AuthenticodeSignature -FilePath '%~1' -Certificate $c -TimestampServer http://timestamp.digicert.com; Set-AuthenticodeSignature -FilePath '%~2' -Certificate $c -TimestampServer http://timestamp.digicert.com" || exit /b 1
+
+rem ---- 方式三：硬件令牌 / 云签名服务，用 signtool ----
+rem signtool sign /sha1 <证书指纹> /tr http://timestamp.digicert.com /td sha256 /fd sha256 "%~1"
+rem signtool sign /sha1 <证书指纹> /tr http://timestamp.digicert.com /td sha256 /fd sha256 "%~2"
+
+echo 签名后可以用这条命令确认：
+echo   powershell -NoProfile -Command "Get-AuthenticodeSignature 'AhzScribe.exe' ^| Format-List Status,SignerCertificate"
+exit /b 0

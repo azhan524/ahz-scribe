@@ -1,0 +1,28 @@
+test_main_prints_filtered_summary (tests.test_cli.CliTest.test_main_prints_filtered_summary) ... ok
+test_parse_args_status_and_keyword (tests.test_cli.CliTest.test_parse_args_status_and_keyword) ... ok
+test_csv_ends_with_newline (tests.test_export.ExportTest.test_csv_ends_with_newline) ... ok
+test_csv_quotes_fields_with_comma (tests.test_export.ExportTest.test_csv_quotes_fields_with_comma) ... ok
+test_priority_range (tests.test_model.ModelTest.test_priority_range) ... ok
+test_status_checked (tests.test_model.ModelTest.test_status_checked) ... ok
+test_filter_by_keyword_searches_notes_too (tests.test_query.QueryTest.test_filter_by_keyword_searches_notes_too) ... ok
+test_filter_by_status_case_insensitive (tests.test_query.QueryTest.test_filter_by_status_case_insensitive) ... ok
+test_filter_combined (tests.test_query.QueryTest.test_filter_combined) ... ok
+test_summary_counts (tests.test_report.ReportTest.test_summary_counts) ... ok
+test_summary_empty (tests.test_report.ReportTest.test_summary_empty) ... ok
+test_by_priority_empty (tests.test_report_extra.ByPriorityTest.test_by_priority_empty) ... ok
+test_by_priority_groups (tests.test_report_extra.ByPriorityTest.test_by_priority_groups) ... ok
+test_list_tasks_asc (tests.test_store.StoreTest.test_list_tasks_asc) ... ok
+test_list_tasks_desc (tests.test_store.StoreTest.test_list_tasks_desc) ... ok
+test_load_missing_file (tests.test_store.StoreTest.test_load_missing_file) ... ok
+test_roundtrip (tests.test_store.StoreTest.test_roundtrip) ... ok
+============================================================
+共运行 19 个用例，失败 0 个
+ALL TESTS PASSED
+test_format_size_units (tests.test_util.UtilTest.test_format_size_units) ... ok
+test_normalize (tests.test_util.UtilTest.test_normalize) ... ok
+
+----------------------------------------------------------------------
+Ran 19 tests in 0.015s
+
+OK
+

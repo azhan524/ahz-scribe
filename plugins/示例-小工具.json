@@ -1,0 +1,34 @@
+{
+  "name": "示例：小工具",
+  "version": "1.0",
+  "description": "演示插件格式，可以直接改，也可以删掉。",
+  "prompts": [
+    {
+      "name": "回答风格",
+      "content": "回答尽量先给结论，再给一句理由；涉及数字时不要自己估算。"
+    }
+  ],
+  "tools": [
+    {
+      "name": "now_time",
+      "description": "查询当前日期和时间。",
+      "type": "shell",
+      "command": "Get-Date -Format 'yyyy-MM-dd HH:mm:ss dddd'",
+      "parameters": []
+    },
+    {
+      "name": "line_count",
+      "description": "统计某个文本文件有多少行。",
+      "type": "shell",
+      "command": "(Get-Content -LiteralPath {{path}} | Measure-Object -Line).Lines",
+      "parameters": [
+        {
+          "name": "path",
+          "type": "string",
+          "description": "文件路径（相对工作目录）",
+          "required": true
+        }
+      ]
+    }
+  ]
+}

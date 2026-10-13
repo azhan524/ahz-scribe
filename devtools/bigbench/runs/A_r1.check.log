@@ -1,0 +1,187 @@
+test_main_prints_filtered_summary (tests.test_cli.CliTest.test_main_prints_filtered_summary) ... FAIL
+test_parse_args_status_and_keyword (tests.test_cli.CliTest.test_parse_args_status_and_keyword) ... FAIL
+test_csv_ends_with_newline (tests.test_export.ExportTest.test_csv_ends_with_newline) ... ok
+test_csv_quotes_fields_with_comma (tests.test_export.ExportTest.test_csv_quotes_fields_with_comma) ... FAIL
+test_priority_range (tests.test_model.ModelTest.test_priority_range) ... FAIL
+test_status_checked (tests.test_model.ModelTest.test_status_checked) ... FAIL
+test_filter_by_keyword_searches_notes_too (tests.test_query.QueryTest.test_filter_by_keyword_searches_notes_too) ... FAIL
+test_filter_by_status_case_insensitive (tests.test_query.QueryTest.test_filter_by_status_case_insensitive) ... FAIL
+test_filter_combined (tests.test_query.QueryTest.test_filter_combined) ... FAIL
+test_summary_counts (tests.test_report.ReportTest.test_summary_counts) ... FAIL
+test_summary_empty (tests.test_report.ReportTest.test_summary_empty) ... ok
+test_by_priority_empty (tests.test_report_extra.ByPriorityTest.test_by_priority_empty) ... ERROR
+test_by_priority_groups (tests.test_report_extra.ByPriorityTest.test_by_priority_groups) ... ERROR
+test_list_tasks_asc (tests.test_store.StoreTest.test_list_tasks_asc) ... FAIL
+test_list_tasks_desc (tests.test_store.StoreTest.test_list_tasks_desc) ... FAIL
+test_load_missing_file (tests.test_store.StoreTest.test_load_missing_file) ... ok
+test_roundtrip (tests.test_store.StoreTest.test_roundtrip) ... ok
+test_format_size_units (tests.test_util.UtilTest.test_format_size_units) ... FAIL
+test_normalize (tests.test_util.UtilTest.test_normalize) ... ok
+
+======================================================================
+ERROR: test_by_priority_empty (tests.test_report_extra.ByPriorityTest.test_by_priority_empty)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\max-assistant\models\ollama\no_think\local-agent\devtools\bigbench\runs\A_r1\tests\test_report_extra.py", line 21, in test_by_priority_empty
+    self.assertEqual(report.by_priority([]), {})
+                     ~~~~~~~~~~~~~~~~~~^^^^
+  File "D:\max-assistant\models\ollama\no_think\local-agent\devtools\bigbench\runs\A_r1\app\report.py", line 29, in by_priority
+    raise NotImplementedError("by_priority 还没实现")
+NotImplementedError: by_priority 还没实现
+
+======================================================================
+ERROR: test_by_priority_groups (tests.test_report_extra.ByPriorityTest.test_by_priority_groups)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\max-assistant\models\ollama\no_think\local-agent\devtools\bigbench\runs\A_r1\tests\test_report_extra.py", line 15, in test_by_priority_groups
+    groups = report.by_priority(tasks)
+  File "D:\max-assistant\models\ollama\no_think\local-agent\devtools\bigbench\runs\A_r1\app\report.py", line 29, in by_priority
+    raise NotImplementedError("by_priority 还没实现")
+NotImplementedError: by_priority 还没实现
+
+======================================================================
+FAIL: test_main_prints_filtered_summary (tests.test_cli.CliTest.test_main_prints_filtered_summary)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\max-assistant\models\ollama\no_think\local-agent\devtools\bigbench\runs\A_r1\tests\test_cli.py", line 28, in test_main_prints_filtered_summary
+    self.assertIn("共 1 个任务", out)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+AssertionError: '共 1 个任务' not found in '共 2 个任务，完成 0 个（0.0%），合计 1024 KB\n'
+
+======================================================================
+FAIL: test_parse_args_status_and_keyword (tests.test_cli.CliTest.test_parse_args_status_and_keyword)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\max-assistant\models\ollama\no_think\local-agent\devtools\bigbench\runs\A_r1\tests\test_cli.py", line 14, in test_parse_args_status_and_keyword
+    self.assertEqual(opts["status"], "done")
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: None != 'done'
+
+======================================================================
+FAIL: test_csv_quotes_fields_with_comma (tests.test_export.ExportTest.test_csv_quotes_fields_with_comma)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\max-assistant\models\ollama\no_think\local-agent\devtools\bigbench\runs\A_r1\tests\test_export.py", line 16, in test_csv_quotes_fields_with_comma
+    self.assertEqual(lines[2], '"带,逗号的任务",5,done')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: '带,逗号的任务,5,done' != '"带,逗号的任务",5,done'
+- 带,逗号的任务,5,done
++ "带,逗号的任务",5,done
+? +       +
+
+
+======================================================================
+FAIL: test_priority_range (tests.test_model.ModelTest.test_priority_range)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\max-assistant\models\ollama\no_think\local-agent\devtools\bigbench\runs\A_r1\tests\test_model.py", line 11, in test_priority_range
+    with self.assertRaises(ValueError):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^
+AssertionError: ValueError not raised
+
+======================================================================
+FAIL: test_status_checked (tests.test_model.ModelTest.test_status_checked)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\max-assistant\models\ollama\no_think\local-agent\devtools\bigbench\runs\A_r1\tests\test_model.py", line 16, in test_status_checked
+    with self.assertRaises(ValueError):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^
+AssertionError: ValueError not raised
+
+======================================================================
+FAIL: test_filter_by_keyword_searches_notes_too (tests.test_query.QueryTest.test_filter_by_keyword_searches_notes_too)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\max-assistant\models\ollama\no_think\local-agent\devtools\bigbench\runs\A_r1\tests\test_query.py", line 21, in test_filter_by_keyword_searches_notes_too
+    self.assertEqual([t["title"] for t in hit], ["写文档"])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: [] != ['写文档']
+
+Second list contains 1 additional elements.
+First extra element 0:
+'写文档'
+
+- []
++ ['写文档']
+
+======================================================================
+FAIL: test_filter_by_status_case_insensitive (tests.test_query.QueryTest.test_filter_by_status_case_insensitive)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\max-assistant\models\ollama\no_think\local-agent\devtools\bigbench\runs\A_r1\tests\test_query.py", line 15, in test_filter_by_status_case_insensitive
+    self.assertEqual(len(query.filter_tasks(self.tasks, status="TODO")), 1)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 1
+
+======================================================================
+FAIL: test_filter_combined (tests.test_query.QueryTest.test_filter_combined)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\max-assistant\models\ollama\no_think\local-agent\devtools\bigbench\runs\A_r1\tests\test_query.py", line 26, in test_filter_combined
+    self.assertEqual(len(query.filter_tasks(self.tasks, status="done", keyword="tag")), 1)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 1
+
+======================================================================
+FAIL: test_summary_counts (tests.test_report.ReportTest.test_summary_counts)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\max-assistant\models\ollama\no_think\local-agent\devtools\bigbench\runs\A_r1\tests\test_report.py", line 16, in test_summary_counts
+    self.assertEqual(info["done"], 2)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 2
+
+======================================================================
+FAIL: test_list_tasks_asc (tests.test_store.StoreTest.test_list_tasks_asc)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\max-assistant\models\ollama\no_think\local-agent\devtools\bigbench\runs\A_r1\tests\test_store.py", line 30, in test_list_tasks_asc
+    self.assertEqual(titles, ["最早的任务", "中间的任务", "晚点的任务"])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: ['中间的任务', '晚点的任务', '最早的任务'] != ['最早的任务', '中间的任务', '晚点的任务']
+
+First differing element 0:
+'中间的任务'
+'最早的任务'
+
+- ['中间的任务', '晚点的任务', '最早的任务']
++ ['最早的任务', '中间的任务', '晚点的任务']
+
+======================================================================
+FAIL: test_list_tasks_desc (tests.test_store.StoreTest.test_list_tasks_desc)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+============================================================
+共运行 19 个用例，失败 14 个
+TESTS FAILED
+  File "D:\max-assistant\models\ollama\no_think\local-agent\devtools\bigbench\runs\A_r1\tests\test_store.py", line 34, in test_list_tasks_desc
+    self.assertEqual(titles, ["晚点的任务", "中间的任务", "最早的任务"])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: ['中间的任务', '晚点的任务', '最早的任务'] != ['晚点的任务', '中间的任务', '最早的任务']
+
+First differing element 0:
+'中间的任务'
+'晚点的任务'
+
+- ['中间的任务', '晚点的任务', '最早的任务']
++ ['晚点的任务', '中间的任务', '最早的任务']
+
+======================================================================
+FAIL: test_format_size_units (tests.test_util.UtilTest.test_format_size_units)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\max-assistant\models\ollama\no_think\local-agent\devtools\bigbench\runs\A_r1\tests\test_util.py", line 9, in test_format_size_units
+    self.assertEqual(util.format_size(1536), "1.5 KB")
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: '1536 KB' != '1.5 KB'
+- 1536 KB
+?   --
++ 1.5 KB
+?  +
+
+
+----------------------------------------------------------------------
+Ran 19 tests in 0.034s
+
+FAILED (failures=12, errors=2)
+

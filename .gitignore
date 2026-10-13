@@ -1,0 +1,51 @@
+# ================= 运行时数据（含密钥 / 会话，绝不能进仓库）=================
+# config.json 里有各提供商的 API Key；sessions.json 是对话记录；日志里有本机路径与命令。
+# 这三类一律不进仓库 —— 开源前先看这一节。
+config.json
+sessions.json
+config*.json
+**/config*.json
+*.before-*.json
+devtools/config*
+devtools/lessons.json
+devtools/iterations.json
+Ahz错误日志.txt
+AhzS日志.txt
+AhzScribe测试报告.txt
+
+# ================= 编译产物 =================
+*.exe
+*.exe.new
+*.exe.bak*
+*.dll
+*.pdb
+*.ico.tmp
+*.bak
+*.cs.bak
+
+# ================= 构建 / 测试产物与快照 =================
+_build/
+.snapshots/
+devtools/bench/_build/
+devtools/scorecard/runs/
+devtools/scorecard/_app/
+devtools/scorecard/_app_tight/
+devtools/scorecard/_*.exe
+devtools/scorecard/_*.log
+devtools/scorecard/last-run.log
+devtools/o*.txt
+devtools/e*.txt
+*.tmp
+
+# ================= 内部往来信件 / 工作笔记 =================
+# 想让它们也开源，就把下面这几行删掉（或改成 !文件名）。
+交接给Codex.md
+交付总结-给Codex检查-*.md
+升级需求-给Codex-*.md
+给codex的升级提示词.txt*
+给Codex的信-*.md
+回信-给AHZS-*.md
+AGENTS.md.bak-*
+
+# ================= 与 C# 项目无关的杂项 =================
+python-version/
