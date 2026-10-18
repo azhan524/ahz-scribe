@@ -11406,6 +11406,28 @@ class UiPasswordBox : Control
     int _caret;
     int _selStart = -1, _selEnd = -1;
     bool _drag;
+    string _imeComp = "";
+    bool _imeActive;
+
+    const int WM_IME_STARTCOMPOSITION = 0x010D;
+    const int WM_IME_ENDCOMPOSITION = 0x010E;
+    const int WM_IME_COMPOSITION = 0x010F;
+    const int WM_IME_CHAR = 0x0286;
+    const int GCS_COMPSTR = 0x0008;
+    const int GCS_RESULTSTR = 0x0800;
+
+    [DllImport("imm32.dll")] static extern IntPtr ImmGetContext(IntPtr hWnd);
+    [DllImport("imm32.dll")] static extern bool ImmReleaseContext(IntPtr hWnd, IntPtr hIMC);
+    [DllImport("imm32.dll", CharSet = CharSet.Unicode)] static extern int ImmGetCompositionString(IntPtr hIMC, int index, StringBuilder buf, int len);
+
+    static string ImeString(IntPtr hIMC, int kind)
+    {
+        int bytes = ImmGetCompositionString(hIMC, kind, null, 0);
+        if (bytes <= 0) return "";
+        StringBuilder sb = new StringBuilder(bytes / 2 + 1);
+        ImmGetCompositionString(hIMC, kind, sb, sb.Capacity * 2);
+        return sb.ToString();
+    }
 
     public UiPasswordBox()
     {
@@ -11416,18 +11438,73 @@ class UiPasswordBox : Control
         Font = Theme.F(9.5f);
         TabStop = true;
         Cursor = Cursors.IBeam;
+        ImeMode = ImeMode.On;
+    }
+
+    // IME 合成串只放 _imeComp，绝不写 _text；只有 GCS_RESULTSTR 才提交到密码内存。
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WM_IME_STARTCOMPOSITION)
+        {
+            _imeActive = true;
+            _imeComp = "";
+            Invalidate();
+            return;
+        }
+        if (m.Msg == WM_IME_ENDCOMPOSITION)
+        {
+            _imeActive = false;
+            _imeComp = "";
+            Invalidate();
+            return;
+        }
+        if (m.Msg == WM_IME_CHAR)
+        {
+            return;   // 合成结果由 WM_IME_COMPOSITION 统一提交，避免双写
+        }
+        if (m.Msg == WM_IME_COMPOSITION)
+        {
+            IntPtr h = ImmGetContext(Handle);
+            if (h != IntPtr.Zero)
+            {
+                try
+                {
+                    int flags = m.LParam.ToInt32();
+                    if ((flags & GCS_RESULTSTR) != 0)
+                    {
+                        string s = ImeString(h, GCS_RESULTSTR);
+                        _imeComp = "";
+                        _imeActive = false;
+                        if (s.Length > 0) ReplaceSelection(s);
+                    }
+                    else if ((flags & GCS_COMPSTR) != 0)
+                    {
+                        _imeComp = ImeString(h, GCS_COMPSTR);
+                        _imeActive = true;
+                        Invalidate();
+                    }
+                }
+                finally { ImmReleaseContext(Handle, h); }
+            }
+            return;
+        }
+        base.WndProc(ref m);
     }
 
     public override string Text
     {
         get { return _text; }
-        set { _text = value ?? ""; _caret = _text.Length; _selStart = _selEnd = -1; OnTextChanged(EventArgs.Empty); Invalidate(); }
+        set { _text = value ?? ""; _imeComp = ""; _imeActive = false; _caret = _text.Length; _selStart = _selEnd = -1; OnTextChanged(EventArgs.Empty); Invalidate(); }
     }
     public bool ReadOnly { get { return _readOnly; } set { _readOnly = value; } }
     public bool UseSystemPasswordChar { get { return _mask; } set { _mask = value; Invalidate(); } }
+    // 自测用：只进合成缓冲区，不写密码；只有 Commit 才提交。
+    public void DebugCompose(string s) { _imeComp = s ?? ""; _imeActive = true; Invalidate(); }
+    public void DebugCommit(string s) { ReplaceSelection(s ?? ""); _imeComp = ""; _imeActive = false; }
+    public string DebugComposition { get { return _imeComp; } }
 
     protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
-    protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+    protected override void OnLostFocus(EventArgs e) { _imeComp = ""; _imeActive = false; base.OnLostFocus(e); Invalidate(); }
 
     int SelA { get { return _selStart < 0 ? _caret : Math.Min(_selStart, _selEnd); } }
     int SelB { get { return _selStart < 0 ? _caret : Math.Max(_selStart, _selEnd); } }
@@ -11563,6 +11640,7 @@ class UiPasswordBox : Control
         Graphics g = e.Graphics;
         using (SolidBrush b = new SolidBrush(BackColor)) g.FillRectangle(b, ClientRectangle);
         string disp = _mask ? new string('●', _text.Length) : _text;
+        if (_imeActive || _imeComp.Length > 0) disp += _imeComp;
         Rectangle r = new Rectangle(Theme.Px(2), 0, Math.Max(1, Width - Theme.Px(4)), Height);
         if (HasSel)
         {
