@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>新标签页 · Ahz Scribe</title>
+<!-- home-v3-search -->
+<style>
+:root{
+  --bg:#FAF9F5; --card:#FFFFFF; --ink-1:#1F1E1D; --ink-2:#57534E; --ink-3:#8A8578;
+  --accent:#5E6AD2; --accent-soft:rgba(94,106,210,.10);
+  --line:rgba(31,30,29,.08);
+  --r-s:6px; --r-m:8px; --r-l:12px; --r-xl:16px;
+  --f: -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei UI",system-ui,sans-serif;
+}
+html.dark{--bg:#16181D;--card:#1E2127;--ink-1:#ECEDEF;--ink-2:#B7BBC2;--ink-3:#8B9099;--accent:#8B93F8;--accent-soft:rgba(139,147,248,.14);--line:rgba(255,255,255,.10);}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;width:100%;max-width:100%;overflow-x:hidden}
+body{font-family:var(--f);background:var(--bg);color:var(--ink-1);
+     display:flex;align-items:center;justify-content:center;padding:40px 24px}
+
+.newtab{width:100%;max-width:min(720px,96vw);min-width:0;margin:0 auto}
+
+/* 顶部标识 */
+.brand{display:flex;align-items:center;justify-content:center;gap:8px;margin-bottom:24px}
+.mark{width:34px;height:34px;border-radius:10px;background:var(--accent);color:#fff;
+      display:grid;place-items:center;font-weight:700;font-size:16px;letter-spacing:-.02em}
+.brand .name{font-size:16px;font-weight:600;letter-spacing:.01em}
+.brand .sub{font-size:12px;color:var(--ink-3);margin-left:2px}
+
+/* 搜索框 */
+form.search{display:flex;align-items:center;gap:8px;background:var(--card);
+            border:1px solid var(--line);border-radius:var(--r-xl);padding:8px;
+            box-shadow:0 1px 2px rgba(0,0,0,.04),0 8px 24px rgba(0,0,0,.05);
+            transition:border-color .15s,box-shadow .15s}
+form.search:focus-within{border-color:var(--accent);
+            box-shadow:0 0 0 3px var(--accent-soft),0 8px 24px rgba(0,0,0,.06)}
+form.search .ico{width:18px;height:18px;flex-shrink:0;stroke:var(--ink-3);fill:none;stroke-width:2;
+            stroke-linecap:round;stroke-linejoin:round}
+form.search:focus-within .ico{stroke:var(--accent)}
+#q{flex:1;min-width:0;border:0;outline:0;background:transparent;font-family:var(--f);
+   font-size:16px;line-height:1.4;color:var(--ink-1);height:44px;padding:0 8px}
+#q::placeholder{color:var(--ink-3)}
+form.search button{flex-shrink:0;height:40px;padding:0 16px;border:0;border-radius:8px;
+   background:var(--accent);color:#fff;font-family:var(--f);font-size:14px;font-weight:500;
+   cursor:pointer;transition:background .12s,filter .12s}
+form.search button:hover{background:var(--accent);filter:brightness(.94)}
+.hint{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:12px;
+      font-size:12px;color:var(--ink-3);letter-spacing:.01em;flex-wrap:wrap}
+kbd{font-family:var(--f);font-size:11px;border:1px solid var(--line);border-bottom-width:2px;
+    border-radius:4px;padding:0 5px;color:var(--ink-2);background:var(--card)}
+
+/* 快捷入口 */
+.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(90px,1fr));gap:8px;margin-top:32px}
+a.tile{display:flex;flex-direction:column;align-items:center;gap:8px;padding:16px 8px;
+       border:1px solid transparent;border-radius:var(--r-l);text-decoration:none;color:var(--ink-1);
+       transition:background .12s,border-color .12s}
+a.tile:hover{background:var(--card);border-color:var(--line)}
+a.tile .av{width:38px;height:38px;border-radius:8px;display:grid;place-items:center;
+           font-weight:600;font-size:14px;color:var(--accent);background:var(--accent-soft)}
+a.tile .nm{font-size:12px;color:var(--ink-2);white-space:nowrap;overflow:hidden;
+           text-overflow:ellipsis;max-width:100%}
+
+/* 底部小条 */
+.statusbar{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:40px;
+           padding-top:16px;border-top:1px solid var(--line);font-size:12px;
+           letter-spacing:.02em;color:var(--ink-3);flex-wrap:wrap}
+.statusbar .sep{opacity:.4}
+
+/* 小窗：浏览器只占主区 900~1000px，再按 720 宽排会横向溢出 */
+@media (max-width:900px){
+  body{padding:24px 16px;align-items:flex-start}
+  .newtab{width:100%}
+  .tiles{grid-template-columns:repeat(auto-fill,minmax(72px,1fr));margin-top:24px}
+  .statusbar{margin-top:24px}
+}
+</style>
+</head>
+<body>
+<div class="newtab">
+
+  <div class="brand">
+    <div class="mark">A</div>
+    <div>
+      <div class="name">Ahz Scribe<span class="sub"> · 内置浏览器</span></div>
+    </div>
+  </div>
+
+  <form class="search" id="sf" autocomplete="off">
+    <svg class="ico" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"></circle><path d="M20 20l-3.6-3.6"></path></svg>
+    <input id="q" type="text" placeholder="搜索或输入网址" spellcheck="false" autocomplete="off">
+    <button type="submit">搜索</button>
+  </form>
+  <div class="hint">
+    <span>回车即走 · 网址直接打开 · 其余交给 Bing</span>
+    <span><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd> 开关浏览器</span>
+  </div>
+
+  <div class="tiles">
+    <a class="tile" href="https://chat.deepseek.com/"><span class="av">D</span><span class="nm">DeepSeek</span></a>
+    <a class="tile" href="https://cn.bing.com/"><span class="av">B</span><span class="nm">Bing</span></a>
+    <a class="tile" href="https://github.com/"><span class="av">G</span><span class="nm">GitHub</span></a>
+    <a class="tile" href="https://www.doubao.com/chat/"><span class="av">豆</span><span class="nm">豆包</span></a>
+    <a class="tile" href="https://yiyan.baidu.com/"><span class="av">文</span><span class="nm">文心一言</span></a>
+    <a class="tile" href="https://tongyi.aliyun.com/"><span class="av">千</span><span class="nm">千问</span></a>
+    <a class="tile" href="https://fanyi.youdao.com/"><span class="av">译</span><span class="nm">有道翻译</span></a>
+  </div>
+
+  <div class="statusbar">
+    <span>交给 AS：把这一页丢给我读</span>
+    <span class="sep">·</span>
+    <span>阅读模式：只留正文</span>
+    <span class="sep">·</span>
+    <span>收藏当前页</span>
+  </div>
+
+</div>
+
+<script>
+(function () {
+  var input = document.getElementById('q');
+  var form = document.getElementById('sf');
+
+  function go(e) {
+    if (e) e.preventDefault();
+    var raw = (input.value || '').trim();
+    if (!raw) { input.focus(); return; }
+
+    // 带协议的、本地文件、内网地址：直接去
+    if (/^(https?:\/\/|file:\/\/|about:)/i.test(raw) ||
+        /^(localhost|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+)/i.test(raw)) {
+      location.href = raw;
+      return;
+    }
+    // 看着像域名（有点、没空格）：补 https://
+    if (/^[\w.-]+\.[a-z]{2,}(\/.*)?$/i.test(raw) && raw.indexOf(' ') < 0) {
+      location.href = 'https://' + raw;
+      return;
+    }
+    // 其余当搜索词
+    location.href = 'https://cn.bing.com/search?q=' + encodeURIComponent(raw);
+  }
+
+  form.addEventListener('submit', go);
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') go(e);
+  });
+  input.focus();
+})();
+</script>
+<script>if(location.search.indexOf("dark")>=0)document.documentElement.classList.add("dark");</script>
+</body>
+</html>
+
