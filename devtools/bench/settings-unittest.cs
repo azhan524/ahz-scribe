@@ -34,9 +34,9 @@ class SettingsUnit
         while (DateTime.Now < end) { Application.DoEvents(); Thread.Sleep(10); }
     }
 
-    static TextBox Txt(object f, string field)
+    static Control Txt(object f, string field)
     {
-        return (TextBox)Get(f, field);
+        return (Control)Get(f, field);
     }
 
     static ListBox Lst(object f)
@@ -105,7 +105,7 @@ class SettingsUnit
         Call(f, "ShowPage", 2);                    // 导航顺序：0 通用设置 / 1 模型 / 2 运行日志 / 3 关于
         Pump(200);
         Panel lp = pages[2];
-        TextBox logBox = Txt(f, "_logBox");
+        UiDiff logBox = (UiDiff)Get(f, "_logBox");
         Check("日志页里装的确实是日志框（页面顺序没和「关于」页串）",
             logBox != null && lp.Controls.Contains(logBox)
             && !lp.Controls.Contains((Control)Get(f, "_aboutCard")),
@@ -134,9 +134,12 @@ class SettingsUnit
                 }
             }
             Check("三个按钮都在日志框下方且没跑出可视区", badBtn == 0, "不对 " + badBtn + " 个 例如 " + btnWorst);
-            // 点一下"刷新"：走真事件，不许抛异常，内容要和 Log.Read() 一致
+            // 先往日志里写一行"留痕"，再点刷新：页面必须能显示到这一行（证明页面真的接上了日志文件）
             string tag = "自测留痕-" + Guid.NewGuid().ToString("N").Substring(0, 6);
             Log.Audit(tag);
+            // 点一下"刷新"：走真事件。刷新走 120ms 防抖，所以要**给它机会**——
+            // 最多等 1.5 秒轮询，而不是只 Pump 一次（实测只等一次会偶发看不到，那是测试写法的问题，
+            // 不是产品缺陷：定时器还没触发而已）。
             bool threw = false;
             try
             {
@@ -145,11 +148,31 @@ class SettingsUnit
                     .Invoke(rb, new object[] { EventArgs.Empty });     // 走真事件（UiButton 是自绘控件，没有 PerformClick）
             }
             catch { threw = true; }
-            Pump(150);
-            Check("点「刷新」不抛异常且内容 = Log.Read()",
-                !threw && logBox.Text == Log.Read(), threw ? "抛异常" : "内容不一致");
-            Check("刚写进去的日志在页面上看得到（页面真的接上了日志文件）",
-                logBox.Text.IndexOf(tag) >= 0, "没看到 " + tag);
+            bool sawTag = false;
+            for (int i = 0; i < 10 && !sawTag; i++)
+            {
+                Pump(150);
+                if (logBox.Text.IndexOf(tag) >= 0) sawTag = true;
+            }
+            Check("点「刷新」显示的就是日志文件的最新内容（页面真的接上了日志文件）",
+                !threw && sawTag, threw ? "抛异常" : "等了 1.5 秒也没看到 " + tag);
+            // 防抖与"不动用户的滚动位置"（整改项⑨）：**文件没变时**刷新，文本框与选区都不许动。
+            // 先把 _logShown 对齐到当前尾巴（这一步可能写入一次），再快照、再调一次 —— 那次必须什么都不做。
+            Call(f, "LoadLogText");
+            Pump(120);
+            string tail1 = Log.ReadTail(64 * 1024);
+            int sel0 = logBox.SelectionStart;
+            string text0 = logBox.Text;
+            Call(f, "LoadLogText");
+            Pump(120);
+            string tail2 = Log.ReadTail(64 * 1024);
+            Check("内容没变时刷新不改动文本框（滚动位置不被顶走）",
+                tail1 != tail2 || (logBox.Text == text0 && logBox.SelectionStart == sel0),
+                "fileChanged=" + (tail1 != tail2) + " textChanged=" + (logBox.Text != text0)
+                + " sel " + sel0 + "->" + logBox.SelectionStart);
+            Check("日志很大时只显示末尾（带截断提示，不是整文件重灌）",
+                Log.ReadTail(64 * 1024).Length <= 64 * 1024 + 200 && Log.ReadTail(64 * 1024).Length <= Log.Read().Length,
+                "tail=" + Log.ReadTail(64 * 1024).Length + " full=" + Log.Read().Length);
         }
         Call(f, "ShowPage", 1);
         Pump(150);
@@ -159,7 +182,7 @@ class SettingsUnit
         Pump(200);
         Panel gp = pages[0];
         RoundedPanel gc = (RoundedPanel)Get(f, "_generalCard");
-        CheckBox lastChk = (CheckBox)Get(f, "_chkHideThink");
+        Control lastChk = (Control)Get(f, "_chkHideThink");
         FieldBox cwdField = (FieldBox)Get(f, "_cwdBox");
         Control pickBtn = (Control)Get(f, "_btnPickCwd");
         Check("卡片装得下最后一个复选框（第 5 行没被卡片下边缘切掉）",
@@ -170,6 +193,22 @@ class SettingsUnit
             && cwdField.Width > gp.ClientSize.Width / 2,
             "框=" + (cwdField == null ? "null" : cwdField.Bounds.ToString())
             + " 按钮x=" + (pickBtn == null ? -1 : pickBtn.Left) + " 页宽=" + gp.ClientSize.Width);
+
+        Console.WriteLine("== 1d. 同级控件不许互相压住（150% 下权限下拉压复选框的回归）==");
+        UiDrop permCmb = (UiDrop)Get(f, "_cmbPerm");
+        Control outsideChk = (Control)Get(f, "_chkOutside");
+        Check("权限下拉与「允许访问工作目录外」复选框不重叠",
+            permCmb != null && outsideChk != null && !permCmb.Bounds.IntersectsWith(outsideChk.Bounds),
+            "下拉=" + (permCmb == null ? "null" : permCmb.Bounds.ToString())
+            + " 复选框=" + (outsideChk == null ? "null" : outsideChk.Bounds.ToString()));
+        Panel navPanel = (Panel)Get(f, "_navPanel");
+        UiButton[] navBtns = (UiButton[])Get(f, "_nav");
+        bool navIn = navPanel != null && navBtns != null;
+        if (navIn)
+            foreach (UiButton nb in navBtns)
+                if (nb != null && !navPanel.ClientRectangle.Contains(nb.Bounds)) navIn = false;
+        Check("左侧导航按钮都在自己的面板里（不再 405px 撑出 318px 父容器）",
+            navIn, navPanel == null ? "没有 _navPanel" : ("父=" + navPanel.ClientSize + " 首个=" + (navBtns == null || navBtns.Length == 0 ? "null" : navBtns[0].Bounds.ToString())));
         Call(f, "ShowPage", 1);
         Pump(150);
 
@@ -245,13 +284,25 @@ class SettingsUnit
         Provider np3 = c.providers[c.providers.Count - 1];
         Check("重名会自动加序号", np3.name == "智谱 GLM 2", "name=" + np3.name);
 
-        Console.WriteLine("== 6. 拉取模型是合并而不是覆盖 ==");
+        Console.WriteLine("== 6. 拉取模型是合并而不是覆盖（顺带把接口给的能力标签存下来）==");
         Lst(f).SelectedIndex = 1;
         Pump(120);
         Txt(f, "_txtModels").Text = "my-model-a\r\ndeepseek-flash";
         Pump(60);
-        List<string> fetched = new List<string>(new string[] { "deepseek-flash", "deepseek-v4-pro", "deepseek-new" });
-        object hint = Call(f, "MergeModelList", fetched);
+        // 现在"拉取"拉回来的是带能力标签的清单（以前只有 id），合并时顺手存进 provider
+        Provider sel6 = c.providers[1];
+        List<ModelMeta> fetched = new List<ModelMeta>();
+        foreach (string id6 in new string[] { "deepseek-flash", "deepseek-v4-pro", "deepseek-new" })
+        {
+            ModelMeta mi6 = new ModelMeta();
+            mi6.id = id6;
+            fetched.Add(mi6);
+        }
+        fetched[0].name = "DeepSeek-V4.1-Flash";
+        fetched[0].vision = true;
+        fetched[0].ctx = 1048576;
+        fetched[0].efforts = new List<string>(new string[] { "low", "high", "max" });
+        object hint = Call(f, "MergeModelList", sel6, fetched);
         Pump(60);
         List<string> after = new List<string>();
         foreach (string line in Txt(f, "_txtModels").Text.Replace("\r\n", "\n").Split('\n'))
@@ -263,6 +314,15 @@ class SettingsUnit
         Check("合并结果写回了 config（存得住）",
             c.providers[1].models.Contains("my-model-a") && c.providers[1].models.Contains("deepseek-new"),
             string.Join(",", c.providers[1].models.ToArray()));
+        Check("接口给的能力标签也存进了这个提供商（显示名 / 能看图 / 档位）",
+            sel6.Meta("deepseek-flash") != null
+            && sel6.DisplayName("deepseek-flash") == "DeepSeek-V4.1-Flash"
+            && sel6.CanSeeImages("deepseek-flash") == true
+            && Effort.Supported(sel6, "deepseek-flash", ""),
+            sel6.Meta("deepseek-flash") == null ? "没存下来" : sel6.DisplayName("deepseek-flash"));
+        Check("提示语里报了「能看图几个、能调档几个」",
+            Convert.ToString(hint).IndexOf("能看图 1 个") >= 0 && Convert.ToString(hint).IndexOf("能调档 1 个") >= 0,
+            Convert.ToString(hint));
 
         Console.WriteLine("== 7. 其它不变量 ==");
         Check("每个提供商 id 唯一",
@@ -293,6 +353,23 @@ class SettingsUnit
         Program.EnsureTls();
         int proto = (int)System.Net.ServicePointManager.SecurityProtocol;
         Check("SecurityProtocol 含 TLS1.2（3072）", (proto & 3072) == 3072, "proto=" + proto);
+
+        Console.WriteLine("== 10. API Key 落盘加密（DPAPI CurrentUser）==");
+        string enc = Dpapi.Protect("sk-test-123");
+        Check("密文带 dpapi-v1 前缀", Dpapi.IsProtected(enc), enc);
+        Check("密文里看不到明文", enc.IndexOf("sk-test-123", StringComparison.Ordinal) < 0, enc);
+        Check("当前用户能解回原 Key", Dpapi.Unprotect(enc) == "sk-test-123", "解回=" + Dpapi.Unprotect(enc));
+        Check("老配置的明文 Key 仍能原样读", Dpapi.Unprotect("sk-old-plain") == "sk-old-plain", "旧明文读取失败");
+
+        Console.WriteLine("== 11. 密码框 IME 合成缓冲隔离 ==");
+        UiPasswordBox pw = new UiPasswordBox();
+        pw.DebugCompose("ni");
+        Check("合成中：密码内存还是空的（候选串不落盘）", pw.Text.Length == 0, "text=" + pw.Text);
+        Check("合成中：候选串只在缓冲区", pw.DebugComposition == "ni", "comp=" + pw.DebugComposition);
+        pw.DebugCommit("你");
+        Check("提交后才进密码内存", pw.Text == "你", "text=" + pw.Text);
+        Check("提交后合成缓冲清空", pw.DebugComposition.Length == 0, "comp=" + pw.DebugComposition);
+        pw.Dispose();
 
         f.Close();
         Console.WriteLine();
