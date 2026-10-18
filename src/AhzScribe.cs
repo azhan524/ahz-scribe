@@ -5425,6 +5425,7 @@ static class Theme
     {
         if (!Dark || root == null) return;
         DarkenOne(root);
+        UiOverlayScroll.Attach(root);
         foreach (Control c in root.Controls) DarkenTree(c);
     }
 
@@ -6371,6 +6372,173 @@ class UiNumber : Control
 }
 
 // 自绘列表：替换设置页/改动页/插件页里默认的系统白底蓝选 ListBox。
+// 暗色原生滚动条的替代：宿主仍用 AutoScroll/TopIndex 滚，外面盖一条自绘 thumb。
+// 只处理垂直滚动；水平条直接隐藏（对话区/侧栏都按宽度换行，不需要横向拖动）。
+class UiOverlayScroll : Control
+{
+    public readonly Control Host;
+    bool _drag;
+    bool _syncing;
+    int _dragY, _dragValue;
+
+    [DllImport("user32.dll")] static extern bool ShowScrollBar(IntPtr hWnd, int bar, bool show);
+
+    public UiOverlayScroll(Control host)
+    {
+        Host = host;
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
+            | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        BackColor = Theme.Side;
+        Width = Theme.Px(8);
+        host.Resize += delegate { Sync(); };
+        host.LocationChanged += delegate { Sync(); };
+        host.VisibleChanged += delegate { Sync(); };
+        host.HandleCreated += delegate { Sync(); };
+        host.Layout += delegate { Sync(); };
+        host.Paint += delegate { try { ShowScrollBar(host.Handle, 1, false); ShowScrollBar(host.Handle, 0, false); } catch { } };
+        host.MouseWheel += delegate { Sync(); };
+        ScrollableControl sc0 = host as ScrollableControl;
+        if (sc0 != null) sc0.Scroll += delegate { Sync(); };
+        ListBox lb0 = host as ListBox;
+        if (lb0 != null)
+        {
+            lb0.SelectedIndexChanged += delegate { Sync(); };
+            lb0.MouseWheel += delegate { Sync(); };
+        }
+        ParentChanged += delegate { Sync(); };
+        Sync();
+    }
+
+    int MaxValue()
+    {
+        ScrollableControl sc = Host as ScrollableControl;
+        if (sc != null) return Math.Max(0, sc.VerticalScroll.Maximum - sc.VerticalScroll.LargeChange + 1);
+        ListBox lb = Host as ListBox;
+        if (lb != null)
+        {
+            int visible = Math.Max(1, lb.ClientSize.Height / Math.Max(1, lb.ItemHeight));
+            return Math.Max(0, lb.Items.Count - visible);
+        }
+        return 0;
+    }
+
+    int CurValue()
+    {
+        ScrollableControl sc = Host as ScrollableControl;
+        if (sc != null) return sc.VerticalScroll.Value;
+        ListBox lb = Host as ListBox;
+        if (lb != null) return lb.TopIndex;
+        return 0;
+    }
+
+    void SetValue(int v)
+    {
+        ScrollableControl sc = Host as ScrollableControl;
+        if (sc != null)
+        {
+            try { sc.VerticalScroll.Value = Math.Max(0, Math.Min(MaxValue(), v)); sc.PerformLayout(); } catch { }
+            return;
+        }
+        ListBox lb = Host as ListBox;
+        if (lb != null && lb.Items.Count > 0)
+            lb.TopIndex = Math.Max(0, Math.Min(MaxValue(), v));
+    }
+
+    public void Sync()
+    {
+        if (_syncing) return;
+        _syncing = true;
+        try
+        {
+            if (Host == null || Host.Parent == null || !Host.IsHandleCreated) { Visible = false; return; }
+            if (Host.Parent != Parent) { Visible = false; return; }
+            ShowScrollBar(Host.Handle, 1, false);
+            ShowScrollBar(Host.Handle, 0, false);
+            int max = MaxValue();
+            if (max <= 0) { Visible = false; return; }
+            Visible = true;
+            int w = Theme.Px(8);
+            int h = Host.Height;
+            SetBounds(Host.Left + Host.Width - w - Theme.Px(1), Host.Top + Theme.Px(1), w, Math.Max(10, h - Theme.Px(2)));
+            BringToFront();
+            Invalidate();
+        }
+        catch { Visible = false; }
+        finally { _syncing = false; }
+    }
+
+    Rectangle Thumb()
+    {
+        int max = Math.Max(1, MaxValue());
+        int h = Math.Max(10, Height - Theme.Px(4));
+        int visible = 1;
+        ScrollableControl sc = Host as ScrollableControl;
+        if (sc != null) visible = Math.Max(1, sc.VerticalScroll.LargeChange);
+        else if (Host is ListBox)
+        {
+            ListBox lb = (ListBox)Host;
+            visible = Math.Max(1, lb.ClientSize.Height / Math.Max(1, lb.ItemHeight));
+        }
+        int total = max + visible;
+        int th = Math.Max(Theme.Px(24), (int)((long)h * visible / Math.Max(1, total)));
+        int ty = Theme.Px(2) + (int)((long)(h - th) * CurValue() / max);
+        return new Rectangle(Theme.Px(2), ty, Math.Max(2, Width - Theme.Px(4)), th);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        using (SolidBrush bg = new SolidBrush(BackColor)) e.Graphics.FillRectangle(bg, ClientRectangle);
+        Rectangle tr = Thumb();
+        Color c = _drag ? Theme.FgMid : Theme.FgFaint;
+        using (SolidBrush b = new SolidBrush(c)) e.Graphics.FillRectangle(b, tr);
+    }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        Rectangle tr = Thumb();
+        if (!tr.Contains(e.Location)) return;
+        _drag = true;
+        _dragY = e.Y;
+        _dragValue = CurValue();
+        Capture = true;
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        base.OnMouseMove(e);
+        if (!_drag) return;
+        int h = Math.Max(10, Height - Theme.Px(4));
+        int max = Math.Max(1, MaxValue());
+        int delta = (int)((long)(e.Y - _dragY) * max / Math.Max(1, h - Thumb().Height));
+        SetValue(_dragValue + delta);
+        Invalidate();
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        base.OnMouseUp(e);
+        _drag = false;
+        Capture = false;
+        Sync();
+    }
+
+    public static void Attach(Control host)
+    {
+        if (!Theme.Dark || host == null || host.Parent == null) return;
+        bool scrollable = host is ScrollableControl && ((ScrollableControl)host).AutoScroll;
+        if (!scrollable && !(host is ListBox)) return;
+        foreach (Control c in host.Parent.Controls)
+        {
+            UiOverlayScroll s = c as UiOverlayScroll;
+            if (s != null && s.Host == host) return;
+        }
+        UiOverlayScroll bar = new UiOverlayScroll(host);
+        host.Parent.Controls.Add(bar);
+        bar.BringToFront();
+    }
+}
+
 class UiList : ListBox
 {
     public UiList()
