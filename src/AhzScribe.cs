@@ -9,10 +9,14 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
 using System.Net;
+using System.Net.Http;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
+using CefSharp;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
@@ -23,6 +27,34 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyFileVersion("1.1.0.0")]
 
 // ============================ 基础工具 ============================
+
+
+// 新代码走 HttpClient；旧流式接口仍保留 HttpWebRequest（它要按行读流+取消）。
+static class HttpJson
+{
+    public static string Get(string url, int timeoutMs, string apiKey)
+    {
+        HttpClientHandler h = new HttpClientHandler();
+        h.UseProxy = false;
+        h.AllowAutoRedirect = true;
+        using (HttpClient c = new HttpClient(h))
+        {
+            c.Timeout = TimeSpan.FromMilliseconds(timeoutMs > 0 ? timeoutMs : 30000);
+            using (HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Get, url))
+            {
+                if (!string.IsNullOrEmpty(apiKey))
+                    req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey.Trim());
+                using (HttpResponseMessage resp = c.SendAsync(req).GetAwaiter().GetResult())
+                {
+                    string body = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                    if (!resp.IsSuccessStatusCode)
+                        throw new LocalAgentException("HTTP " + (int)resp.StatusCode + " " + resp.ReasonPhrase + "：" + body);
+                    return body;
+                }
+            }
+        }
+    }
+}
 
 static class Json
 {
@@ -126,6 +158,237 @@ static class Txt
         int n = 1;
         foreach (char c in s) if (c == '\n') n++;
         return n;
+    }
+}
+
+// ============================ 图片（多模态） ============================
+// 输入框里粘进来的图片会以文件路径的形式出现在用户消息里。这里负责把这些路径
+// 变成模型真能"看到"的图片数据：
+//   · Ollama /api/chat       → 消息上的 images 字段（base64 列表）
+//   · OpenAI 兼容 /chat/completions → content 数组里的 image_url（data: URL）
+// 只给"最后一条用户消息"带图：历史消息里的图没必要每轮重发，否则一轮比一轮胖。
+static class Vision
+{
+    public const int MaxImages = 4;                    // 单条消息最多带几张
+    public const long MaxBytes = 12L * 1024 * 1024;    // 单张文件上限，超过就不带（免得请求体炸掉）
+    public const int MaxEdge = 1568;                   // 长边上限：多模态模型的常用像素预算
+
+    // 接口明确回过"看不了图"之后置 true：本轮起退回纯文字，别一直撞同一堵墙
+    public static bool Disabled = false;
+
+    // 接口/探测声明过的结论：true=能看 false=看不了 null=没说
+    // 与 VisionNote() 用同一处来源（Provider.CanSeeImages / ollama 的 capabilities），不另起一套。
+    public static bool? Capability = null;
+
+    // 上次"记住"是给哪个模型的（provider|model）：换了模型要重新给图片一次机会
+    public static string Key = "";
+
+    // 还要不要往请求里塞图片
+    public static bool ShouldSend
+    {
+        get { return !Disabled && Capability != false; }
+    }
+
+    public static bool IsImageExt(string p)
+    {
+        if (p == null) return false;
+        // 文本里什么字符都可能有（引号、竖线、控制字符），而这种"看着像路径"的串到处都是。
+        // Path.GetExtension 遇到非法路径字符会抛 ArgumentException —— 2026-10-15 日志里
+        // "压缩历史"就是这么连着失败 12 次的（异常从 ConvertMessages → ContentParts 一路上抛）。
+        // 这里一律当成"不是图片路径"跳过，绝不往外抛。
+        string e;
+        try { e = Path.GetExtension(p).ToLowerInvariant(); }
+        catch { return false; }
+        return e == ".png" || e == ".jpg" || e == ".jpeg" || e == ".gif"
+            || e == ".bmp" || e == ".webp";
+    }
+
+    // 从一段文字里挑出"确实存在的图片文件路径"（带引号的路径也能认出来）
+    public static List<string> PathsIn(string text)
+    {
+        List<string> res = new List<string>();
+        if (text == null || text.Length == 0) return res;
+        MatchCollection ms = Regex.Matches(text, "\"([^\"]+)\"|([^\\s\"]+)");
+        foreach (Match m in ms)
+        {
+            string cand = m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Value;
+            if (cand == null) continue;
+            cand = cand.Trim();
+            if (!IsImageExt(cand)) continue;
+            if (!File.Exists(cand)) continue;
+            if (!res.Contains(cand)) res.Add(cand);
+        }
+        return res;
+    }
+
+    // 对话里最后一条 user 消息（图片只跟它走）
+    public static Dictionary<string, object> LastUser(List<Dictionary<string, object>> msgs)
+    {
+        Dictionary<string, object> last = null;
+        if (msgs == null) return null;
+        foreach (Dictionary<string, object> m in msgs)
+            if (Json.Str(m, "role", "") == "user") last = m;
+        return last;
+    }
+
+    // 这一轮的请求里带没带图（失败重发时要按它决定要不要退回纯文字）
+    public static bool MessagesHaveImages(List<Dictionary<string, object>> msgs)
+    {
+        Dictionary<string, object> u = LastUser(msgs);
+        return u != null && PathsIn(Json.Str(u, "content", "")).Count > 0;
+    }
+
+    // ---------- 工具产出的图片（2026-10-18 补回）----------
+    // 只挂"最后一条 user 之后"的工具结果（本轮），最多 2 张；超大图跳过并报一声。
+    public const int MaxToolImages = 2;
+    public const long MaxToolImageBytes = 1536L * 1024L;   // 1.5MB
+    public static Action<string> ToolImageReport = null;
+
+    static void AddToolImage(string p, List<string> res)
+    {
+        if (string.IsNullOrEmpty(p) || res.Contains(p)) return;
+        try
+        {
+            FileInfo fi = new FileInfo(p);
+            if (!fi.Exists) return;
+            if (fi.Length > MaxToolImageBytes)
+            {
+                if (ToolImageReport != null) ToolImageReport("图片太大（" + (fi.Length / 1024) + "KB），没有带上：" + Path.GetFileName(p));
+                return;
+            }
+            res.Add(p);
+        }
+        catch { }
+    }
+
+    // 单条工具结果里的图片（最新优先），给 ConvertMessages 用。
+    public static List<string> ToolImagesIn(Dictionary<string, object> msg)
+    {
+        List<string> res = new List<string>();
+        if (!ShouldSend || msg == null) return res;
+        if (Json.Str(msg, "role", "") != "tool") return res;
+        List<string> ps = PathsIn(Json.Str(msg, "content", ""));
+        for (int i = ps.Count - 1; i >= 0 && res.Count < MaxToolImages; i--)
+            AddToolImage(ps[i], res);
+        return res;
+    }
+
+    // 整轮的工具图（只算最后一条 user 之后的；从后往前，最多 MaxToolImages）。
+    public static List<string> ToolImages(List<Dictionary<string, object>> msgs)
+    {
+        List<string> res = new List<string>();
+        if (!ShouldSend || msgs == null) return res;
+        int lastUser = -1;
+        for (int i = 0; i < msgs.Count; i++)
+            if (Json.Str(msgs[i], "role", "") == "user") lastUser = i;
+        if (lastUser < 0) return res;
+        for (int i = msgs.Count - 1; i > lastUser && res.Count < MaxToolImages; i--)
+        {
+            if (Json.Str(msgs[i], "role", "") != "tool") continue;
+            List<string> ps = PathsIn(Json.Str(msgs[i], "content", ""));
+            for (int j = ps.Count - 1; j >= 0 && res.Count < MaxToolImages; j--)
+                AddToolImage(ps[j], res);
+        }
+        return res;
+    }
+
+    public static List<string> Base64ForPaths(List<string> paths)
+    {
+        List<string> res = new List<string>();
+        if (paths == null) return res;
+        foreach (string p in paths)
+        {
+            if (res.Count >= MaxToolImages) break;
+            string b64 = Base64Of(p);
+            if (b64 != null) res.Add(b64);
+        }
+        return res;
+    }
+
+    // Ollama 用：base64 列表
+    public static List<string> Base64List(string text)
+    {
+        List<string> res = new List<string>();
+        if (!ShouldSend) return res;
+        foreach (string p in PathsIn(text))
+        {
+            if (res.Count >= MaxImages) break;
+            string b64 = Base64Of(p);
+            if (b64 != null) res.Add(b64);
+        }
+        return res;
+    }
+
+    // OpenAI 兼容接口用：content 数组（文字 + 图片）
+    public static object ContentParts(string text)
+    {
+        if (!ShouldSend) return null;
+        List<string> paths = PathsIn(text);
+        if (paths.Count == 0) return null;
+        List<object> parts = new List<object>();
+        Dictionary<string, object> t = new Dictionary<string, object>();
+        t["type"] = "text";
+        t["text"] = text;
+        parts.Add(t);
+        int n = 0;
+        foreach (string p in paths)
+        {
+            if (n >= MaxImages) break;
+            string b64 = Base64Of(p);
+            if (b64 == null) continue;
+            Dictionary<string, object> url = new Dictionary<string, object>();
+            url["url"] = "data:" + Mime(p) + ";base64," + b64;
+            Dictionary<string, object> img = new Dictionary<string, object>();
+            img["type"] = "image_url";
+            img["image_url"] = url;
+            parts.Add(img);
+            n++;
+        }
+        return n > 0 ? (object)parts : null;
+    }
+
+    static string Mime(string p)
+    {
+        string e = Path.GetExtension(p).ToLowerInvariant();
+        if (e == ".jpg" || e == ".jpeg") return "image/jpeg";
+        if (e == ".gif") return "image/gif";
+        if (e == ".bmp") return "image/bmp";
+        if (e == ".webp") return "image/webp";
+        return "image/png";
+    }
+
+    // 读成 base64；太大或太大尺寸就先缩一下（不然一张截图能把请求体撑到几 MB）
+    public static string Base64Of(string path)
+    {
+        try
+        {
+            FileInfo fi = new FileInfo(path);
+            if (!fi.Exists || fi.Length > MaxBytes) return null;
+            using (Image img = Image.FromFile(path))
+            {
+                int w = img.Width, h = img.Height;
+                int edge = Math.Max(w, h);
+                if (edge <= MaxEdge && fi.Length <= 2L * 1024 * 1024)
+                    return Convert.ToBase64String(File.ReadAllBytes(path));
+                double k = MaxEdge / (double)edge;
+                int nw = Math.Max(1, (int)Math.Round(w * k));
+                int nh = Math.Max(1, (int)Math.Round(h * k));
+                using (Bitmap b = new Bitmap(nw, nh))
+                {
+                    using (Graphics g = Graphics.FromImage(b))
+                    {
+                        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                        g.DrawImage(img, 0, 0, nw, nh);
+                    }
+                    using (MemoryStream ms = new MemoryStream())
+                    {
+                        b.Save(ms, System.Drawing.Imaging.ImageFormat.Png);
+                        return Convert.ToBase64String(ms.ToArray());
+                    }
+                }
+            }
+        }
+        catch { return null; }
     }
 }
 
@@ -1214,7 +1477,7 @@ static class Tools
         if (!IsWriteTool(name)) return;
         throw new ToolException("当前权限档是「仅可查看」，不能执行 " + name + "。\n"
             + "读类操作（list_dir / read_file / search_text / glob / outline / tail_file）照常可用。\n"
-            + "需要改动的话，请让用户在输入条左下角把权限档切成「工作区内修改」或「完全权限」。");
+            + "需要改动的话，请让用户在输入条左下角把权限档切成「工作区内修改」或「完全访问」。");
     }
 
     public static string WriteFile(ToolContext ctx, Dictionary<string, object> a)
@@ -1264,14 +1527,43 @@ static class Tools
             + (o - n) + " 字符）—— 像是没写完或者复制中途断了";
     }
 
+    // 换行符归一化：模型传进来的 old_string/new_string 一律是 LF，而磁盘上的文件
+    // 常常是 CRLF（本仓库的 .ps1 / .md 就是）。不归一化的话 IndexOf(Ordinal) 永远匹配不上，
+    // 报的却是"没找到 old_string"—— 把人往"你抄错了原文"的方向带偏。
+    // 2026-10-13 实测复现：同一个多行 old_string，LF 文件成功、CRLF 文件必失败（改 .ps1 时连着撞两次）。
+    public static string ToLf(string s)
+    {
+        if (s == null) return null;
+        if (s.IndexOf('\r') < 0) return s;
+        return s.Replace("\r\n", "\n").Replace("\r", "\n");
+    }
+
+    // 文件主用哪种换行：CRLF 的条数是否多过"单独 LF"的条数
+    public static bool UsesCrlf(string s)
+    {
+        if (s == null) return false;
+        int crlf = 0, lf = 0;
+        for (int i = 0; i < s.Length; i++)
+        {
+            if (s[i] != '\n') continue;
+            if (i > 0 && s[i - 1] == '\r') crlf++; else lf++;
+        }
+        return crlf > lf;
+    }
+
     public static string EditFile(ToolContext ctx, Dictionary<string, object> a)
     {
         string path = ctx.Resolve(A.Str(a, "path", ""));
         if (!File.Exists(path)) throw new ToolException("文件不存在：" + path);
-        string oldS = A.Str(a, "old_string", "");
-        string newS = A.Str(a, "new_string", "");
         bool all = A.Bool(a, "replace_all", false);
-        string text = File.ReadAllText(path, Encoding.UTF8);
+        string raw = File.ReadAllText(path, Encoding.UTF8);
+        bool crlf = UsesCrlf(raw);                       // 记住文件原本的换行风格，写完要还原
+        string text = crlf ? ToLf(raw) : raw;            // 匹配和替换一律在 LF 空间做
+        string oldS = ToLf(A.Str(a, "old_string", ""));
+        string newS = ToLf(A.Str(a, "new_string", ""));
+        // 空的 old_string 会让下面的 IndexOf 循环原地打转（IndexOf("", i) 恒等于 i，idx 又不前进）。
+        // 以前只有 schema 标了必填挡着，真传个 "" 进来就是死循环 —— 宁可明确报错。
+        if (oldS.Length == 0) throw new ToolException("old_string 不能为空。要替换整份文件请用 write_file。");
         int count = 0, idx = 0;
         while ((idx = text.IndexOf(oldS, idx, StringComparison.Ordinal)) >= 0) { count++; idx += oldS.Length; }
         if (count == 0) throw new ToolException("没找到 old_string。请先用 read_file 看清原文，注意空格、缩进和换行要完全一致。");
@@ -1293,8 +1585,9 @@ static class Tools
                     + after + " 个，正数=缺右括号，负数=多右括号）。已拒绝写入，文件没动。\n"
                     + "请检查 new_string 里的 { 和 } 是不是成对。");
         }
+        if (crlf) result = result.Replace("\n", "\r\n");   // 还原成文件原本的换行风格，别整体重写行尾
         File.WriteAllText(path, result, new UTF8Encoding(false));
-        Changes.Record(path, text, result);
+        Changes.Record(path, raw, result);                 // 记原始内容，否则 diff 会显示"整个文件都在改行尾"
         return "已修改 " + path + "（替换 " + (all ? count : 1) + " 处）";
     }
 
@@ -1616,6 +1909,100 @@ static class Tools
     }
 }
 
+// ============================ 远程审批：接「Ahz 通信台」 ============================
+// 开关打开时，高危操作不再本地弹窗，而是推到网页控制台（..\ahz通信\通讯.ps1），
+// 等用户在手机上点「批准 / 拒绝」。返回 1=批准 / 0=拒绝；<0 = 通信台不可用（调用方回退本地弹窗）。
+static class RemoteApproval
+{
+    // 约定路径：exe 所在目录（local-agent\）的上一层，进 ahz通信\通讯.ps1
+    public static string DefaultScript()
+    {
+        try
+        {
+            string baseDir = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
+            DirectoryInfo up = Directory.GetParent(baseDir);
+            if (up != null)
+            {
+                string cand = Path.Combine(up.FullName, "ahz通信", "通讯.ps1");
+                if (File.Exists(cand)) return cand;
+            }
+        }
+        catch { }
+        return "";
+    }
+
+    public static string ScriptPath(AgentConfig config)
+    {
+        string s = config != null ? config.remote_approval_script : null;
+        if (!string.IsNullOrEmpty(s) && File.Exists(s)) return s;
+        return DefaultScript();
+    }
+
+    // 发一条授权请求并阻塞等待。action 必须写清"到底要做什么"（用户靠它决定批不批）。
+    public static int Ask(AgentConfig config, string action, string reason, out string detail)
+    {
+        detail = "";
+        string script = ScriptPath(config);
+        if (string.IsNullOrEmpty(script))
+        {
+            detail = "找不到通信台脚本（通讯.ps1）";
+            return -1;
+        }
+        int wait = (config != null && config.remote_approval_wait > 0) ? config.remote_approval_wait : 600;
+
+        ProcessStartInfo psi = new ProcessStartInfo();
+        try { psi.FileName = Tools.FindShell(); }
+        catch { psi.FileName = "powershell.exe"; }
+        psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File \"" + script + "\" -Mode 请求授权";
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        psi.RedirectStandardOutput = true;
+        psi.RedirectStandardError = true;
+        psi.StandardOutputEncoding = Encoding.UTF8;
+        psi.StandardErrorEncoding = Encoding.UTF8;
+        // 走环境变量传参：PS 5.1 用 -File 时会把空字符串参数整个丢掉，正文绝不能走命令行
+        try
+        {
+            psi.EnvironmentVariables["AHZ_ACTION"] = action == null ? "" : action;
+            psi.EnvironmentVariables["AHZ_REASON"] = reason == null ? "" : reason;
+            psi.EnvironmentVariables["AHZ_WAIT"] = wait.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+        catch { }
+
+        try
+        {
+            using (Process p = Process.Start(psi))
+            {
+                if (p == null) { detail = "通信台进程没起来"; return -1; }
+                StringBuilder so = new StringBuilder();
+                p.OutputDataReceived += delegate(object s, DataReceivedEventArgs e) { if (e.Data != null) so.AppendLine(e.Data); };
+                p.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e) { if (e.Data != null) so.AppendLine(e.Data); };
+                p.BeginOutputReadLine();
+                p.BeginErrorReadLine();
+                // 多给 60 秒余量，让脚本自己走完超时逻辑再收尾
+                if (!p.WaitForExit((wait + 60) * 1000))
+                {
+                    try { Tools.KillTree(p); } catch { }
+                    detail = "等通信台回话超时";
+                    return -1;
+                }
+                try { p.WaitForExit(); } catch { }
+                detail = so.ToString().Trim();
+                int code = p.ExitCode;
+                if (code == 0) return 1;        // 批准
+                if (code == 3) return 0;        // 拒绝
+                if (code == 4) { detail += "\n（等待超时，按未授权处理）"; return 0; }
+                return -1;
+            }
+        }
+        catch (Exception ex)
+        {
+            detail = ex.Message;
+            return -1;
+        }
+    }
+}
+
 // ============================ 插件：给 agent 加工具 ============================
 // 插件就是程序目录 plugins\ 下的一个 json 文件，里面声明若干工具。
 // 支持两种类型：
@@ -1808,6 +2195,16 @@ static class Plugins
             foreach (PluginParam p in t.parameters)
                 if (p != null && p.required && (args == null || !args.ContainsKey(p.name)))
                     throw new ToolException("缺少必填参数 " + p.name);
+
+        // 声明了但没传的参数补空串：模板里的 {{name}} 如果原样残留、又被替换进命令/URL，会变成语法错误。
+        //（2026-10-16 修：模板手写引号 + 引擎自动再加引号 → ''值'' 解析失败，ahz_reply 连挂 4 次）
+        if (t.parameters != null)
+        {
+            if (args == null) args = new Dictionary<string, object>();
+            foreach (PluginParam p in t.parameters)
+                if (p != null && !string.IsNullOrEmpty(p.name) && !args.ContainsKey(p.name))
+                    args[p.name] = "";
+        }
 
         if (shell)
         {
@@ -2143,6 +2540,7 @@ class OllamaClient
 {
     public string Host;
     private HttpWebRequest _current;
+    private CancellationTokenSource _cts;
     private readonly object _lock = new object();
 
     public OllamaClient(string host)
@@ -2155,17 +2553,29 @@ class OllamaClient
 
     public void Cancel()
     {
-        lock (_lock) { if (_current != null) { try { _current.Abort(); } catch { } } }
+        lock (_lock)
+        {
+            if (_current != null) { try { _current.Abort(); } catch { } }
+            if (_cts != null) { try { _cts.Cancel(); } catch { } }
+        }
     }
 
     HttpWebRequest Make(string path, string method, string json)
+    {
+        return Make(path, method, json, 0);
+    }
+
+    // timeoutMs = 0 用默认（生成任务可能跑十几分钟）。
+    // 但"探测 / 列模型"这种点一下就该立刻有反应的操作必须给短超时：
+    // 它们是在 UI 线程上调的，默认 15 分钟超时 = 界面能假死一刻钟（2026-10-15 排查时发现）。
+    HttpWebRequest Make(string path, string method, string json, int timeoutMs)
     {
         Program.EnsureTls();
         HttpWebRequest req = (HttpWebRequest)WebRequest.Create(Host + path);
         req.Method = method;
         req.Proxy = null;
-        req.Timeout = 900000;
-        req.ReadWriteTimeout = 900000;
+        req.Timeout = timeoutMs > 0 ? timeoutMs : 900000;
+        req.ReadWriteTimeout = timeoutMs > 0 ? timeoutMs : 900000;
         req.KeepAlive = false;
         if (json != null)
         {
@@ -2189,14 +2599,19 @@ class OllamaClient
     {
         Dictionary<string, object> payload = new Dictionary<string, object>();
         payload["model"] = model;
-        Dictionary<string, object> result = PostJson("/api/show", payload);
+        Dictionary<string, object> result = PostJson("/api/show", payload, 20000);   // 探测：短超时，别把界面拖死
         if (result == null) throw new LocalAgentException("读不到模型信息：" + model);
         return result;
     }
 
     public Dictionary<string, object> PostJson(string path, Dictionary<string, object> payload)
     {
-        HttpWebRequest req = Make(path, "POST", Json.Dump(payload));
+        return PostJson(path, payload, 0);
+    }
+
+    public Dictionary<string, object> PostJson(string path, Dictionary<string, object> payload, int timeoutMs)
+    {
+        HttpWebRequest req = Make(path, "POST", Json.Dump(payload), timeoutMs);
         try
         {
             using (WebResponse resp = req.GetResponse())
@@ -2209,56 +2624,78 @@ class OllamaClient
     public List<Dictionary<string, object>> Tags()
     {
         List<Dictionary<string, object>> list = new List<Dictionary<string, object>>();
-        HttpWebRequest req = Make("/api/tags", "GET", null);
         try
         {
-            using (WebResponse resp = req.GetResponse())
-            {
-                Dictionary<string, object> o = Json.Obj(ReadBody(resp));
-                object[] arr = Json.Arr(Json.Get(o, "models"));
-                if (arr != null)
-                    foreach (object it in arr)
-                    {
-                        Dictionary<string, object> m = Json.Map(it);
-                        if (m != null) list.Add(m);
-                    }
-            }
+            string body = HttpJson.Get(Host + "/api/tags", 20000, null);   // 列模型：短超时
+            Dictionary<string, object> o = Json.Obj(body);
+            object[] arr = Json.Arr(Json.Get(o, "models"));
+            if (arr != null)
+                foreach (object it in arr)
+                {
+                    Dictionary<string, object> m = Json.Map(it);
+                    if (m != null) list.Add(m);
+                }
         }
-        catch (WebException ex) { throw new LocalAgentException(Describe(ex)); }
-        finally { lock (_lock) { _current = null; } }
+        catch (Exception ex) { throw new LocalAgentException(ex.Message); }
         return list;
     }
 
-    public Dictionary<string, object> ChatStream(Dictionary<string, object> payload, Action<Dictionary<string, object>> onChunk)
+    public async Task<Dictionary<string, object>> ChatStreamAsync(Dictionary<string, object> payload, Action<Dictionary<string, object>> onChunk)
     {
-        HttpWebRequest req = Make("/api/chat", "POST", Json.Dump(payload));
         Dictionary<string, object> last = null;
+        CancellationTokenSource cts = new CancellationTokenSource();
+        lock (_lock) { _cts = cts; }
         try
         {
-            using (WebResponse resp = req.GetResponse())
-            using (Stream s = resp.GetResponseStream())
-            using (StreamReader r = new StreamReader(s, Encoding.UTF8))
+            HttpClientHandler h = new HttpClientHandler();
+            h.UseProxy = false;
+            using (HttpClient c = new HttpClient(h))
             {
-                string line;
-                while ((line = r.ReadLine()) != null)
+                c.Timeout = System.Threading.Timeout.InfiniteTimeSpan;
+                using (HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Post, Host + "/api/chat"))
                 {
-                    if (line.Trim().Length == 0) continue;
-                    Dictionary<string, object> chunk;
-                    try { chunk = Json.Obj(line); }
-                    catch { continue; }
-                    if (chunk == null) continue;
-                    if (onChunk != null) onChunk(chunk);
-                    if (Json.Bool(chunk, "done", false)) last = chunk;
+                    req.Content = new StringContent(Json.Dump(payload), Encoding.UTF8, "application/json");
+                    using (HttpResponseMessage resp = await c.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, cts.Token))
+                    {
+                        if (!resp.IsSuccessStatusCode)
+                        {
+                            string err = await resp.Content.ReadAsStringAsync();
+                            throw new LocalAgentException("Ollama 返回 HTTP " + (int)resp.StatusCode + "：" + err);
+                        }
+                        using (Stream s = await resp.Content.ReadAsStreamAsync())
+                        using (StreamReader r = new StreamReader(s, Encoding.UTF8))
+                        {
+                            string line;
+                            while ((line = await r.ReadLineAsync()) != null)
+                            {
+                                if (line.Trim().Length == 0) continue;
+                                Dictionary<string, object> chunk;
+                                try { chunk = Json.Obj(line); }
+                                catch { continue; }
+                                if (chunk == null) continue;
+                                if (onChunk != null) onChunk(chunk);
+                                if (Json.Bool(chunk, "done", false)) last = chunk;
+                            }
+                        }
+                    }
                 }
             }
         }
-        catch (WebException ex)
+        catch (OperationCanceledException) { throw new LocalAgentException("__CANCELLED__"); }
+        catch (LocalAgentException) { throw; }
+        catch (Exception ex) { throw new LocalAgentException("连不上 Ollama（" + ex.Message + "）\n提示：确认 Ollama 正在运行。"); }
+        finally
         {
-            if (ex.Status == WebExceptionStatus.RequestCanceled) throw new LocalAgentException("__CANCELLED__");
-            throw new LocalAgentException(Describe(ex));
+            lock (_lock) { _current = null; _cts = null; }
+            try { cts.Dispose(); } catch { }
         }
-        finally { lock (_lock) { _current = null; } }
         return last;
+    }
+
+    // 兼容旧调用（探针/测试）；产品 UI 走 ChatStreamAsync。
+    public Dictionary<string, object> ChatStream(Dictionary<string, object> payload, Action<Dictionary<string, object>> onChunk)
+    {
+        return ChatStreamAsync(payload, onChunk).GetAwaiter().GetResult();
     }
 
     static string Describe(WebException ex)
@@ -2294,9 +2731,12 @@ interface ILlm
     Dictionary<string, object> Stream(
         List<Dictionary<string, object>> messages, List<object> tools, bool think, string effort, int numCtx,
         Action<string> onThinking, Action<string> onContent, Action<Dictionary<string, object>> onToolCall);
+    Task<Dictionary<string, object>> StreamAsync(
+        List<Dictionary<string, object>> messages, List<object> tools, bool think, string effort, int numCtx,
+        Action<string> onThinking, Action<string> onContent, Action<Dictionary<string, object>> onToolCall);
     void Cancel();
     Dictionary<string, object> Probe();     // 能力探测，OpenAI 兼容接口返回 null
-    List<string> ListModels();
+    List<ModelMeta> ListModelInfos();     // 拉模型清单（含接口给的能力标签）
     void Close();
 }
 
@@ -2311,7 +2751,8 @@ static class Perm
     public const string Full = "full";
 
     public static readonly string[] Values = new string[] { Readonly, Workspace, Full };
-    public static readonly string[] Labels = new string[] { "仅可查看", "工作区内修改", "完全权限" };
+    // 「完全访问」是照 Codex 那一屏写的（用户截图里输入条左下角就是这四个字）
+    public static readonly string[] Labels = new string[] { "仅可查看", "工作区内修改", "完全访问" };
     public static readonly string[] Icons2 = new string[] { "eye", "folder", "warn" };
 
     public static int Index(string v)
@@ -2385,6 +2826,33 @@ static class Effort
         return CloudSupportsEffort(model);
     }
 
+    // 有 Provider 的写法：接口在 /models 里声明过 supported_levels 就信接口，
+    // 没声明才回落到上面那份写死的白名单（老行为不能丢）。
+    public static bool Supported(Provider p, string model, string thinkingValues)
+    {
+        if (p == null) return false;
+        if (p.type == "ollama") return Supported("ollama", model, thinkingValues);
+        ModelMeta m = p.Meta(model);
+        if (m != null && m.efforts != null && m.efforts.Count >= 2) return true;
+        return CloudSupportsEffort(model);
+    }
+
+    // 界面三档（低/中/高）→ 接口真正认的那个字符串。
+    //   接口声明了档位：按位置对（第一个=低、最后一个=高）。
+    //     例：DeepSeek 给的是 low/high/max → 低=low、中=high、高=max。
+    //   接口没声明：按老行为原样发（low/medium/high 是 OpenAI 那套）。
+    public static string ResolveFor(Provider p, string model, string e)
+    {
+        if (!IsSet(e)) return null;
+        ModelMeta m = p == null ? null : p.Meta(model);
+        if (m == null || m.efforts == null || m.efforts.Count == 0) return e;
+        int idx = Index(e);                                     // 0 / 1 / 2
+        int k = m.efforts.Count == 1 ? 0 : (int)Math.Round(idx * (m.efforts.Count - 1) / 2.0);
+        if (k < 0) k = 0;
+        if (k >= m.efforts.Count) k = m.efforts.Count - 1;
+        return m.efforts[k];
+    }
+
     public static bool CloudSupportsEffort(string model)
     {
         if (string.IsNullOrEmpty(model)) return false;
@@ -2424,12 +2892,25 @@ class OllamaLlm : ILlm
     static List<object> ConvertMessages(List<Dictionary<string, object>> msgs)
     {
         List<object> list = new List<object>();
-        foreach (Dictionary<string, object> m in msgs)
+        // 只有最后一条用户消息带图：历史里的图不必每轮重发
+        Dictionary<string, object> lastUser = Vision.LastUser(msgs);
+        int lastUserIdx = -1;
+        for (int mi = 0; mi < msgs.Count; mi++)
+            if (msgs[mi] == lastUser) lastUserIdx = mi;
+        for (int mi = 0; mi < msgs.Count; mi++)
         {
+            Dictionary<string, object> m = msgs[mi];
             string role = Json.Str(m, "role", "user");
             Dictionary<string, object> o = new Dictionary<string, object>();
             o["role"] = role;
-            o["content"] = Json.Str(m, "content", "");
+            string text = Json.Str(m, "content", "");
+            o["content"] = text;
+            // 图片走 Ollama 自己的 images 字段（/api/chat 不认 OpenAI 那种 content 数组）
+            if (m == lastUser)
+            {
+                List<string> imgs = Vision.Base64List(text);
+                if (imgs.Count > 0) o["images"] = imgs;
+            }
             object[] calls = Json.Arr(Json.Get(m, "tool_calls"));
             if (calls != null && calls.Length > 0)
             {
@@ -2447,12 +2928,24 @@ class OllamaLlm : ILlm
                 }
                 o["tool_calls"] = outCalls;
             }
+            // 本轮工具结果里的图：图挂在 tool 那条的 images 上，再补一条 user 说明。
+            List<string> toolImgs = (role == "tool" && lastUserIdx >= 0 && mi > lastUserIdx)
+                ? Vision.ToolImagesIn(m) : new List<string>();
+            List<string> toolB64 = Vision.Base64ForPaths(toolImgs);
+            if (toolB64.Count > 0) o["images"] = toolB64;
             list.Add(o);
+            if (toolB64.Count > 0)
+            {
+                Dictionary<string, object> note = new Dictionary<string, object>();
+                note["role"] = "user";
+                note["content"] = "工具结果里的图片（见上一条工具消息）";
+                list.Add(note);
+            }
         }
         return list;
     }
 
-    public Dictionary<string, object> Stream(
+    public async Task<Dictionary<string, object>> StreamAsync(
         List<Dictionary<string, object>> messages, List<object> tools, bool think, string effort, int numCtx,
         Action<string> onThinking, Action<string> onContent, Action<Dictionary<string, object>> onToolCall)
     {
@@ -2467,7 +2960,7 @@ class OllamaLlm : ILlm
         opts["num_ctx"] = numCtx;
         payload["options"] = opts;
 
-        return _client.ChatStream(payload, delegate(Dictionary<string, object> chunk)
+        return await _client.ChatStreamAsync(payload, delegate(Dictionary<string, object> chunk)
         {
             Dictionary<string, object> msg = Json.Map(Json.Get(chunk, "message"));
             if (msg == null) return;
@@ -2498,13 +2991,33 @@ class OllamaLlm : ILlm
         });
     }
 
+    // 兼容旧探针/测试；产品链路走 StreamAsync。
+    public Dictionary<string, object> Stream(
+        List<Dictionary<string, object>> messages, List<object> tools, bool think, string effort, int numCtx,
+        Action<string> onThinking, Action<string> onContent, Action<Dictionary<string, object>> onToolCall)
+    {
+        return StreamAsync(messages, tools, think, effort, numCtx, onThinking, onContent, onToolCall)
+            .GetAwaiter().GetResult();
+    }
+
     public Dictionary<string, object> Probe() { return _client.Show(_model); }
 
-    public List<string> ListModels()
+    // /api/tags 只列"本地已经拉下来的"模型（不列能下载的），也没有能力标签 ——
+    // 能力得走 /api/show，那是按需探测的，别在这里对每个模型都打一次。
+    public List<ModelMeta> ListModelInfos()
     {
-        List<string> names = new List<string>();
-        foreach (Dictionary<string, object> m in _client.Tags()) names.Add(Json.Str(m, "name", "?"));
-        return names;
+        List<ModelMeta> list = new List<ModelMeta>();
+        foreach (Dictionary<string, object> m in _client.Tags())
+        {
+            string nm = Json.Str(m, "name", null);
+            if (string.IsNullOrEmpty(nm)) nm = Json.Str(m, "model", null);
+            if (string.IsNullOrEmpty(nm)) continue;
+            ModelMeta mi = new ModelMeta();
+            mi.id = nm;
+            list.Add(mi);
+        }
+        list.Sort(delegate(ModelMeta a, ModelMeta b) { return string.CompareOrdinal(a.id, b.id); });
+        return list;
     }
 }
 
@@ -2515,6 +3028,7 @@ class OpenAiLlm : ILlm
     private readonly Provider _p;
     private readonly string _model;
     private HttpWebRequest _current;
+    private CancellationTokenSource _cts;
     private readonly object _lock = new object();
 
     public OpenAiLlm(Provider p, string model)
@@ -2525,7 +3039,14 @@ class OpenAiLlm : ILlm
 
     public string Kind { get { return "openai"; } }
 
-    public void Cancel() { lock (_lock) { if (_current != null) { try { _current.Abort(); } catch { } } } }
+    public void Cancel()
+    {
+        lock (_lock)
+        {
+            if (_current != null) { try { _current.Abort(); } catch { } }
+            if (_cts != null) { try { _cts.Cancel(); } catch { } }
+        }
+    }
 
     public void Close() { }
 
@@ -2538,12 +3059,19 @@ class OpenAiLlm : ILlm
 
     HttpWebRequest Make(string url, string method, string json)
     {
+        return Make(url, method, json, 0);
+    }
+
+    // timeoutMs = 0 用默认（生成要能跑十几分钟）；列模型这种"点一下要立刻有反应"的给短超时，
+    // 否则在 UI 线程上等 15 分钟 = 界面假死（2026-10-15 排查"设置/拉取卡死"时发现）。
+    HttpWebRequest Make(string url, string method, string json, int timeoutMs)
+    {
         Program.EnsureTls();
         HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
         req.Method = method;
         req.Proxy = null;
-        req.Timeout = 900000;
-        req.ReadWriteTimeout = 900000;
+        req.Timeout = timeoutMs > 0 ? timeoutMs : 900000;
+        req.ReadWriteTimeout = timeoutMs > 0 ? timeoutMs : 900000;
         req.KeepAlive = false;
         req.Accept = "application/json";
         if (!string.IsNullOrEmpty(_p.api_key)) req.Headers["Authorization"] = "Bearer " + _p.api_key.Trim();
@@ -2591,12 +3119,19 @@ class OpenAiLlm : ILlm
     static List<object> ConvertMessages(List<Dictionary<string, object>> msgs)
     {
         List<object> list = new List<object>();
-        foreach (Dictionary<string, object> m in msgs)
+        Dictionary<string, object> lastUser = Vision.LastUser(msgs);
+        int lastUserIdx = -1;
+        for (int mi = 0; mi < msgs.Count; mi++)
+            if (msgs[mi] == lastUser) lastUserIdx = mi;
+        for (int mi = 0; mi < msgs.Count; mi++)
         {
+            Dictionary<string, object> m = msgs[mi];
             string role = Json.Str(m, "role", "user");
             Dictionary<string, object> o = new Dictionary<string, object>();
             o["role"] = role;
             string content = Json.Str(m, "content", "");
+            // 带图的用户消息：content 换成"文字 + 图片"数组（OpenAI 多模态格式）
+            object vision = (m == lastUser) ? Vision.ContentParts(content) : null;
             object[] calls = Json.Arr(Json.Get(m, "tool_calls"));
             if (role == "tool")
             {
@@ -2624,14 +3159,30 @@ class OpenAiLlm : ILlm
             }
             else
             {
-                o["content"] = content;
+                o["content"] = vision != null ? vision : (object)content;
             }
             list.Add(o);
+            // 本轮工具图：tool 消息保持原样，在后面补一条“文字 + 图片”的合成 user。
+            if (role == "tool" && lastUserIdx >= 0 && mi > lastUserIdx)
+            {
+                List<string> toolImgs = Vision.ToolImagesIn(m);
+                if (toolImgs.Count > 0)
+                {
+                    object parts = Vision.ContentParts("工具结果里的图片：\n" + string.Join("\n", toolImgs.ToArray()));
+                    if (parts != null)
+                    {
+                        Dictionary<string, object> note = new Dictionary<string, object>();
+                        note["role"] = "user";
+                        note["content"] = parts;
+                        list.Add(note);
+                    }
+                }
+            }
         }
         return list;
     }
 
-    public Dictionary<string, object> Stream(
+    public async Task<Dictionary<string, object>> StreamAsync(
         List<Dictionary<string, object>> messages, List<object> tools, bool think, string effort, int numCtx,
         Action<string> onThinking, Action<string> onContent, Action<Dictionary<string, object>> onToolCall)
     {
@@ -2644,20 +3195,35 @@ class OpenAiLlm : ILlm
             payload["tool_choice"] = "auto";
         }
         payload["stream"] = true;
-        string eff = Effort.OpenAiEffort(effort);
+        // 接口在 /models 里声明过档位就按它发（比如 DeepSeek 是 low/high/max），否则原样发
+        string eff = Effort.ResolveFor(_p, _model, effort);
         if (eff != null) payload["reasoning_effort"] = eff;
 
         Dictionary<int, Dictionary<string, object>> pending = new Dictionary<int, Dictionary<string, object>>();
         Dictionary<string, object> stats = null;
-        HttpWebRequest req = Make(Root() + "/chat/completions", "POST", Json.Dump(payload));
+        CancellationTokenSource cts = new CancellationTokenSource();
+        lock (_lock) { _cts = cts; }
         try
         {
-            using (WebResponse resp = req.GetResponse())
-            using (Stream s = resp.GetResponseStream())
-            using (StreamReader r = new StreamReader(s, Encoding.UTF8))
+            HttpClientHandler h = new HttpClientHandler();
+            h.UseProxy = false;
+            using (HttpClient c = new HttpClient(h))
+            using (HttpRequestMessage hreq = new HttpRequestMessage(HttpMethod.Post, Root() + "/chat/completions"))
             {
+                c.Timeout = System.Threading.Timeout.InfiniteTimeSpan;
+                hreq.Content = new StringContent(Json.Dump(payload), Encoding.UTF8, "application/json");
+                using (HttpResponseMessage resp = await c.SendAsync(hreq, HttpCompletionOption.ResponseHeadersRead, cts.Token))
+                {
+                    if (!resp.IsSuccessStatusCode)
+                    {
+                        string err = await resp.Content.ReadAsStringAsync();
+                        throw new LocalAgentException("接口返回 HTTP " + (int)resp.StatusCode + "：" + err);
+                    }
+                    using (Stream s = await resp.Content.ReadAsStreamAsync())
+                    using (StreamReader r = new StreamReader(s, Encoding.UTF8))
+                    {
                 string line;
-                while ((line = r.ReadLine()) != null)
+                while ((line = await r.ReadLineAsync()) != null)
                 {
                     line = line.Trim();
                     if (line.Length == 0) continue;
@@ -2708,14 +3274,18 @@ class OpenAiLlm : ILlm
                             }
                         }
                 }
+                    }
+                }
             }
         }
-        catch (WebException ex)
+        catch (OperationCanceledException) { throw new LocalAgentException("__CANCELLED__"); }
+        catch (LocalAgentException) { throw; }
+        catch (Exception ex) { throw new LocalAgentException("接口请求失败：" + ex.Message); }
+        finally
         {
-            if (ex.Status == WebExceptionStatus.RequestCanceled) throw new LocalAgentException("__CANCELLED__");
-            throw new LocalAgentException(Describe(ex));
+            lock (_lock) { _current = null; _cts = null; }
+            try { cts.Dispose(); } catch { }
         }
-        finally { lock (_lock) { _current = null; } }
 
         foreach (KeyValuePair<int, Dictionary<string, object>> kv in pending)
         {
@@ -2735,32 +3305,82 @@ class OpenAiLlm : ILlm
         return stats;
     }
 
+    // 兼容旧探针/测试；产品链路走 StreamAsync。
+    public Dictionary<string, object> Stream(
+        List<Dictionary<string, object>> messages, List<object> tools, bool think, string effort, int numCtx,
+        Action<string> onThinking, Action<string> onContent, Action<Dictionary<string, object>> onToolCall)
+    {
+        return StreamAsync(messages, tools, think, effort, numCtx, onThinking, onContent, onToolCall)
+            .GetAwaiter().GetResult();
+    }
+
     public Dictionary<string, object> Probe() { return null; }
 
-    public List<string> ListModels()
+    public List<ModelMeta> ListModelInfos()
     {
-        List<string> names = new List<string>();
-        HttpWebRequest req = Make(Root() + "/models", "GET", null);
         try
         {
-            using (WebResponse resp = req.GetResponse())
-            {
-                Dictionary<string, object> o = Json.Obj(ReadAll(resp));
-                object[] data = Json.Arr(Json.Get(o, "data"));
-                if (data != null)
-                    foreach (object d in data)
-                    {
-                        Dictionary<string, object> dm = Json.Map(d);
-                        if (dm == null) continue;
-                        string id = Json.Str(dm, "id", null);
-                        if (!string.IsNullOrEmpty(id)) names.Add(id);
-                    }
-            }
+            string body = HttpJson.Get(Root() + "/models", 30000, _p.api_key);   // 列模型：短超时（这步在 UI 线程上跑）
+            return ParseModelList(body);
         }
-        catch (WebException ex) { throw new LocalAgentException(Describe(ex)); }
-        finally { lock (_lock) { _current = null; } }
-        names.Sort(StringComparer.OrdinalIgnoreCase);
-        return names;
+        catch (Exception ex) { throw new LocalAgentException(ex.Message); }
+    }
+
+    // 解析 GET {base}/models 的返回。除了 id，接口通常还给了：
+    //   name              显示名（DeepSeek-V4.1-Flash）
+    //   context_window    上下文长度
+    //   input_modalities  能不能看图（["text","image"]）
+    //   effort.supported_levels  支持的档位（["low","high","max"]）
+    // 这些以前全被扔了。抽成静态方法是为了能拿真返回离线跑自测（不打网络）。
+    public static List<ModelMeta> ParseModelList(string json)
+    {
+        List<ModelMeta> list = new List<ModelMeta>();
+        Dictionary<string, object> o = Json.Obj(json);
+        object[] data = Json.Arr(Json.Get(o, "data"));
+        if (data == null) return list;
+        foreach (object d in data)
+        {
+            Dictionary<string, object> dm = Json.Map(d);
+            if (dm == null) continue;
+            string id = Json.Str(dm, "id", null);
+            if (string.IsNullOrEmpty(id)) continue;
+            ModelMeta mi = new ModelMeta();
+            mi.id = id;
+            mi.name = Json.Str(dm, "name", null);
+
+            object ctx = Json.Get(dm, "context_window");
+            if (ctx != null)
+            {
+                int v;
+                if (int.TryParse(Convert.ToString(ctx, System.Globalization.CultureInfo.InvariantCulture), out v)) mi.ctx = v;
+            }
+
+            object[] mods = Json.Arr(Json.Get(dm, "input_modalities"));
+            if (mods != null && mods.Length > 0)
+            {
+                bool hasImage = false, hasText = false;
+                foreach (object mo in mods)
+                {
+                    string s = Convert.ToString(mo, System.Globalization.CultureInfo.InvariantCulture).ToLowerInvariant();
+                    if (s == "image") hasImage = true;
+                    else if (s == "text") hasText = true;
+                }
+                if (hasImage) mi.vision = true;
+                else if (hasText) mi.vision = false;      // 明说了只有文字 → 就是看不了图
+            }
+
+            Dictionary<string, object> ef = Json.Map(Json.Get(dm, "effort"));
+            object[] levels = ef == null ? null : Json.Arr(Json.Get(ef, "supported_levels"));
+            if (levels != null)
+                foreach (object l in levels)
+                {
+                    string s = Convert.ToString(l, System.Globalization.CultureInfo.InvariantCulture);
+                    if (!string.IsNullOrEmpty(s)) mi.efforts.Add(s);
+                }
+            list.Add(mi);
+        }
+        list.Sort(delegate(ModelMeta a, ModelMeta b) { return string.CompareOrdinal(a.id, b.id); });
+        return list;
     }
 }
 
@@ -2771,9 +3391,44 @@ static class LlmFactory
         if (p != null && p.type == "ollama") return new OllamaLlm(p.base_url, model);
         return new OpenAiLlm(p, model);
     }
+
+    // 只要 id 的调用（CLI 的 --list-models）用这个
+    public static List<string> Ids(List<ModelMeta> infos)
+    {
+        List<string> ids = new List<string>();
+        if (infos == null) return ids;
+        foreach (ModelMeta m in infos) if (m != null && m.id != null) ids.Add(m.id);
+        return ids;
+    }
 }
 
 // ============================ 会话配置 ============================
+
+// 接口在 /models 里给的"模型能力标签"。以前拉取只取 id，把接口能给的全扔了 ——
+// 结果 chip 只能显示 deepseek-flash 这种生 id，档位也只能靠一份写死的模型名白名单猜。
+// 现在拉一次就存一次，界面和请求参数都以接口说的为准。
+class ModelMeta
+{
+    public string id { get; set; }            // 模型 id（真正发给接口的那个）
+    public string name { get; set; }          // 显示名：接口的 name（DeepSeek-V4.1-Flash 这种）
+    public bool? vision { get; set; }         // 能不能看图（null = 接口没说）
+    public int ctx { get; set; }              // 上下文长度
+    public List<string> efforts { get; set; } // 接口声明的档位，从低到高（low/high/max 这种）
+
+    public ModelMeta()
+    {
+        id = "";
+        name = "";
+        efforts = new List<string>();
+    }
+
+    public string Display(string fallbackId)
+    {
+        if (name != null && name.Length > 0) return name;
+        if (id != null && id.Length > 0) return id;
+        return fallbackId;
+    }
+}
 
 class Provider
 {
@@ -2783,6 +3438,7 @@ class Provider
     public string base_url { get; set; }
     public string api_key { get; set; }
     public List<string> models { get; set; }
+    public Dictionary<string, ModelMeta> model_meta { get; set; }   // 模型 id → 接口给的能力（老配置没有这项，允许为空）
 
     public Provider()
     {
@@ -2792,6 +3448,37 @@ class Provider
         base_url = "";          // 别默认成某一家：新提供商应该由预设或用户自己填
         api_key = "";
         models = new List<string>();
+        model_meta = new Dictionary<string, ModelMeta>();
+    }
+
+    // 这个模型的能力标签（没有就返回 null，调用方自己回落到老行为）
+    public ModelMeta Meta(string model)
+    {
+        ModelMeta m;
+        if (model_meta == null || model == null) return null;
+        return model_meta.TryGetValue(model, out m) ? m : null;
+    }
+
+    public void SetMeta(ModelMeta m)
+    {
+        if (m == null || m.id == null || m.id.Length == 0) return;
+        if (model_meta == null) model_meta = new Dictionary<string, ModelMeta>();
+        model_meta[m.id] = m;
+    }
+
+    // chip / 列表上显示的名字：接口给了显示名就用显示名
+    public string DisplayName(string model)
+    {
+        ModelMeta m = Meta(model);
+        return m == null ? model : m.Display(model);
+    }
+
+    // 能不能看图：true/false = 知道；null = 接口没说
+    // （云端看 /models 的 input_modalities，本地看 /api/show 的 capabilities）
+    public bool? CanSeeImages(string model)
+    {
+        ModelMeta m = Meta(model);
+        return m == null ? (bool?)null : m.vision;
     }
 
     public static Provider DefaultOllama()
@@ -2812,8 +3499,47 @@ class Provider
     }
 }
 
+// API Key 落盘加密：DPAPI CurrentUser（只有当前 Windows 用户能解）。
+// 老 config.json 的明文 Key 仍能读；下一次保存时自动迁移成 dpapi-v1: 前缀。
+static class Dpapi
+{
+    const string Prefix = "dpapi-v1:";
+    static readonly byte[] Entropy = Encoding.UTF8.GetBytes("AhzScribe.config.v1");
+
+    public static bool IsProtected(string s)
+    {
+        return !string.IsNullOrEmpty(s) && s.StartsWith(Prefix, StringComparison.Ordinal);
+    }
+
+    public static string Protect(string plain)
+    {
+        if (string.IsNullOrEmpty(plain) || IsProtected(plain)) return plain;
+        try
+        {
+            byte[] data = ProtectedData.Protect(Encoding.UTF8.GetBytes(plain), Entropy, DataProtectionScope.CurrentUser);
+            return Prefix + Convert.ToBase64String(data);
+        }
+        catch (Exception ex) { Log.Swallow(ex, "加密 API Key"); throw; }
+    }
+
+    public static string Unprotect(string stored)
+    {
+        if (!IsProtected(stored)) return stored;
+        try
+        {
+            byte[] data = Convert.FromBase64String(stored.Substring(Prefix.Length));
+            byte[] plain = ProtectedData.Unprotect(data, Entropy, DataProtectionScope.CurrentUser);
+            return Encoding.UTF8.GetString(plain);
+        }
+        catch (Exception ex) { Log.Swallow(ex, "解密 API Key"); return ""; }
+    }
+}
+
 class AgentConfig
 {
+    // 启动时把“配置读坏了/写失败了”带到界面上，不再只写日志。
+    public static string LastLoadError = "";
+    public static string LastSaveError = "";
     public List<Provider> providers { get; set; }
     public string provider { get; set; }
     public string model { get; set; }
@@ -2832,9 +3558,17 @@ class AgentConfig
     public bool auto_verify { get; set; }        // 改完文件后自动跑项目测试，把结果回灌给模型
     public bool follow_output { get; set; }      // 流式输出时自动滚到底（关掉 = 画面完全不动）
     public bool hide_thinking { get; set; }      // 思考内容只进"轨迹"页，对话区只留一行摘要
+    public bool dark { get; set; }               // 暗色模式（启动时应用，切换后重启）
+    // 智能意图澄清（2026-10-16）：GUI 提交指令后、进执行引擎前先用轻量模型（deepseek-flash）判一次歧义，
+    // 有歧义就弹确认框让用户选具体方向，选中项的 command 原样下发。默认开；关掉 = 行为跟以前一模一样。
+    public bool clarify { get; set; }
     public List<string> disabled_plugins { get; set; }   // 被停用的插件文件名
     public Dictionary<string, string> plugin_sources { get; set; }   // 文件名 -> 安装来源
     public string plugin_market_url { get; set; }        // 插件市场索引地址（留空则用 plugins\market.json）
+    // 远程审批：高危操作改推到「Ahz 通信台」网页控制台，等用户在手机上点批准/拒绝（默认关，行为与以前一致）
+    public bool remote_approval { get; set; }
+    public string remote_approval_script { get; set; }   // 通信台脚本路径（留空则用默认的 ..\ahz通信\通讯.ps1）
+    public int remote_approval_wait { get; set; }        // 远程审批最多等多少秒（默认 600）
 
     public AgentConfig()
     {
@@ -2854,9 +3588,13 @@ class AgentConfig
         auto_verify = true;
         follow_output = true;
         hide_thinking = true;
+        clarify = true;        // 意图澄清默认开（老配置里没这项也能用：Migrate 只补"缺字段"的默认值）
         disabled_plugins = new List<string>();
         plugin_sources = new Dictionary<string, string>();
         plugin_market_url = "";
+        remote_approval = false;
+        remote_approval_script = "";
+        remote_approval_wait = 600;
     }
 
     public void Migrate()
@@ -2873,6 +3611,11 @@ class AgentConfig
         if (disabled_plugins == null) disabled_plugins = new List<string>();
         if (plugin_sources == null) plugin_sources = new Dictionary<string, string>();
         if (plugin_market_url == null) plugin_market_url = "";
+        if (remote_approval_script == null) remote_approval_script = "";
+        if (remote_approval_wait <= 0) remote_approval_wait = 600;
+        // 模型能力标签：老配置里没有这一项，补成空表（不是"没有能力"，是"接口还没告诉过我们"）
+        foreach (Provider p in providers)
+            if (p != null && p.model_meta == null) p.model_meta = new Dictionary<string, ModelMeta>();
         // 单轮工具步数：默认 28（老默认 12 在多文件改+跑测试这类任务上实测有一半概率被掐断）。
         // 这里只补"没填"的情况，不动用户显式设过的值。
         if (max_steps <= 0) max_steps = 28;
@@ -2908,22 +3651,90 @@ class AgentConfig
 
     public static AgentConfig Load()
     {
+        LastLoadError = "";
         try
         {
             if (File.Exists(FilePath))
             {
-                AgentConfig c = Json.Ser.Deserialize<AgentConfig>(File.ReadAllText(FilePath, Encoding.UTF8));
-                if (c != null) { c.Migrate(); return c; }
+                string raw = File.ReadAllText(FilePath, Encoding.UTF8);
+                AgentConfig c = Json.Ser.Deserialize<AgentConfig>(raw);
+                if (c != null)
+                {
+                    // 老配置是明文，IsProtected 会原样返回；新配置在这里解成明文。
+                    bool hadPlain = false;
+                    if (c.providers != null)
+                        foreach (Provider p in c.providers)
+                        {
+                            if (p == null) continue;
+                            string old = p.api_key;
+                            p.api_key = Dpapi.Unprotect(old);
+                            if (!string.IsNullOrEmpty(old) && !Dpapi.IsProtected(old)) hadPlain = true;
+                        }
+                    // 老 config.json 里没有 clarify 这一项，反序列化会把它落成 false ——
+                    // 而需求是"默认开"。所以按"原文件里到底有没有这个键"来补，没法靠 Migrate 分辨。
+                    if (raw.IndexOf("\"clarify\"", StringComparison.OrdinalIgnoreCase) < 0) c.clarify = true;
+                    c.Migrate();
+                    // 读到明文 Key 就顺手迁成 DPAPI 密文，别让老配置一直裸着。
+                    if (hadPlain) { try { c.Save(); } catch { } }
+                    return c;
+                }
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            LastLoadError = "配置读取失败：" + ex.Message;
+            Log.Swallow(ex, "读取配置");
+        }
         return new AgentConfig();
     }
 
     public void Save()
     {
-        try { File.WriteAllText(FilePath, Json.Ser.Serialize(this), new UTF8Encoding(false)); }
-        catch { }
+        // 和 sessions 一样：先 .tmp 再替换，别让掉电把 config（含 Key）写成半截。
+        string tmp = FilePath + ".tmp";
+        try
+        {
+            // 只加密落盘的那一份，内存里始终是明文（设置页要回显、请求头要用）。
+            string json;
+            if (providers == null || providers.Count == 0)
+                json = Json.Ser.Serialize(this);
+            else
+            {
+                string[] keys = new string[providers.Count];
+                try
+                {
+                    for (int i = 0; i < providers.Count; i++)
+                    {
+                        Provider p = providers[i];
+                        if (p == null) continue;
+                        keys[i] = p.api_key;
+                        p.api_key = Dpapi.Protect(p.api_key);
+                    }
+                    json = Json.Ser.Serialize(this);
+                }
+                finally
+                {
+                    for (int i = 0; i < providers.Count; i++)
+                        if (providers[i] != null) providers[i].api_key = keys[i];
+                }
+            }
+            File.WriteAllText(tmp, json, new UTF8Encoding(false));
+            if (File.Exists(FilePath))
+            {
+                try { File.Copy(FilePath, FilePath + ".bak", true); } catch { }
+                try { File.Replace(tmp, FilePath, null); }
+                catch { File.Copy(tmp, FilePath, true); try { File.Delete(tmp); } catch { } }
+            }
+            else File.Move(tmp, FilePath);
+            // .bak 也必须是密文：先复制旧文件再替换的话，旧 .bak 可能还是明文。
+            try { File.Copy(FilePath, FilePath + ".bak", true); } catch { }
+            LastSaveError = "";
+        }
+        catch (Exception ex)
+        {
+            LastSaveError = "设置保存失败：" + ex.Message;
+            Log.Swallow(ex, "保存配置（API Key 加密失败时不会退回明文）");
+        }
     }
 }
 
@@ -3051,7 +3862,7 @@ static class ProjectRules
 class AgentRunner
 {
     public ILlm Llm;
-    public readonly AgentConfig Config;
+    public AgentConfig Config;      // 设置窗口改完配置后由 ApplyConfig 换成新对象（所以不能 readonly）
     public readonly IAgentUI UI;
     public readonly List<ToolDef> ToolList = new List<ToolDef>();
     public readonly Dictionary<string, ToolDef> ToolMap = new Dictionary<string, ToolDef>(StringComparer.Ordinal);
@@ -3090,15 +3901,36 @@ class AgentRunner
     int AskOutsidePath(string full)
     {
         string tool = _currentTool.Length > 0 ? _currentTool : "工具";
+        string[] preview = new string[]
+        {
+            full,
+            "工作目录：" + Ctx.Root,
+            "这是工作目录之外的路径，批准后才会访问"
+        };
         int d;
         try
         {
-            d = UI.ApproveOutside(tool + "（工作目录外）", new string[]
+            if (Config.remote_approval)
             {
-                full,
-                "工作目录：" + Ctx.Root,
-                "这是工作目录之外的路径，批准后才会访问"
-            });
+                // 开关打开：越权申请也推到通信台（手机点批准才放行）。
+                // 远程只有「批准/拒绝」两档，不给「本会话总是允许」——
+                // 越权这种口子不该被一次点击永久打开。
+                string detail;
+                int r = RemoteApproval.Ask(Config, tool + "（工作目录外）\n" + string.Join("\n", preview),
+                    "Ahz 想访问工作目录外的路径", out detail);
+                if (r < 0)
+                {
+                    // 通信台起不来：回退本地弹窗，绝不因此把访问卡死或悄悄放行
+                    Log.Audit("远程授权不可用（" + detail + "），回退本地窗口 · 越权 " + full);
+                    d = UI.ApproveOutside(tool + "（工作目录外）", preview);
+                }
+                else
+                {
+                    d = (r == 1) ? 1 : 0;
+                    Log.Audit("远程授权·" + (r == 1 ? "批准" : "拒绝") + " · 越权 " + tool + " · " + full);
+                }
+            }
+            else d = UI.ApproveOutside(tool + "（工作目录外）", preview);
         }
         catch (Exception ex) { Log.Swallow(ex, "越权申请"); return 0; }
         try
@@ -3117,6 +3949,8 @@ class AgentRunner
         ToolList.Clear();
         ToolMap.Clear();
         ToolList.AddRange(Tools.All());
+        // 内置浏览器：助手能自己开页/读正文/点链接/截图，用户同一时间看着同一个页面
+        try { ToolList.AddRange(BrowserTools.All()); } catch { }
         HashSet<string> taken = new HashSet<string>(StringComparer.Ordinal);
         foreach (ToolDef t in ToolList) taken.Add(t.Name);
         try { ToolList.AddRange(Plugins.ToolDefs(Config, taken)); }
@@ -3234,10 +4068,17 @@ class AgentRunner
         return i;
     }
 
-    // 发请求前的体检：丢掉没有配对 tool_calls 的 tool 消息。压缩切歪、旧会话、手工改过的会话都能自愈。
+    // 发请求前的体检：坏历史在这里自愈。坏法有**两种**，以前只认半边：
+    //   ① 孤儿 tool 消息：有 tool 结果，但它前面没有声明这条调用的 assistant（压缩切歪造成）→ 摘掉。
+    //   ② 孤儿 tool_calls：assistant 声明了调用，配对的结果一条都没有（中途点停止、进程被杀造成）→ 补一条
+    //      "未执行"的 tool 结果。这是 2026-10-17 用户那条会话永久卡死的真因：那条 assistant 消息已经带
+    //      tool_calls 落进历史，结果没写回来，于是**之后每一句**（连"你好"）都被接口挡回来：
+    //      "An assistant message with 'tool_calls' must be followed by tool messages responding to each
+    //       'tool_call_id'"（DeepSeek）/ "Invalid request: …"（Moonshot）。
+    //      两种坏法都不是模型的错，换模型更没用 —— 坏的是历史，必须在这儿补。
     internal static int DropOrphanTools(List<Dictionary<string, object>> msgs)
     {
-        int removed = 0;
+        int fixedCount = 0;
         int i = 1;
         while (i < msgs.Count)
         {
@@ -3254,9 +4095,53 @@ class AgentRunner
             }
             if (paired) { i++; continue; }
             msgs.RemoveAt(i);
-            removed++;
+            fixedCount++;
         }
-        return removed;
+
+        // ② 补"声明了调用、却没有结果"的那些（顺序也必须对：紧跟在那条 assistant 后面）
+        i = 0;
+        while (i < msgs.Count)
+        {
+            if (Json.Str(msgs[i], "role", "") != "assistant") { i++; continue; }
+            object[] calls = Json.Arr(Json.Get(msgs[i], "tool_calls"));
+            if (calls == null || calls.Length == 0) { i++; continue; }
+            List<string> got = new List<string>();
+            int j = i + 1;
+            while (j < msgs.Count && Json.Str(msgs[j], "role", "") == "tool")
+            {
+                got.Add(Json.Str(msgs[j], "tool_call_id", ""));
+                j++;
+            }
+            int blanks = 0;
+            for (int g = 0; g < got.Count; g++) if (got[g].Length == 0) blanks++;
+            List<Dictionary<string, object>> fill = new List<Dictionary<string, object>>();
+            for (int c = 0; c < calls.Length; c++)
+            {
+                Dictionary<string, object> tc = Json.Map(calls[c]);
+                if (tc == null) continue;
+                string cid = Json.Str(tc, "id", "");
+                bool answered = cid.Length > 0 && got.Contains(cid);
+                if (!answered && blanks > 0) { blanks--; answered = true; }   // 老数据没带 id：按条数配
+                if (answered) continue;
+                fill.Add(SyntheticToolResult(cid, Json.Str(tc, "name", "?")));
+                fixedCount++;
+            }
+            if (fill.Count > 0) msgs.InsertRange(i + 1 + got.Count, fill);
+            i = i + 1 + got.Count + fill.Count;
+        }
+        return fixedCount;
+    }
+
+    // 补出来的那条"未执行"结果：内容要写清是"没跑"而不是"跑了没输出"，模型才不会当成真实结果接着推理
+    internal static Dictionary<string, object> SyntheticToolResult(string callId, string toolName)
+    {
+        Dictionary<string, object> m = Msg("tool", "[" + toolName + " 结果]\n"
+            + "（没有结果：这一条调用发出去之后那一轮被中断了（点了停止或程序退出），工具没有执行。"
+            + "需要它的话，重新调用一次。）");
+        m["tool_call_id"] = callId;
+        m["tool_name"] = toolName;
+        m["synthetic"] = true;          // 标一下是补的，不是真跑出来的
+        return m;
     }
 
     static bool HasToolCall(Dictionary<string, object> msg, string id)
@@ -3276,6 +4161,19 @@ class AgentRunner
     {
         if (Llm != null) { try { Llm.Close(); } catch { } }
         Llm = LlmFactory.Create(Config.Current(), Config.model);
+    }
+
+    // 设置窗口里改完配置后接管新配置：**只换连接 / 工具表 / 系统提示，对话原样留着**。
+    // 以前主窗口是 `runner = new AgentRunner(...)` + `rtb.ClearAll()` —— 一保存设置，
+    // 界面上和内存里的上下文就一起没了（用户 2026-10-15 报的"设置后会清空上下文"）。
+    public void ApplyConfig(AgentConfig config)
+    {
+        Config = config;
+        ResetContext();                    // 权限档 / 越权放行 / 工作目录都按新配置重装
+        ReloadTools();                     // 插件开关可能也变了；里面会顺带刷新系统提示
+        if (Messages.Count == 0) Messages.Add(Msg("system", SystemPrompt()));
+        else Messages[0] = Msg("system", SystemPrompt());
+        RebuildLlm();
     }
 
     public void Cancel()
@@ -3322,6 +4220,10 @@ class AgentRunner
             + "· 活没干完别说「已完成」；做不到就说清卡在哪一步、还差什么。\n\n"
             + "环境：Windows，命令是 PowerShell 语法；今天 " + DateTime.Now.ToString("yyyy-MM-dd")
             + "；工作目录 " + Ctx.Root + "。\n"
+            + "用户消息里可能出现图片文件的路径（在输入框 Ctrl+V 粘图、或把图片拖进来就会生成）："
+            + (Vision.ShouldSend
+                ? "这类图片会随消息一起发给你，你可以直接看图，不需要再调工具去读路径。\n"
+                : "当前模型看不了图，你只会拿到路径文字；要了解图里内容，就用 read_file 读它，或跟用户说明这个模型不支持图片。\n")
              + "你可以管理这台电脑的程序：run_shell 执行命令、list_processes 列进程、start_program 启动程序、kill_process 结束进程。\n"
              + "长任务（编译、跑测试、记分卡、起服务）用 run_background 丢到后台、拿任务号，再用 job_status 看进度；"
              + "别用 run_shell 在前台干等（默认 120 秒会被掐断）。\n"
@@ -3432,6 +4334,14 @@ class AgentRunner
         return true;
     }
 
+    // 最后一条消息是不是"同一句话"：重复的提醒没必要再塞一遍（模型上一步刚看过）
+    static bool LastMsgIs(List<Dictionary<string, object>> msgs, string role, string text)
+    {
+        if (msgs == null || msgs.Count == 0) return false;
+        Dictionary<string, object> last = msgs[msgs.Count - 1];
+        return Json.Str(last, "role", "") == role && Json.Str(last, "content", "") == text;
+    }
+
     public static int TaskDoneCount(List<TaskItem> list)
     {
         int n = 0;
@@ -3506,10 +4416,11 @@ class AgentRunner
             // 并且不发送任何思考相关参数
             Capabilities.Add("tools");
             CanDisableThink = true;
+            SyncVision();
             return;
         }
         Dictionary<string, object> info = Llm.Probe();
-        if (info == null) return;
+        if (info == null) { SyncVision(); return; }
         object[] caps = Json.Arr(Json.Get(info, "capabilities"));
         if (caps != null) foreach (object c in caps) Capabilities.Add(Convert.ToString(c));
         Dictionary<string, object> thinking = Json.Map(Json.Get(info, "thinking"));
@@ -3527,6 +4438,24 @@ class AgentRunner
                 ThinkingValues = string.Join("/", parts.ToArray());
             }
         }
+        SyncVision();
+    }
+
+    // 把"这个模型能不能看图"喂给 Vision：来源和 VisionNote() 完全一致
+    //   · 云端：接口 /models 里的 input_modalities（Provider.CanSeeImages）
+    //   · 本地：/api/show 的 capabilities 里有没有 vision
+    // 已知看不了就别再往请求里塞图片 —— 否则每轮都要白撞一次失败请求再退回纯文字。
+    public void SyncVision()
+    {
+        try
+        {
+            Provider p = Config.Current();
+            bool? v = p == null ? null : p.CanSeeImages(Config.model);
+            if (v == null && p != null && p.type == "ollama" && Capabilities.Count > 0)
+                v = Capabilities.Contains("vision");
+            Vision.Capability = v;
+        }
+        catch { }
     }
 
     public string Warning()
@@ -3625,7 +4554,8 @@ class AgentRunner
         catch (Exception ex)
         {
             Log.Swallow(ex, "导出交付记录");
-            UI.Write(OutKind.Error, "  导出失败：" + ex.Message + "\n");
+            UI.Write(OutKind.Error, MainForm.ErrorText("导出交付记录失败", ex.Message,
+                "确认目标路径可写、文件没被别的程序占用，然后重试"));
         }
         return true;
     }
@@ -3665,9 +4595,18 @@ class AgentRunner
 
     // ---------- 一轮对话 ----------
 
-    public void RunTurn(string userText)
+    public async Task RunTurnAsync(string userText)
     {
         if (userText == null || userText.Trim().Length == 0) return;
+        // 只在"换了模型 / 换了接口"时才重新给图片一次机会：
+        // 同一个模型已知看不了图，就不该每轮都白撞一次失败请求。
+        SyncVision();
+        string vkey = Config.provider + "|" + Config.model;
+        if (Vision.Key != vkey)
+        {
+            Vision.Key = vkey;
+            Vision.Disabled = false;
+        }
         if (HandlePlanCommand(userText)) return;        // /计划 开|关：本地切换，不发给模型
         if (HandleExportCommand(userText)) return;      // /导出：把交付落成 md，也不发给模型
         if (HandleUpgradeCommand(userText)) return;     // /升级：换 .new 并重启
@@ -3700,6 +4639,9 @@ class AgentRunner
         int editedFiles = 0;                          // 改过几个文件
         int verifyRounds = 0;                         // 自动验证跑了几次
         int idleReads = 0;                            // 连续几步只读不写（催它动手用）
+        int taskNudges = 0;                           // "计划还剩几步"注入了几次（要有上限，见下）
+        const int TaskNudgeMax = 3;
+        bool restartAsked = false;                    // 它叫了"重启并升级"：本轮不用再往下走了
         int nudges = 0;                               // "别再读了"催过几次（封顶 2 次）
 
         // 项目规矩 + 自动验证命令（每轮对话重新读一次规矩文件，改完立刻生效）
@@ -3720,11 +4662,17 @@ class AgentRunner
         {
             if (Cancelled) break;
             steps++;
-            // 每步把"还剩几步"注入上下文：模型不用自己记计划，忘了就会被提醒（见 _tasks 那段注释）
-            string tn = TaskNudge(_tasks);
-            if (tn != null) Messages.Add(Msg("user", tn));
+            // 每步把"还剩几步"注入上下文：模型不用自己记计划，忘了就会被提醒（见 _tasks 那段注释）。
+            // 但**必须有上限**：模型要是死不改那行 `- [x]`，这条提醒会一步步灌满上下文和对话区
+            // （2026-10-15 用户报的"历史全变成同一句提醒"就是没上限导致的，一条会话灌了十几遍）。
+            string tn = taskNudges < TaskNudgeMax ? TaskNudge(_tasks) : null;
+            if (tn != null && !LastMsgIs(Messages, "user", tn))
+            {
+                taskNudges++;
+                Messages.Add(Msg("user", tn));
+            }
             UI.Status("等待模型…");
-            StepResult res = Step();
+            StepResult res = await StepAsync();
             genTokens += res.Tokens;
             genSeconds += res.Seconds;
             // 模型自己写的 "- [ ] / - [x]" 就是它的计划，抽出来记着（每步注入剩余步骤用）
@@ -3776,10 +4724,12 @@ class AgentRunner
             }
 
             bool anyOk = false;
+            List<string> answered = new List<string>();     // 已经写回结果的 callId（收尾时查缺补漏，见下面那段）
             foreach (Dictionary<string, object> call in res.Calls)
             {
                 if (Cancelled) break;
                 string name = Json.Str(call, "name", "?");
+                if (name == "restart_upgrade") restartAsked = true;   // 这一轮马上要退出，别再往下走
                 string callId = Json.Str(call, "id", "");
                 Dictionary<string, object> args = Json.Map(Json.Get(call, "arguments"));
                 if (args == null)
@@ -3807,6 +4757,7 @@ class AgentRunner
                     dupMsgObj["tool_call_id"] = callId;
                     dupMsgObj["tool_name"] = name;
                     Messages.Add(dupMsgObj);
+                    answered.Add(callId);
                     continue;
                 }
 
@@ -3830,17 +4781,40 @@ class AgentRunner
                 }
                 if (name == "run_shell") ranCmds.Add(A.Str(args, "command", ""));
                 if (ok && (name == "write_file" || name == "edit_file")) editedFiles++;
-                toolCount++;                int extra = Txt.LineCount(result) - 1;
-                UI.Write(OutKind.ToolResult, "  └ " + (ok ? "✓ " : "✗ ") + Txt.FirstLine(result)
-                    + (extra > 0 ? "  …+" + extra + " 行" : "") + "\n");
+                toolCount++;
+                // 工具结果**摆全文**（上限 3000 字兜底）：只摆第一行的话"展开"根本没有内容可展开。
+                // 摘要那一行由折叠组件负责（MsgBlock.FoldSummary）。
+                UI.Write(OutKind.ToolResult, "  └ " + (ok ? "✓ " : "✗ ") + Txt.Clip(result, 3000) + "\n");
                 Dictionary<string, object> toolMsg = Msg("tool", "[" + name + " 结果]\n" + result);
                 toolMsg["tool_call_id"] = callId;
                 toolMsg["tool_name"] = name;
                 Messages.Add(toolMsg);
+                answered.Add(callId);
+            }
+
+            // 被中断（点了停止）时，后面没轮到的调用必须补一条"未执行"的结果。
+            // assistant 那条带 tool_calls 的消息已经进历史了，少一条配对结果就是坏历史 —— 而且这个伤是永久的：
+            // 之后每一句都会被接口 400 掉（"An assistant message with 'tool_calls' must be followed by tool
+            // messages responding to each 'tool_call_id'"），换模型也没用。用户 2026-10-17 就是这么卡住的。
+            for (int ci = 0; ci < res.Calls.Count; ci++)
+            {
+                string cid = Json.Str(res.Calls[ci], "id", "");
+                if (answered.Contains(cid)) continue;
+                string cname = Json.Str(res.Calls[ci], "name", "?");
+                UI.Write(OutKind.ToolResult, "  └ ⏹ " + cname + " 没执行（本轮已中断），已补一条占位结果\n");
+                Messages.Add(SyntheticToolResult(cid, cname));
             }
 
             stall = NextStallCount(stall, anyOk);
             if (stall >= StallLimit) { stallStopped = stall; break; }
+
+            // 它刚叫了"重启并升级"：进程马上要退出。再往下走只会把提醒和工具调用一路灌进历史
+            // （用户 2026-10-15 那条会话就是这么绕进去的：重启回来计划行还是未完成 → 提醒 → 又叫重启）。
+            if (restartAsked)
+            {
+                UI.Write(OutKind.Info, "  · 已请求「重启并升级」，本轮到此为止（进程马上退出）\n");
+                break;
+            }
 
             // 只读不写催促：这一步成功的全是读类工具（list_dir/read_file/search_text）且没改过文件，
             // 连续 3 步就注入一次提醒。本地小模型最常见的死法就是"读完→输出计划→收工"。
@@ -3893,7 +4867,7 @@ class AgentRunner
             {
                 UI.Status("正在整理结论…");
                 UI.Write(OutKind.Info, "  · 这一轮不再给工具，让它先把阶段性结论讲清楚…\n");
-                StepResult fin = Step(false);
+                StepResult fin = await StepAsync(false);
                 genTokens += fin.Tokens;
                 genSeconds += fin.Seconds;
                 string txt = fin.Content == null ? "" : fin.Content.Trim();
@@ -3985,9 +4959,8 @@ class AgentRunner
         string result;
         Execute("run_shell", args, true, out result, out ok);     // true = 不用问（命令来自规矩文件或白名单识别）
         output = Txt.Clip(result, 3000);
-        int extra = Txt.LineCount(output) - 1;
-        UI.Write(OutKind.ToolResult, "  └ " + (ok ? "✓ " : "✗ ") + Txt.FirstLine(output)
-            + (extra > 0 ? "  …+" + extra + " 行" : "") + "\n");
+        // 同上：全文进对话区/轨迹页，摘要行交给折叠组件
+        UI.Write(OutKind.ToolResult, "  └ " + (ok ? "✓ " : "✗ ") + output + "\n");
     }
 
     // 把验证输出里的"失败要点"挑出来放最前面：小模型面对一大坨输出经常抓不住重点
@@ -4063,11 +5036,34 @@ class AgentRunner
 
         if (def.NeedsApproval && !autoYes && !AlwaysAllow.Contains(name))
         {
-            int decision = UI.Approve(name, Preview(name, args));
+            string[] preview = Preview(name, args);
+            int decision;
+            if (Config.remote_approval)
+            {
+                // 开关打开：高危操作一律推到通信台，等用户在手机/网页上点批准或拒绝
+                string detail;
+                string what = string.Join("\n", preview);
+                int r = RemoteApproval.Ask(Config, what, "Ahz 想执行工具 " + name, out detail);
+                if (r < 0)
+                {
+                    // 通信台起不来 / 脚本不在：回退到本地弹窗，绝不因此把操作卡死
+                    Log.Audit("远程审批不可用（" + detail + "），回退本地窗口 · 工具 " + name);
+                    decision = UI.Approve(name, preview);
+                }
+                else
+                {
+                    decision = r;
+                    Log.Audit("远程审批·" + (r == 1 ? "批准" : "拒绝") + " · 工具 " + name + " · " + what);
+                }
+            }
+            else
+            {
+                decision = UI.Approve(name, preview);
+            }
             try
             {
                 Log.Audit("审批·" + (decision == 0 ? "拒绝" : (decision == 2 ? "本会话总是允许" : "允许"))
-                    + " · 工具 " + name + " · " + string.Join(" / ", Preview(name, args)));
+                    + " · 工具 " + name + " · " + string.Join(" / ", preview));
             }
             catch { }
             if (decision == 2) { AlwaysAllow.Add(name); decision = 1; }
@@ -4131,14 +5127,20 @@ class AgentRunner
         return lines.ToArray();
     }
 
-    StepResult Step()
+    // 兼容 CLI/旧测试；产品 UI 走 RunTurnAsync。
+    public void RunTurn(string userText)
+    {
+        RunTurnAsync(userText).GetAwaiter().GetResult();
+    }
+
+    async Task<StepResult> StepAsync()
     {
         StepResult res = new StepResult();
-        return Step(true);
+        return await StepAsync(true);
     }
 
     // allowTools=false：这一轮不给模型任何工具，用来逼它直接给结论
-    StepResult Step(bool allowTools)
+    async Task<StepResult> StepAsync(bool allowTools)
     {
         StepResult res = new StepResult();
         List<object> schemas = null;
@@ -4156,7 +5158,9 @@ class AgentRunner
         Stopwatch clock = Stopwatch.StartNew();
         // 发请求前体检：坏会话（孤立 tool 消息）在这里自愈，否则每次请求都会被接口拒掉
         DropOrphanTools(Messages);
-        Dictionary<string, object> last = Llm.Stream(Messages, schemas, Config.think, Config.effort, Config.num_ctx,
+        Func<Task<Dictionary<string, object>>> send = async delegate()
+        {
+            return await Llm.StreamAsync(Messages, schemas, Config.think, Config.effort, Config.num_ctx,
             delegate(string th)
             {
                 if (!thinkingStarted)
@@ -4189,6 +5193,23 @@ class AgentRunner
             {
                 res.Calls.Add(call);
             });
+        };
+        Dictionary<string, object> last = null;
+        bool needRetry = false;
+        try { last = await send(); }
+        catch (LocalAgentException ex)
+        {
+            // 图片是被接口拒掉的头号嫌疑（很多模型根本不支持看图）：
+            // 去掉图片、原样重发一次，别让用户卡在一个看不懂的报错上。
+            if (!Vision.MessagesHaveImages(Messages)) throw;
+            Vision.Disabled = true;
+            UI.Write(OutKind.Info, "\n  · 这个模型看不了图（" + Txt.FirstLine(ex.Message) + "），已去掉图片重发一次\n"
+                + "  · 记住这个模型：接下来再带图也不会发了（换一个能看图的模型就自动恢复）。\n");
+            thinkingStarted = false; contentStarted = false; contentDecided = false; markup = false;
+            res.Content = ""; res.Calls.Clear();
+            needRetry = true;
+        }
+        if (needRetry) last = await send();
 
         res.Stats = last;
         clock.Stop();
@@ -4282,8 +5303,7 @@ class ConsoleUI : IAgentUI
     public int Approve(string toolName, string[] preview)
     {
         Console.WriteLine();
-        Console.ForegroundColor = ConsoleColor.Yellow;
-        Console.WriteLine("  ⚠ 需要你确认：" + toolName);
+        Console.ForegroundColor = ConsoleColor.Yellow;        Console.WriteLine("  ⚠ 需要你确认：" + toolName);
         Console.ForegroundColor = ConsoleColor.DarkGray;
         foreach (string line in preview) Console.WriteLine("  " + line);
         Console.ResetColor();
@@ -4330,36 +5350,158 @@ class ConsoleUI : IAgentUI
 // 配色：白底 + 浅灰侧栏 + 一点点蓝（DeepSeek 蓝）。所有界面颜色都从这里取，改一处全局生效。
 static class Theme
 {
-    public static readonly Color Bg = Color.FromArgb(255, 255, 255);
-    public static readonly Color Side = Color.FromArgb(249, 250, 251);
-    public static readonly Color Card = Color.FromArgb(249, 250, 251);
-    public static readonly Color Field = Color.FromArgb(255, 255, 255);
-    public static readonly Color Chip = Color.FromArgb(243, 244, 246);
-    public static readonly Color ChipHover = Color.FromArgb(233, 235, 239);
-    public static readonly Color Hover = Color.FromArgb(241, 242, 244);
-    public static readonly Color Sel = Color.FromArgb(236, 238, 240);
-    public static readonly Color Line = Color.FromArgb(231, 232, 234);
-    public static readonly Color LineSoft = Color.FromArgb(240, 240, 242);
-    public static readonly Color Fg = Color.FromArgb(15, 17, 21);
-    public static readonly Color FgMid = Color.FromArgb(88, 93, 100);
-    public static readonly Color FgDim = Color.FromArgb(138, 143, 152);
-    public static readonly Color FgFaint = Color.FromArgb(170, 175, 182);
-    public static readonly Color Accent = Color.FromArgb(77, 107, 254);
-    public static readonly Color AccentHover = Color.FromArgb(60, 88, 232);
-    public static readonly Color AccentIdle = Color.FromArgb(187, 200, 251);
-    public static readonly Color AccentSoft = Color.FromArgb(238, 241, 254);
-    public static readonly Color SelFill = Color.FromArgb(110, 77, 107, 254);   // 拖选高亮
-    public static readonly Color Band = Color.FromArgb(245, 246, 248);
-    public static readonly Color Warn = Color.FromArgb(180, 83, 9);
-    public static readonly Color Ok = Color.FromArgb(5, 150, 105);
-    public static readonly Color Err = Color.FromArgb(220, 38, 38);
+    public static Color Bg = Color.FromArgb(255, 255, 255);
+    public static Color Side = Color.FromArgb(244, 244, 245);
+    public static Color Card = Color.FromArgb(249, 250, 251);
+    public static Color Field = Color.FromArgb(255, 255, 255);
+    public static Color Chip = Color.FromArgb(243, 244, 246);
+    public static Color ChipHover = Color.FromArgb(233, 235, 239);
+    public static Color Hover = Color.FromArgb(241, 242, 244);
+    public static Color Sel = Color.FromArgb(236, 238, 240);
+    public static Color Line = Color.FromArgb(231, 232, 234);
+    public static Color LineSoft = Color.FromArgb(240, 240, 242);
+    public static Color Fg = Color.FromArgb(15, 17, 21);
+    public static Color FgMid = Color.FromArgb(88, 93, 100);
+    // 2026-10-18：FgDim/FgFaint 原来只有 3.25/2.21:1，9.5pt 小字达不到 WCAG AA 4.5:1。
+    // 现在 FgDim 5.96:1、FgFaint 5.28:1（白底），层级仍然保持 Mid > Dim > Faint。
+    public static Color FgDim = Color.FromArgb(95, 100, 108);
+    public static Color FgFaint = Color.FromArgb(103, 108, 116);
+    // 强调色白字原为 4.33:1（9.5pt 按钮不达标），压深到 5.46:1。
+    public static Color Accent = Color.FromArgb(61, 90, 234);
+    public static Color AccentHover = Color.FromArgb(52, 82, 232);
+    public static Color AccentIdle = Color.FromArgb(187, 200, 251);
+    public static Color AccentSoft = Color.FromArgb(238, 241, 254);
+    public static Color SelFill = Color.FromArgb(110, 77, 107, 254);   // 拖选高亮
+    public static Color Band = Color.FromArgb(245, 246, 248);
+    public static Color Warn = Color.FromArgb(180, 83, 9);
+    public static Color Ok = Color.FromArgb(5, 150, 105);
+    public static Color Err = Color.FromArgb(220, 38, 38);
     // diff 面板用的淡底：加行淡绿、删行淡红（跟 Codex 那种审查面板一个观感）
-    public static readonly Color OkSoft = Color.FromArgb(236, 253, 245);
-    public static readonly Color ErrSoft = Color.FromArgb(254, 242, 242);
-    public static readonly Color Clear = Color.FromArgb(0, 0, 0, 0);
+    public static Color OkSoft = Color.FromArgb(236, 253, 245);
+    public static Color ErrSoft = Color.FromArgb(254, 242, 242);
+    public static Color Clear = Color.FromArgb(0, 0, 0, 0);
+
+    // ---- Codex 那套外壳色（2026-10-13 按用户给的 Codex 截图逐像素量出来的）----
+    // 标题栏和侧栏是同一层浅灰（截图里两侧同一个色值），输入卡下面那块「井」再深一档。
+    public static Color Chrome = Color.FromArgb(244, 244, 245);
+    public static Color Well = Color.FromArgb(242, 242, 243);
+    // 发送键：Codex 是个深色圆钮，空输入时是灰的（不是蓝色的）
+    public static Color SendIdle = Color.FromArgb(154, 155, 160);
+    public static Color SendOn = Color.FromArgb(51, 53, 60);
+    public static Color SendOnHover = Color.FromArgb(26, 27, 31);
+    // 输入条左下角的权限提示：Codex 的「完全访问」是这个橙色
+    public static Color PermWarn = Color.FromArgb(190, 70, 5);   // 白底 5.16:1（原 226,89,10 只有 3.71:1）
+    // 浮层卡片的描边：Codex 那圈实测 #DDDFDF（比正文分隔线 Theme.Line 略深一档）
+    public static Color PopupLine = Color.FromArgb(221, 223, 225);
 
     public const string FontName = "Microsoft YaHei UI";
     public const string MonoName = "Consolas";
+
+    // ---- 8px 栅格令牌（2026-10-16 统一）----
+    // 间距一律取 4 的倍数、常态是 8 的倍数；圆角只用这四档；控件高度也取 4 的倍数。
+    // 新写的界面代码请从这里取值，不要各写各的数字（以前同一个左内边距有 11/14/15/17 四种写法）。
+    public const int Sp4 = 4, Sp8 = 8, Sp12 = 12, Sp16 = 16, Sp24 = 24, Sp32 = 32;
+    public const int RadMenu = 6, RadRow = 8, RadCard = 10, RadInput = 12;
+    public const int RowHeight = 28, CtrlHeight = 32, MenuRowHeight = 28;
+
+    // ---- 聊天气泡 / 内容块（2026-10-16 整改②）----
+    // 两套气泡靠"填充 + 1px 描边 + 左右对齐 + 圆角 10"区分；代码块/行内代码各有自己的底色与描边。
+    public static Color BubbleUserFill = Color.FromArgb(238, 241, 254);   // #EEF1FE
+    public static Color BubbleUserLine = Color.FromArgb(206, 216, 250);   // #CED8FA
+    public static Color BubbleAiFill = Color.FromArgb(250, 250, 251);     // #FAFAFB
+    public static Color BubbleAiLine = Color.FromArgb(227, 228, 230);     // #E3E4E6（比 #E7E8EA 深一档，描边才真的看得见）
+    public static Color CodeFill = Color.FromArgb(241, 243, 246);         // #F1F3F6
+    public static Color CodeLine = Color.FromArgb(232, 235, 240);         // #E8EBF0
+    public static Color InlineFill = Color.FromArgb(243, 244, 246);
+    public static Color InlineLine = Color.FromArgb(229, 231, 235);
+    public static bool Dark;
+
+    [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hWnd, int attr, ref int value, int size);
+    [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+    static extern int SetWindowTheme(IntPtr hWnd, string pszSubAppName, string pszSubIdList);
+
+    // 原生滚动条/列表边框不会跟 Theme 走，用 DarkMode_Explorer 主题把非客户区也压暗。
+    public static void DarkenTree(Control root)
+    {
+        if (!Dark || root == null) return;
+        DarkenOne(root);
+        foreach (Control c in root.Controls) DarkenTree(c);
+    }
+
+    public static void DarkenOne(Control c)
+    {
+        if (!Dark || c == null || !c.IsHandleCreated) return;
+        try
+        {
+            SetWindowTheme(c.Handle, "DarkMode_Explorer", null);
+            int on = 1;
+            DwmSetWindowAttribute(c.Handle, 20, ref on, 4);
+            DwmSetWindowAttribute(c.Handle, 19, ref on, 4);
+            EnumChildWindows(c.Handle, delegate(IntPtr h, IntPtr l)
+            {
+                StringBuilder sb = new StringBuilder(64);
+                GetClassName(h, sb, sb.Capacity);
+                if (sb.ToString() == "ScrollBar") SetWindowTheme(h, "DarkMode_Explorer", null);
+                return true;
+            }, IntPtr.Zero);
+        }
+        catch { }
+    }
+
+    delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr hWnd, EnumProc cb, IntPtr lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hWnd, StringBuilder sb, int max);
+
+    // 暗色是一套完整调色板，不是简单反色；切换后由启动流程重建界面。
+    public static void Apply(bool dark)
+    {
+        Dark = dark;
+        if (!dark)
+        {
+            Bg = Color.FromArgb(255, 255, 255); Side = Color.FromArgb(244, 244, 245);
+            Card = Color.FromArgb(249, 250, 251); Field = Color.FromArgb(255, 255, 255);
+            Chip = Color.FromArgb(243, 244, 246); ChipHover = Color.FromArgb(233, 235, 239);
+            Hover = Color.FromArgb(241, 242, 244); Sel = Color.FromArgb(236, 238, 240);
+            Line = Color.FromArgb(231, 232, 234); LineSoft = Color.FromArgb(240, 240, 242);
+            Fg = Color.FromArgb(15, 17, 21); FgMid = Color.FromArgb(88, 93, 100);
+            FgDim = Color.FromArgb(95, 100, 108); FgFaint = Color.FromArgb(103, 108, 116);
+            Accent = Color.FromArgb(61, 90, 234); AccentHover = Color.FromArgb(52, 82, 232);
+            AccentIdle = Color.FromArgb(187, 200, 251); AccentSoft = Color.FromArgb(238, 241, 254);
+            SelFill = Color.FromArgb(110, 77, 107, 254); Band = Color.FromArgb(245, 246, 248);
+            Warn = Color.FromArgb(180, 83, 9); Ok = Color.FromArgb(5, 150, 105); Err = Color.FromArgb(220, 38, 38);
+            OkSoft = Color.FromArgb(236, 253, 245); ErrSoft = Color.FromArgb(254, 242, 242);
+            Chrome = Color.FromArgb(244, 244, 245); Well = Color.FromArgb(242, 242, 243);
+            SendIdle = Color.FromArgb(154, 155, 160); SendOn = Color.FromArgb(51, 53, 60); SendOnHover = Color.FromArgb(26, 27, 31);
+            PermWarn = Color.FromArgb(190, 70, 5); PopupLine = Color.FromArgb(221, 223, 225);
+            BubbleUserFill = Color.FromArgb(238, 241, 254); BubbleUserLine = Color.FromArgb(206, 216, 250);
+            BubbleAiFill = Color.FromArgb(250, 250, 251); BubbleAiLine = Color.FromArgb(227, 228, 230);
+            CodeFill = Color.FromArgb(241, 243, 246); CodeLine = Color.FromArgb(232, 235, 240);
+            InlineFill = Color.FromArgb(243, 244, 246); InlineLine = Color.FromArgb(229, 231, 235);
+            return;
+        }
+        Bg = Color.FromArgb(20, 22, 27); Side = Color.FromArgb(22, 24, 29);
+        Card = Color.FromArgb(32, 35, 42); Field = Color.FromArgb(26, 28, 33);
+        Chip = Color.FromArgb(42, 46, 54); ChipHover = Color.FromArgb(52, 57, 66);
+        Hover = Color.FromArgb(42, 46, 54); Sel = Color.FromArgb(50, 55, 64);
+        Line = Color.FromArgb(58, 63, 72); LineSoft = Color.FromArgb(42, 46, 53);
+        Fg = Color.FromArgb(232, 234, 238); FgMid = Color.FromArgb(174, 180, 190);
+        FgDim = Color.FromArgb(152, 159, 170); FgFaint = Color.FromArgb(136, 143, 154);
+        Accent = Color.FromArgb(124, 150, 255); AccentHover = Color.FromArgb(146, 168, 255);
+        AccentIdle = Color.FromArgb(68, 82, 120); AccentSoft = Color.FromArgb(42, 48, 68);
+        SelFill = Color.FromArgb(120, 105, 130, 220); Band = Color.FromArgb(30, 33, 39);
+        Warn = Color.FromArgb(245, 170, 80); Ok = Color.FromArgb(90, 210, 150); Err = Color.FromArgb(255, 110, 110);
+        OkSoft = Color.FromArgb(20, 45, 35); ErrSoft = Color.FromArgb(55, 28, 30);
+        Chrome = Color.FromArgb(30, 33, 39); Well = Color.FromArgb(18, 20, 24);
+        SendIdle = Color.FromArgb(90, 94, 102); SendOn = Color.FromArgb(205, 209, 216); SendOnHover = Color.FromArgb(235, 237, 240);
+        PermWarn = Color.FromArgb(255, 160, 80); PopupLine = Color.FromArgb(72, 78, 90);
+        BubbleUserFill = Color.FromArgb(40, 48, 75); BubbleUserLine = Color.FromArgb(70, 85, 130);
+        BubbleAiFill = Color.FromArgb(35, 38, 46); BubbleAiLine = Color.FromArgb(58, 62, 72);
+        CodeFill = Color.FromArgb(27, 30, 36); CodeLine = Color.FromArgb(50, 54, 62);
+        InlineFill = Color.FromArgb(40, 44, 52); InlineLine = Color.FromArgb(54, 58, 68);
+    }
+
+    public const int PadBubbleX = Sp16, PadBubbleY = Sp12;   // 气泡内边距（横 / 纵）—— 栅格值，别写 14/10 这种脱栅格的数
+    public const int BubbleMaxPct = 75;                   // 用户气泡最宽占块宽的比例
 
     // 屏幕缩放（150% 的屏幕上是 1.5）。程序是 DPI 感知的，所以逻辑尺寸要自己乘上去，
     // 否则整块界面在大屏上会小得可怜。
@@ -4425,7 +5567,13 @@ static class Theme
     {
         string k = family + "|" + size.ToString("0.##") + "|" + (int)style;
         Font f;
-        if (FontCache.TryGetValue(k, out f)) return f;
+        if (FontCache.TryGetValue(k, out f))
+        {
+            // 共享 Font 一旦被别的控件 Dispose，Height 会抛 ArgumentException；
+            // 这里先验证，坏了就重建，避免整窗在 OnPaint 里崩掉。
+            try { f.GetHeight(); return f; }
+            catch { FontCache.Remove(k); try { f.Dispose(); } catch { } }
+        }
         f = new Font(family, size, style);
         FontCache[k] = f;
         return f;
@@ -4552,6 +5700,67 @@ static class Icons
                     g.DrawRectangle(p, PX(r, 0.20f), PY(r, 0.32f), r.Width * 0.46f, r.Height * 0.46f);
                     g.DrawLines(p, new PointF[] {
                         Pt(r, 0.34f, 0.26f), Pt(r, 0.80f, 0.26f), Pt(r, 0.80f, 0.66f) });
+                    break;
+
+                case "arrowLeft":
+                    g.DrawLine(p, PX(r, 0.74f), PY(r, 0.50f), PX(r, 0.30f), PY(r, 0.50f));
+                    g.DrawLines(p, new PointF[] { Pt(r, 0.47f, 0.32f), Pt(r, 0.29f, 0.50f), Pt(r, 0.47f, 0.68f) });
+                    break;
+
+                case "arrowRight":
+                    g.DrawLine(p, PX(r, 0.26f), PY(r, 0.50f), PX(r, 0.70f), PY(r, 0.50f));
+                    g.DrawLines(p, new PointF[] { Pt(r, 0.53f, 0.32f), Pt(r, 0.71f, 0.50f), Pt(r, 0.53f, 0.68f) });
+                    break;
+
+                case "panel":
+                    // 侧栏开关（Codex 标题栏最左边那个）：方框 + 靠左一条竖线
+                    using (GraphicsPath pnl = Ui.Round(new Rectangle((int)PX(r, 0.10f), (int)PY(r, 0.18f),
+                        (int)(r.Width * 0.80f), (int)(r.Height * 0.64f)), (int)(r.Width * 0.16f)))
+                        g.DrawPath(p, pnl);
+                    g.DrawLine(p, PX(r, 0.40f), PY(r, 0.20f), PX(r, 0.40f), PY(r, 0.80f));
+                    break;
+
+                case "bell":
+                    // 铃铛：钟形 + 底座 + 小舌头
+                    g.DrawArc(p, PX(r, 0.30f), PY(r, 0.20f), r.Width * 0.40f, r.Height * 0.40f, 180, 180);
+                    g.DrawLines(p, new PointF[] {
+                        Pt(r, 0.30f, 0.40f), Pt(r, 0.24f, 0.72f), Pt(r, 0.76f, 0.72f), Pt(r, 0.70f, 0.40f) });
+                    g.DrawLine(p, PX(r, 0.41f), PY(r, 0.82f), PX(r, 0.59f), PY(r, 0.82f));
+                    break;
+
+                case "newchat":
+                    // 新聊天：一个开口的方框 + 一支斜笔（Codex 侧栏第一项就是这个）
+                    g.DrawLines(p, new PointF[] {
+                        Pt(r, 0.56f, 0.24f), Pt(r, 0.30f, 0.24f), Pt(r, 0.24f, 0.30f),
+                        Pt(r, 0.24f, 0.72f), Pt(r, 0.68f, 0.72f), Pt(r, 0.76f, 0.64f), Pt(r, 0.76f, 0.48f) });
+                    g.DrawLines(p, new PointF[] {
+                        Pt(r, 0.50f, 0.62f), Pt(r, 0.62f, 0.72f), Pt(r, 0.86f, 0.48f), Pt(r, 0.74f, 0.38f), Pt(r, 0.50f, 0.62f) });
+                    break;
+
+                case "warnCircle":
+                    // 圈里一个叹号（「完全访问」前面那个）
+                    g.DrawEllipse(p, PX(r, 0.12f), PY(r, 0.12f), r.Width * 0.76f, r.Height * 0.76f);
+                    g.DrawLine(p, PX(r, 0.50f), PY(r, 0.30f), PX(r, 0.50f), PY(r, 0.56f));
+                    using (SolidBrush wcb = new SolidBrush(color))
+                        g.FillEllipse(wcb, PX(r, 0.45f), PY(r, 0.64f), r.Width * 0.10f, r.Height * 0.10f);
+                    break;
+
+                case "monitor":
+                    // 一块屏幕（输入卡上方「本地」那个药丸）
+                    using (GraphicsPath mon = Ui.Round(new Rectangle((int)PX(r, 0.10f), (int)PY(r, 0.20f),
+                        (int)(r.Width * 0.80f), (int)(r.Height * 0.54f)), (int)(r.Width * 0.14f)))
+                        g.DrawPath(p, mon);
+                    g.DrawLine(p, PX(r, 0.34f), PY(r, 0.86f), PX(r, 0.66f), PY(r, 0.86f));
+                    break;
+
+                case "cloudCode":
+                    // 首屏那个云朵 logo：外面一圈云，里面一个 >_
+                    g.DrawArc(p, PX(r, 0.10f), PY(r, 0.40f), r.Width * 0.36f, r.Height * 0.36f, 90, 180);
+                    g.DrawArc(p, PX(r, 0.22f), PY(r, 0.16f), r.Width * 0.42f, r.Height * 0.42f, 180, 180);
+                    g.DrawArc(p, PX(r, 0.54f), PY(r, 0.40f), r.Width * 0.36f, r.Height * 0.36f, 270, 180);
+                    g.DrawLine(p, PX(r, 0.28f), PY(r, 0.76f), PX(r, 0.72f), PY(r, 0.76f));
+                    g.DrawLines(p, new PointF[] { Pt(r, 0.41f, 0.44f), Pt(r, 0.49f, 0.52f), Pt(r, 0.41f, 0.60f) });
+                    g.DrawLine(p, PX(r, 0.55f), PY(r, 0.60f), PX(r, 0.65f), PY(r, 0.60f));
                     break;
 
                 case "refresh":
@@ -4691,7 +5900,7 @@ static class Ui
 class RoundedPanel : Panel
 {
     public int Radius = 12;
-    public Color Fill = Color.White;
+    public Color Fill = Theme.Card;
     public Color BorderColor = Color.FromArgb(231, 232, 234);
     public bool DrawBorder = true;
     public bool Shadow;
@@ -4762,7 +5971,8 @@ class UiButton : Control, IButtonControl
     public string Icon;
     public int IconSize = 15;
     public int IconGap = 7;
-    public int Radius = 9;
+    public float IconYOffset;
+    public int Radius = Theme.RadRow;
     public Color FillColor = Theme.Chip;
     public Color HoverColor = Theme.ChipHover;
     public Color BorderColor = Theme.Clear;
@@ -4781,10 +5991,17 @@ class UiButton : Control, IButtonControl
     public UiButton()
     {
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
-            | ControlStyles.UserPaint | ControlStyles.ResizeRedraw | ControlStyles.SupportsTransparentBackColor, true);
+            | ControlStyles.UserPaint | ControlStyles.ResizeRedraw | ControlStyles.SupportsTransparentBackColor
+            | ControlStyles.Selectable, true);
+        // 透明底：OnPaint 是"用父底色擦一遍再画圆角"，所以 BackColor 必须是透明的。
+        // 不设的话它是 Control.DefaultBackColor（不透明浅灰），于是 FillColor=Clear 的 chip
+        // 只剩一块灰矩形 —— 这就是用户说的"控件周边多余的小框"（2026-10-16 查到）。
+        BackColor = Theme.Clear;
         Cursor = Cursors.Hand;
-        TabStop = false;
-        Font = Theme.F(9f);
+        // 2026-10-18 验收：以前全部 TabStop=false，键盘/读屏完全到不了审批、权限、模型这些按钮。
+        TabStop = true;
+        AccessibleRole = AccessibleRole.PushButton;
+        Font = Theme.F(9.5f);
     }
 
     protected override void OnMouseEnter(EventArgs e) { _hover = true; Invalidate(); base.OnMouseEnter(e); }
@@ -4792,7 +6009,27 @@ class UiButton : Control, IButtonControl
     protected override void OnMouseDown(MouseEventArgs e) { _down = true; Invalidate(); base.OnMouseDown(e); }
     protected override void OnMouseUp(MouseEventArgs e) { _down = false; Invalidate(); base.OnMouseUp(e); }
     protected override void OnEnabledChanged(EventArgs e) { Cursor = Enabled ? Cursors.Hand : Cursors.Default; Invalidate(); base.OnEnabledChanged(e); }
-    protected override void OnTextChanged(EventArgs e) { Invalidate(); base.OnTextChanged(e); }
+    protected override void OnTextChanged(EventArgs e)
+    {
+        Invalidate();
+        if (AccessibleName == null || AccessibleName.Length == 0) AccessibleName = Text;
+        base.OnTextChanged(e);
+    }
+    protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
+    protected override void OnLostFocus(EventArgs e) { Invalidate(); base.OnLostFocus(e); }
+
+    // 空格 / 回车激活。以前自绘按钮只能鼠标点，审批框里的「本会话总是允许」没有键盘路径。
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        base.OnKeyDown(e);
+        if (!Enabled) return;
+        if (e.KeyCode == Keys.Space || e.KeyCode == Keys.Enter)
+        {
+            PerformClick();
+            e.Handled = true;
+            e.SuppressKeyPress = true;
+        }
+    }
 
     public void SetIcon(string name) { Icon = name; Invalidate(); }
 
@@ -4810,7 +6047,10 @@ class UiButton : Control, IButtonControl
         Graphics g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         Color parentBg = Parent != null ? Parent.BackColor : BackColor;
-        using (SolidBrush bg = new SolidBrush(BackColor.A > 0 ? BackColor : parentBg)) g.FillRectangle(bg, ClientRectangle);
+        // 用父底色擦一遍：这里要擦成圆角，不能再是"铺满直角客户区"的方形 ——
+        // 异色底（比如灰底上的白胶囊）会从四角糊出四个直角块，看着就是"多余的小框"（2026-10-16）。
+        using (GraphicsPath bgp = Ui.Round(new Rectangle(0, 0, Width - 1, Height - 1), Theme.Px(Radius)))
+        using (SolidBrush bg = new SolidBrush(BackColor.A > 0 ? BackColor : parentBg)) g.FillPath(bg, bgp);
 
         Color fill = FillColor;
         if (!Enabled) fill = FillColor.A > 0 ? Theme.Mix(FillColor, Theme.Bg, 0.5f) : Theme.Clear;
@@ -4833,6 +6073,17 @@ class UiButton : Control, IButtonControl
         int gap = Theme.Px(IconGap);
         int iconW = Icon == null ? 0 : iconSize;
         int caretW = ShowCaret ? Theme.Px(16) : 0;
+        // 文字超宽就按可用宽度裁尾巴：不裁的话会直接糊出控件外（设置页那个长类型名在 150% 下就中过）。
+        // 这里用「两边内边距 + 图标 + 箭头」算真实可用宽度，和下面摆位用的是同一套数。
+        int room = Width - Theme.Px(Padding.Left) - Theme.Px(Padding.Right) - iconW - caretW
+            - (Icon != null && txt.Length > 0 ? gap : 0);
+        if (room > 0 && tw > room)
+        {
+            string cut = txt;
+            while (cut.Length > 1 && Ui.TextWidth(cut + "…", Font) > room) cut = cut.Substring(0, cut.Length - 1);
+            txt = cut + "…";
+            tw = Ui.TextWidth(txt, Font);
+        }
         int total = iconW + (tw > 0 ? ((iconW > 0 ? gap : 0) + tw) : 0) + caretW;
         int x;
         if (Align == ContentAlignment.MiddleLeft) x = Theme.Px(Padding.Left);
@@ -4841,7 +6092,7 @@ class UiButton : Control, IButtonControl
 
         if (Icon != null)
         {
-            Rectangle ir = new Rectangle(x, (Height - iconSize) / 2, iconSize, iconSize);
+            Rectangle ir = new Rectangle(x, (Height - iconSize) / 2 + Theme.Px(IconYOffset), iconSize, iconSize);
             Icons.Draw(g, Icon, ir, IconColor.A > 0 ? IconColor : fg, IconWeight);
             x += iconSize + (tw > 0 ? gap : 0);
         }
@@ -4853,7 +6104,9 @@ class UiButton : Control, IButtonControl
         }
         if (ShowCaret)
         {
-            if (!CaretFlip)
+            // 箭头方向跟着"展开"走：收起时朝下、展开时朝上。
+            // Active 就是"浮层开着"那个状态（模型 chip 展开时会同时点亮一块浅灰底）。
+            if (!(CaretFlip && Active))
                 Icons.Draw(g, "chevronDown",
                     new Rectangle(Width - Theme.Px(Padding.Right) - Theme.Px(11), Height / 2 - Theme.Px(5), Theme.Px(11), Theme.Px(10)),
                     fg, 1.4f);
@@ -4869,6 +6122,15 @@ class UiButton : Control, IButtonControl
                     fg, 1.4f);
                 g.Transform = old;
             }
+        }
+        // 可见焦点框：自绘按钮以前 Tab 到了也看不出焦点在哪。
+        if (Focused && Enabled)
+        {
+            using (GraphicsPath fp = Ui.Round(new Rectangle(Theme.Px(2), Theme.Px(2),
+                Math.Max(2, Width - Theme.Px(4) - 1), Math.Max(2, Height - Theme.Px(4) - 1)),
+                Theme.Px(Math.Max(2, Radius - 2))))
+            using (Pen pen = new Pen(Theme.Accent, Theme.Pxf(2f)))
+                g.DrawPath(pen, fp);
         }
     }
 }
@@ -4886,10 +6148,264 @@ class UiIconButton : UiButton
         TextColor = Theme.FgMid;
         IconColor = Theme.FgMid;
         Padding = new Padding(0);
+        AccessibleName = "图标：" + icon;
     }
 }
 
 // 下拉 / 菜单按钮：点开一个浅色菜单
+// 菜单项：一个字 + 右边那列快捷键提示（Codex 的菜单就长这样）
+class MenuItem2
+{
+    public string Text;
+    public string Hint;
+    public MenuItem2(string t, string h) { Text = t; Hint = h; }
+    public override string ToString() { return Text; }
+}
+
+// 自绘复选框：替换可见 CheckBox，方块和文字都自己画。
+class UiCheck : Control
+{
+    bool _hover;
+    bool _checked;
+
+    public string Label = "";
+    public event EventHandler CheckedChanged;
+
+    public bool Checked
+    {
+        get { return _checked; }
+        set
+        {
+            if (_checked == value) return;
+            _checked = value;
+            Invalidate();
+            if (CheckedChanged != null) CheckedChanged(this, EventArgs.Empty);
+        }
+    }
+
+    public UiCheck()
+    {
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
+            | ControlStyles.UserPaint | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+        Height = Theme.Px(23);
+        Width = Theme.Px(160);
+        BackColor = Theme.Bg;
+        Cursor = Cursors.Hand;
+        TabStop = true;
+        AccessibleRole = AccessibleRole.CheckButton;
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        using (SolidBrush b = new SolidBrush(BackColor)) g.FillRectangle(b, ClientRectangle);
+        int box = Theme.Px(16);
+        int by = (Height - box) / 2;
+        Rectangle r = new Rectangle(Theme.Px(2), by, box, box);
+        using (GraphicsPath p = Ui.Round(r, Theme.Px(4)))
+        {
+            using (SolidBrush b = new SolidBrush(Checked ? Theme.Accent : Color.White)) g.FillPath(b, p);
+            using (Pen pen = new Pen(Checked ? Theme.Accent : (_hover ? Theme.FgDim : Theme.Line), Theme.Pxf(1f)))
+                g.DrawPath(pen, p);
+        }
+        if (Checked)
+        {
+            using (Pen pen = new Pen(Color.White, Theme.Pxf(2f)))
+            {
+                pen.StartCap = LineCap.Round;
+                pen.EndCap = LineCap.Round;
+                g.DrawLine(pen, r.Left + Theme.Px(4), r.Top + Theme.Px(8), r.Left + Theme.Px(7), r.Top + Theme.Px(11));
+                g.DrawLine(pen, r.Left + Theme.Px(7), r.Top + Theme.Px(11), r.Left + Theme.Px(12), r.Top + Theme.Px(5));
+            }
+        }
+        if (Focused && ShowFocusCues)
+        {
+            using (Pen pen = new Pen(Theme.Accent, Theme.Pxf(1f)))
+                g.DrawRectangle(pen, r.Left - 2, r.Top - 2, r.Width + 4, r.Height + 4);
+        }
+        Rectangle tr = new Rectangle(r.Right + Theme.Px(8), 0, Math.Max(1, Width - r.Right - Theme.Px(8)), Height);
+        TextRenderer.DrawText(g, Label, Font, tr, Enabled ? Theme.FgMid : Theme.FgFaint,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding
+            | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+    }
+
+    protected override void OnMouseEnter(EventArgs e) { _hover = true; Invalidate(); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { _hover = false; Invalidate(); base.OnMouseLeave(e); }
+    protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
+    protected override void OnLostFocus(EventArgs e) { Invalidate(); base.OnLostFocus(e); }
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        if (e.Button != MouseButtons.Left) return;
+        Focus();
+        Checked = !Checked;
+    }
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        base.OnKeyDown(e);
+        if (e.KeyCode == Keys.Space) { Checked = !Checked; e.Handled = true; }
+    }
+}
+
+// 自绘数值框：替换设置页的两个系统 NumericUpDown（保留 min/max/value 用法）。
+class UiNumber : Control
+{
+    decimal _min, _max, _val;
+    int _decimals;
+    bool _hover;
+
+    public event EventHandler ValueChanged;
+
+    public UiNumber()
+    {
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
+            | ControlStyles.UserPaint | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+        BackColor = Theme.Card;
+        ForeColor = Theme.Fg;
+        Font = Theme.F(9.5f);
+        Height = Theme.Px(22);
+        TabStop = true;
+        AccessibleRole = AccessibleRole.SpinButton;
+        AccessibleName = "数值";
+    }
+
+    public decimal Minimum
+    {
+        get { return _min; }
+        set { _min = value; if (_max < _min) _max = _min; if (_val < _min) _val = _min; Invalidate(); }
+    }
+
+    public decimal Maximum
+    {
+        get { return _max; }
+        set { _max = value; if (_max < _min) _min = _max; if (_val > _max) _val = _max; Invalidate(); }
+    }
+
+    public int DecimalPlaces { get { return _decimals; } set { _decimals = Math.Max(0, value); Invalidate(); } }
+
+    public decimal Value
+    {
+        get { return _val; }
+        set
+        {
+            decimal v = value;
+            if (v < _min) v = _min;
+            if (v > _max) v = _max;
+            if (v == _val) return;
+            _val = v;
+            Invalidate();
+            if (ValueChanged != null) ValueChanged(this, EventArgs.Empty);
+        }
+    }
+
+    void Step(int dir)
+    {
+        decimal step = _decimals > 0 ? (decimal)Math.Pow(10, -_decimals) : 1m;
+        Value = _val + step * dir;
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        using (SolidBrush b = new SolidBrush(BackColor)) g.FillRectangle(b, ClientRectangle);
+        Rectangle r = new Rectangle(0, 0, Math.Max(1, Width - 1), Math.Max(1, Height - 1));
+        using (GraphicsPath p = Ui.Round(r, Theme.Px(4)))
+        {
+            using (SolidBrush b = new SolidBrush(BackColor)) g.FillPath(b, p);
+            using (Pen pen = new Pen(_hover ? Theme.FgDim : Theme.Line, Theme.Pxf(1f))) g.DrawPath(pen, p);
+        }
+        int arrowW = Theme.Px(18);
+        Rectangle tr = new Rectangle(Theme.Px(8), 0, Math.Max(1, Width - arrowW - Theme.Px(10)), Height);
+        TextRenderer.DrawText(g, _val.ToString("F" + _decimals), Font, tr, ForeColor,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding
+            | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+        // 上下两个小三角
+        int cx = Width - Theme.Px(9);
+        int cy = Height / 2;
+        using (SolidBrush b = new SolidBrush(Theme.FgMid))
+        {
+            Point[] up = new Point[] { new Point(cx - Theme.Px(4), cy - Theme.Px(3)), new Point(cx + Theme.Px(4), cy - Theme.Px(3)), new Point(cx, cy - Theme.Px(7)) };
+            Point[] dn = new Point[] { new Point(cx - Theme.Px(4), cy + Theme.Px(3)), new Point(cx + Theme.Px(4), cy + Theme.Px(3)), new Point(cx, cy + Theme.Px(7)) };
+            g.FillPolygon(b, up);
+            g.FillPolygon(b, dn);
+        }
+        if (Focused && ShowFocusCues)
+        {
+            using (Pen pen = new Pen(Theme.Accent, Theme.Pxf(2f))) g.DrawRectangle(pen, 1, 1, Math.Max(0, Width - 3), Math.Max(0, Height - 3));
+        }
+    }
+
+    protected override void OnMouseEnter(EventArgs e) { _hover = true; Invalidate(); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { _hover = false; Invalidate(); base.OnMouseLeave(e); }
+    protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
+    protected override void OnLostFocus(EventArgs e) { Invalidate(); base.OnLostFocus(e); }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        Focus();
+        if (e.X >= Width - Theme.Px(20))
+        {
+            Step(e.Y < Height / 2 ? 1 : -1);
+            return;
+        }
+        Invalidate();
+    }
+
+    protected override void OnMouseWheel(MouseEventArgs e)
+    {
+        base.OnMouseWheel(e);
+        Step(e.Delta > 0 ? 1 : -1);
+    }
+
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        if (keyData == Keys.Up || keyData == Keys.Right) { Step(1); return true; }
+        if (keyData == Keys.Down || keyData == Keys.Left) { Step(-1); return true; }
+        if (keyData == Keys.PageUp) { Value = _val + 10; return true; }
+        if (keyData == Keys.PageDown) { Value = _val - 10; return true; }
+        return base.ProcessCmdKey(ref msg, keyData);
+    }
+}
+
+// 自绘列表：替换设置页/改动页/插件页里默认的系统白底蓝选 ListBox。
+class UiList : ListBox
+{
+    public UiList()
+    {
+        DrawMode = DrawMode.OwnerDrawFixed;
+        BorderStyle = BorderStyle.None;
+        BackColor = Theme.Card;
+        ForeColor = Theme.Fg;
+        Font = Theme.F(9.5f);
+        ItemHeight = Theme.Px(28);
+        IntegralHeight = false;
+        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
+    }
+
+    protected override void OnDrawItem(DrawItemEventArgs e)
+    {
+        if (e.Index < 0 || e.Index >= Items.Count) return;
+        bool sel = (e.State & DrawItemState.Selected) != 0;
+        Color bg = sel ? Theme.Sel : BackColor;
+        using (SolidBrush b = new SolidBrush(bg)) e.Graphics.FillRectangle(b, e.Bounds);
+        Rectangle tr = new Rectangle(e.Bounds.Left + Theme.Px(8), e.Bounds.Top,
+            Math.Max(1, e.Bounds.Width - Theme.Px(16)), e.Bounds.Height);
+        TextRenderer.DrawText(e.Graphics, Convert.ToString(Items[e.Index]), Font, tr,
+            Enabled ? (sel ? Theme.Fg : ForeColor) : Theme.FgFaint,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix
+            | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+        if ((e.State & DrawItemState.Focus) != 0 && sel)
+        {
+            using (Pen p = new Pen(Theme.Accent, Theme.Pxf(1f)))
+                e.Graphics.DrawRectangle(p, e.Bounds.Left + 1, e.Bounds.Top + 1,
+                    Math.Max(0, e.Bounds.Width - 3), Math.Max(0, e.Bounds.Height - 3));
+        }
+    }
+}
+
 class UiDrop : UiButton
 {
     public List<object> Items = new List<object>();
@@ -4901,11 +6417,14 @@ class UiDrop : UiButton
 
     public UiDrop()
     {
+        AccessibleRole = AccessibleRole.ComboBox;
+        AccessibleName = "下拉选择";
         ShowCaret = true;
         Align = ContentAlignment.MiddleLeft;
-        Padding = new Padding(10, 0, 12, 0);
-        Radius = 9;
-        Font = Theme.F(9f);
+        // 内边距走栅格令牌（左 12 给文字、右 12 给箭头），圆角吸附 RadRow
+        Padding = new Padding(Theme.Sp12, 0, Theme.Sp12, 0);
+        Radius = Theme.RadRow;
+        Font = Theme.F(9.5f);
     }
 
     public object SelectedItem
@@ -4937,18 +6456,24 @@ class UiDrop : UiButton
     {
         if (Items.Count == 0) return;
         ContextMenuStrip menu = new ContextMenuStrip();
+        MenuRound.Apply(menu);
         menu.ShowImageMargin = false;
-        menu.BackColor = Color.White;
+        menu.DropShadowEnabled = true;       // 圆角需要阴影才能在白底上看出边界
+        menu.BackColor = Theme.Card;
         menu.ForeColor = Theme.Fg;
-        menu.Font = Font;
-        menu.Padding = new Padding(4);
+        menu.Font = Theme.F(9.5f);
+        menu.Padding = new Padding(Theme.Px(8), Theme.Px(6), Theme.Px(8), Theme.Px(6));
         menu.Renderer = new MenuTheme();
         foreach (object it in Items)
         {
             object captured = it;
             bool isSel = !KeepText && _sel != null && object.Equals(_sel, captured);
+            MenuItem2 m2 = captured as MenuItem2;
             ToolStripMenuItem mi = new ToolStripMenuItem(Convert.ToString(captured));
-            mi.Padding = new Padding(Theme.Px(6), Theme.Px(4), Theme.Px(6), Theme.Px(4));
+            if (m2 != null && m2.Hint != null && m2.Hint.Length > 0)
+                mi.ShortcutKeyDisplayString = m2.Hint;      // 右对齐那列灰字
+            mi.Padding = new Padding(Theme.Px(12), Theme.Px(3), Theme.Px(12), Theme.Px(3));
+            mi.Margin = new Padding(0, Theme.Px(1), 0, Theme.Px(1));
             if (isSel) { mi.Font = Theme.FB(Font.Size); mi.ForeColor = Theme.Accent; }
             mi.Click += delegate(object s, EventArgs a)
             {
@@ -4964,26 +6489,89 @@ class UiDrop : UiButton
             };
             menu.Items.Add(mi);
         }
-        menu.Show(this, new Point(0, Height + 6));
+        // 下拉卡片水平居中在按钮下面（以前是左对齐，文件/编辑/视图/帮助看起来都偏一边）
+        Size pref = menu.GetPreferredSize(Size.Empty);
+        if (pref.Width < 1) pref = menu.Size;
+        menu.Show(this, new Point((Width - pref.Width) / 2, Height + 6));
     }
 }
 
 class MenuTheme : ToolStripProfessionalRenderer
 {
     public MenuTheme() : base(new MenuColors()) { RoundedEdges = false; }
+
+    protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
+    {
+        Rectangle r = e.TextRectangle;
+        int h = TextRenderer.MeasureText(e.Text, e.TextFont).Height;
+        e.TextRectangle = new Rectangle(r.X, r.Y + Math.Max(0, (r.Height - h) / 2), r.Width, h);
+        base.OnRenderItemText(e);
+    }
+}
+
+// WinForms 的 ToolStripDropDown 会反复重置 Region；直接给原生窗口 SetWindowRgn，
+// 让主菜单/右键菜单也跟主窗口一样是圆角，而不是方方正正的系统卡片。
+static class MenuRound
+{
+    [DllImport("gdi32.dll")]
+    static extern IntPtr CreateRoundRectRgn(int x1, int y1, int x2, int y2, int w, int h);
+    [DllImport("user32.dll")]
+    static extern int SetWindowRgn(IntPtr hWnd, IntPtr hRgn, bool redraw);
+    [DllImport("dwmapi.dll")]
+    static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
+    public static void Apply(ToolStripDropDown menu)
+    {
+        if (menu == null) return;
+        menu.Opened += delegate
+        {
+            Round(menu);
+            // ToolStrip 在 Opened 之后还会再摆一次布局，同步 SetWindowRgn 会被它覆盖；
+            // 延迟到消息队列末尾再切一次，才是最终可见的窗口形状。
+            try
+            {
+                if (menu.IsHandleCreated)
+                    menu.BeginInvoke(new MethodInvoker(delegate { Round(menu); }));
+            }
+            catch { }
+        };
+        menu.SizeChanged += delegate { Round(menu); };
+    }
+
+    static void Round(ToolStripDropDown menu)
+    {
+        try
+        {
+            if (!menu.IsHandleCreated || menu.Width < 2 || menu.Height < 2) return;
+            int r = Theme.Px(10);
+            IntPtr h = CreateRoundRectRgn(0, 0, menu.Width + 1, menu.Height + 1, r * 2, r * 2);
+            if (h != IntPtr.Zero) SetWindowRgn(menu.Handle, h, true);   // 区域所有权交给系统
+            // Win11 的 DWM 圆角对弹出菜单比 SetWindowRgn 更稳（菜单句柄会被 ToolStrip 重整）。
+            int pref = 2; // DWMWCP_ROUND
+            DwmSetWindowAttribute(menu.Handle, 33, ref pref, sizeof(int));
+        }
+        catch { }
+    }
 }
 
 class MenuColors : ProfessionalColorTable
 {
     public override Color MenuItemSelected { get { return Theme.Hover; } }
+    // 选中项的渐变也要给：只给 MenuItemSelected 的话，系统渲染器还会画它自己那套默认渐变，
+    // 灰底上叠出一条和自绘悬停色不一样的横带（浮层里"看着有第二层框"的来源之一）。
+    public override Color MenuItemSelectedGradientBegin { get { return Theme.Hover; } }
+    public override Color MenuItemSelectedGradientEnd { get { return Theme.Hover; } }
+    public override Color MenuItemPressedGradientBegin { get { return Theme.Hover; } }
+    public override Color MenuItemPressedGradientMiddle { get { return Theme.Hover; } }
+    public override Color MenuItemPressedGradientEnd { get { return Theme.Hover; } }
     public override Color MenuItemBorder { get { return Theme.Hover; } }
-    public override Color ToolStripDropDownBackground { get { return Color.White; } }
+    public override Color ToolStripDropDownBackground { get { return Theme.Card; } }
     public override Color MenuBorder { get { return Theme.Line; } }
-    public override Color ImageMarginGradientBegin { get { return Color.White; } }
-    public override Color ImageMarginGradientMiddle { get { return Color.White; } }
-    public override Color ImageMarginGradientEnd { get { return Color.White; } }
+    public override Color ImageMarginGradientBegin { get { return Theme.Card; } }
+    public override Color ImageMarginGradientMiddle { get { return Theme.Card; } }
+    public override Color ImageMarginGradientEnd { get { return Theme.Card; } }
     public override Color SeparatorDark { get { return Theme.LineSoft; } }
-    public override Color SeparatorLight { get { return Color.White; } }
+    public override Color SeparatorLight { get { return Theme.Card; } }
 }
 // 强度面板（Codex 的"推理强度"那张卡片）：顶部大号蓝字档位、下面一行「模型名 ›」、最下面一根滑杆。
 // 点「模型名 ›」那行可以切到模型列表（浮层会平滑地换成模型列表那张卡）。
@@ -5001,15 +6589,17 @@ class EffortSlider : Control
     {
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
             | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
-        BackColor = Color.White;
-        Font = Theme.F(9f);
+        BackColor = Theme.Card;
+        AccessibleRole = AccessibleRole.Slider;
+        AccessibleName = "模型强度";
+        Font = Theme.F(9.5f);
         Size = new Size(Theme.Px(232), Theme.Px(112));
     }
 
     int HeadTop { get { return Theme.Px(12); } }
     int TrackL { get { return Theme.Px(22); } }
     int TrackW { get { return Math.Max(Theme.Px(60), Width - Theme.Px(44)); } }
-    int TrackY { get { return Theme.Px(106); } }
+    int TrackY { get { return Theme.Px(104); } }
     int TrackH { get { return Theme.Px(13); } }
     int LevelTop { get { return Theme.Px(36); } }
     int TitleTop { get { return Theme.Px(78); } }
@@ -5020,7 +6610,7 @@ class EffortSlider : Control
     {
         get
         {
-            Font f = Theme.F(9f);
+            Font f = Theme.Cache(Theme.FontName, 9f, FontStyle.Regular);
             int tw = Ui.TextWidth(Title, f) + Theme.Px(26);
             if (tw > Width - Theme.Px(24)) tw = Width - Theme.Px(24);
             return new Rectangle((Width - tw) / 2, TitleTop, tw, TitleH);
@@ -5056,7 +6646,7 @@ class EffortSlider : Control
         // 顶部小标题（"选择强度"）
         if (Head != null && Head.Length > 0)
         {
-            Font fh = Theme.F(10f);      // 参考图（Codex）那行小标题比正文略大、中灰
+            Font fh = Theme.Cache(Theme.FontName, 10f, FontStyle.Regular);   // 参考图那行小标题比正文略大、中灰
             TextRenderer.DrawText(g, Head, fh, new Point(Theme.Px(14), HeadTop), Theme.FgDim,
                 TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
         }
@@ -5064,14 +6654,14 @@ class EffortSlider : Control
         // 当前档位（强调蓝、加粗、居中）。不支持调强度的模型也照常显示当前档位文字，
         // 只是下面不画滑块 —— 否则整张卡片会是一片空白（用户报的 bug）。
         string lvl = Effort.Label(Effort.Levels[Value]);
-        Font fb = Theme.FB(17f);
+        Font fb = Theme.Cache(Theme.FontName, 17f, FontStyle.Bold);
         TextRenderer.DrawText(g, lvl, fb,
             new Point((Width - Ui.TextWidth(lvl, fb)) / 2, LevelTop), Theme.Accent,
             TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
 
         // 中间：「模型名 ›」。参考图（Codex）这里是纯灰文字，不是胶囊底 —— 胶囊会看成一枚按钮
         Rectangle tr = TitleRect;
-        Font ft = Theme.F(9f);
+        Font ft = Theme.Cache(Theme.FontName, 9f, FontStyle.Regular);
         string tt = Title == null ? "" : Title;
         int maxTw = tr.Width - Theme.Px(24);
         while (tt.Length > 1 && Ui.TextWidth(tt, ft) > maxTw) tt = tt.Substring(0, tt.Length - 1);   // 太长的模型名裁尾巴
@@ -5084,7 +6674,7 @@ class EffortSlider : Control
         // 不支持调强度：不画滑块（不要假档位），但把话说明白
         if (!EffortSupported)
         {
-            Font fn = Theme.F(8.5f);
+            Font fn = Theme.Cache(Theme.FontName, 9.5f, FontStyle.Regular);
             string note = "这个模型不支持调强度";
             TextRenderer.DrawText(g, note, fn,
                 new Point((Width - Ui.TextWidth(note, fn)) / 2, TrackY + Theme.Px(2)), Theme.FgFaint,
@@ -5162,7 +6752,9 @@ class CardRowCtl : Control
     {
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
             | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
-        BackColor = Color.White;
+        BackColor = Theme.Card;
+        AccessibleRole = AccessibleRole.ListItem;
+        AccessibleName = "变更文件";
         Font = Theme.F(9.5f);
         Size = new Size(Theme.Px(340), Theme.Px(36));
         Cursor = Cursors.Hand;
@@ -5183,7 +6775,7 @@ class CardRowCtl : Control
             Theme.Fg, TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
         if (Value != null && Value.Length > 0)
         {
-            Font fv = Theme.F(9f);
+            Font fv = Theme.Cache(Theme.FontName, 9f, FontStyle.Regular);
             int vw = Ui.TextWidth(Value, fv);
             TextRenderer.DrawText(g, Value, fv,
                 new Point(Width - Theme.Px(34) - vw, (Height - fv.Height) / 2), Theme.FgDim,
@@ -5242,7 +6834,9 @@ class ModelPickCtl : Control
     {
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
             | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
-        BackColor = Color.White;
+        BackColor = Theme.Card;
+        AccessibleRole = AccessibleRole.List;
+        AccessibleName = "选择模型";
         _rowH = Theme.Px(36);
         _headH = headH;
         _maxRows = maxRows;
@@ -5257,7 +6851,7 @@ class ModelPickCtl : Control
                 h.Label = groups[i];
                 h.Header = true;
                 h.Y = y;
-                h.H = Theme.Px(26);
+                h.H = Theme.Px(Theme.Sp24);        // 组头行高吸附 24（原 26）
                 _items.Add(h);
                 y += h.H;
             }
@@ -5269,7 +6863,7 @@ class ModelPickCtl : Control
             _items.Add(it);
             y += _rowH;
         }
-        _contentH = y + Theme.Px(6);
+        _contentH = y + Theme.Px(Theme.Sp8);
         Size = new Size(Theme.Px(340), _headH + ListH(maxRows, labels.Length));
         _listRect = new Rectangle(0, _headH, Width, ListH(maxRows, labels.Length));
         // 当前模型的自动滚动放在 SetListHeight 里做：构造时还没跟浮层接上，Scrolled 还没人听
@@ -5287,7 +6881,7 @@ class ModelPickCtl : Control
     int ListH(int maxRows, int labelCount)
     {
         int rows = Math.Max(1, Math.Min(maxRows, Math.Max(1, labelCount)));
-        int h = rows * _rowH + Theme.Px(2);
+        int h = rows * _rowH + Theme.Px(Theme.Sp4);
         foreach (PickItem it in _items) if (it.Header) h += it.H;
         return h;
     }
@@ -5319,7 +6913,7 @@ class ModelPickCtl : Control
     }
 
     // 行区域宽度（右边留出滚动条的地方）
-    int RowW { get { return Math.Max(Theme.Px(60), Width - Theme.Px(14)); } }
+    int RowW { get { return Math.Max(Theme.Px(60), Width - Theme.Px(Theme.Sp12)); } }
 
     int RowTopInView(int rowIdx)
     {
@@ -5345,20 +6939,23 @@ class ModelPickCtl : Control
         using (SolidBrush bg = new SolidBrush(BackColor)) g.FillRectangle(bg, ClientRectangle);
         if (_headH > 0)
         {
-            Font ft = Theme.F(10f);      // 和强度卡那行小标题统一（参考图里这行比正文略大、中灰）
-            TextRenderer.DrawText(g, "选择模型", ft, new Point(Theme.Px(14), Theme.Px(10)), Theme.FgDim,
-                TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+            using (Font ft = Theme.F(10f))   // 和强度卡那行小标题统一；本控件自己持有，不碰共享缓存
+                TextRenderer.DrawText(g, "选择模型", ft, new Point(Theme.Px(14), Theme.Px(10)), Theme.FgDim,
+                    TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
         }
 
-        Font fh = Theme.F(8.5f);
-        Font fr = Theme.F(9.5f);
+        using (Font fh = Theme.F(8.5f))
+        using (Font fr = Theme.F(9.5f))
+        {
         // 行和组标题都画在列表区里，超出列表区的部分裁掉
         Region old = g.Clip;
         g.SetClip(new Rectangle(0, ViewTop, Width, ViewH));
         foreach (PickItem it in _items)
         {
             int y = ViewTop + it.Y - _scrollTop;
-            if (y + it.H < ViewTop || y > ViewTop + ViewH) continue;
+            // 只画"完整落在列表区里"的行。以前允许半行露出，但 TextRenderer.DrawText 不遵守
+            // GDI+ 的 SetClip，半行文字会画进上面的"选择模型"标题区（2026-10-18 验收 P0）。
+            if (y < ViewTop || y + it.H > ViewTop + ViewH) continue;
             if (it.Header)
             {
                 TextRenderer.DrawText(g, it.Label, fh, new Point(Theme.Px(20), y + (it.H - fh.Height) / 2),
@@ -5380,6 +6977,7 @@ class ModelPickCtl : Control
         }
         g.Clip = old;
         DrawScrollBar(g);
+        }
     }
 
     int RowIndexOfItem(PickItem it)
@@ -5507,6 +7105,7 @@ class ModelPickCtl : Control
 
     // ---- 只给自测用的只读快照（devtools\bench\flicker-unittest.cs 要检查列表状态）----
     public int ListHeight { get { return _headH + ListH(_maxRows, _rowItemIdx.Count); } }
+    public int HeadHeight { get { return _headH; } }          // 头部占位（调用方要区分"总高"与"列表体高"）
     public int RowCount { get { return _rowItemIdx.Count; } }
     public int CurrentRow { get { return _cur; } }
     public int CheckedCount { get { int n = 0; for (int i = 0; i < RowCount; i++) if (i == _cur) n++; return n; } }
@@ -5553,7 +7152,7 @@ class PopoverForm : Form
     const uint RDW_ALLCHILDREN = 0x0080;
     const uint RDW_FRAME = 0x0400;
 
-    public int Pad = 16;              // 阴影留白（不含它的话圆角边会被切掉）
+    public int Pad = Theme.Sp8;       // 窗口给卡片留的边（只要够容纳 1px 描边就行；以前是 16，当阴影区用）
     public int Gap;                   // 卡片与 chip 之间的间距（逻辑像素，默认 6）
     public int CardW;                 // 卡片宽（换页动画中会变）
     public int CardH;                 // 卡片高（换页动画中会变）
@@ -5567,10 +7166,10 @@ class PopoverForm : Form
         // 不要设 TopMost：主窗口置顶时它会被压住，而且置顶窗口会牵动前台的激活状态，
         // 实测会让"点 chip 弹浮层"偶发失效。靠 Show()/BringToFront() 保持在自己的 owner 之上就够了。
         StartPosition = FormStartPosition.Manual;
-        BackColor = Color.White;
+        BackColor = Theme.Card;
         AutoScaleMode = AutoScaleMode.None;
         Font = Theme.F(9.5f);
-        Gap = Theme.Px(6);
+        Gap = Theme.Px(Theme.Sp8);
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
             | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
     }
@@ -5593,19 +7192,16 @@ class PopoverForm : Form
         base.OnPaint(e);
         Graphics g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
+        // 1px 细线要配 PixelOffsetMode.Half，否则描边会被糊成 2px（"多余小框"的来源之一）
+        g.PixelOffsetMode = PixelOffsetMode.Half;
         Rectangle card = CardRect;
-        // 柔和阴影：几层递减透明度的圆角矩形（投影在下方，观感更像卡片）
-        for (int i = 6; i >= 1; i--)
-        {
-            int a = 8 + (7 - i) * 2;
-            Rectangle sr = new Rectangle(card.X - i, card.Y - i + Theme.Px(3), card.Width + i * 2, card.Height + i * 2);
-            using (GraphicsPath sp = Ui.Round(sr, Theme.Px(16) + i))
-            using (SolidBrush sb = new SolidBrush(Color.FromArgb(a, 15, 17, 21))) g.FillPath(sb, sp);
-        }
-        using (GraphicsPath cp = Ui.Round(card, Theme.Px(16)))
+        // 不再画阴影圈（2026-10-16）：窗口 region 的半径是"卡片半径 + 留白"，而卡片描边半径只有卡片半径，
+        // 夹在中间那圈留白会被 region 硬化成一个更大的白框 —— 用户看到的就是"白框里套一个小框"。
+        // 现在层次只靠"白底 + 1px 描边"，和整体那种克制的观感一致。
+        using (GraphicsPath cp = Ui.Round(card, Theme.Px(Theme.RadCard)))
         {
             using (SolidBrush b = new SolidBrush(Color.White)) g.FillPath(b, cp);
-            using (Pen pen = new Pen(Theme.Line, 1f)) g.DrawPath(pen, cp);
+            using (Pen pen = new Pen(Theme.PopupLine, Theme.Pxf(1f))) g.DrawPath(pen, cp);
         }
     }
 
@@ -5627,11 +7223,12 @@ class PopoverForm : Form
             if (Width <= 0 || Height <= 0) return;
             int p = Theme.Px(Pad);
             Rectangle card = CardRect;
-            int grow = p - Theme.Px(2);          // 把阴影也圈进来
+            // 只比卡片大一个描边宽度：再大就会露出一圈纯白，被裁成"外面那个白框"
+            int grow = Math.Max(1, Theme.Px(1));
             Rectangle outer = new Rectangle(
                 Math.Max(0, card.X - grow), Math.Max(0, card.Y - grow),
                 Math.Min(Width, card.Width + grow * 2), Math.Min(Height, card.Height + grow * 2));
-            using (GraphicsPath gp = Ui.Round(outer, Theme.Px(16) + grow))
+            using (GraphicsPath gp = Ui.Round(outer, Theme.Px(Theme.RadCard) + grow))
                 Region = new Region(gp);
         }
         catch (Exception ex) { Log.Swallow(ex, "浮层裁剪"); }
@@ -5646,6 +7243,7 @@ class PopoverForm : Form
         Show();
         BringToFront();
         ApplyCardRegion();
+        Native.RoundWindow(Handle);
         ForceRepaint();
         // 让 DWM 把这一块合成上去：不激活的窗口是自己画的，紧接着重画/截屏会看到"还没合成"的空块
         Application.DoEvents();
@@ -5738,12 +7336,18 @@ class ModelChip : UiButton
         ShowCaret = true;
         CaretFlip = true;
         Align = ContentAlignment.MiddleLeft;
-        FillColor = Theme.Chip;
-        HoverColor = Theme.ChipHover;
+        // Codex 输入条右下角那个：平时就是一行深色小字 + 箭头，没有底色；
+        // 只有浮层开着的时候才浮出一块浅灰底（Active 那套现成的）。
+        FillColor = Theme.Clear;
+        HoverColor = Theme.Hover;
         TextColor = Theme.Fg;
+        // 输入条上这颗是**胶囊**（半径 = 高度的一半），和设置页那种 8px 圆角下拉是两种形状：
+        // 这是有意的区分（参考图里输入条的 chip 就是胶囊），不是为了"统一"就该拉平 —— 自测也在守它。
         Radius = 18;
-        Font = Theme.F(9f);
-        Padding = new Padding(14, 0, 14, 0);
+        Font = Theme.F(9.5f);
+        Padding = new Padding(Theme.Sp4, 0, Theme.Sp8, 0);
+        ActiveFill = Theme.Chip;
+        ActiveText = Theme.Fg;
     }
 
     public object SelectedItem
@@ -5783,15 +7387,19 @@ class PermMenu : Control
     public event EventHandler RowPicked;
     private int _hover = -1;
 
-    int RowH { get { return Theme.Px(30); } }      // 参考图（Codex）那三行比我们原来松一点
-    int PadY { get { return Theme.Px(6); } }
-    int PadX { get { return Theme.Px(6); } }
+    int RowH { get { return Theme.Px(Theme.MenuRowHeight); } }   // 栅格：菜单行高 28
+    int PadY { get { return Theme.Px(Theme.Sp4); } }
+    int PadX { get { return Theme.Px(Theme.Sp4); } }
+    private int _down = -1;                     // 按下态（三态：选中 / 按下 / 悬停）
+    public int Disabled = -1;                   // 要置灰的行（-1 = 没有）
 
     public PermMenu(int cur)
     {
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
             | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
-        BackColor = Color.White;
+        BackColor = Theme.Card;
+        AccessibleRole = AccessibleRole.MenuItem;
+        AccessibleName = "权限选择";
         Current = cur;
         Font = Theme.F(9.5f);
         int textW = 0;
@@ -5804,12 +7412,146 @@ class PermMenu : Control
         // 左右内边距 + 图标 + 图标与文字间距 + ✓ 的位置 + 右边距（比原来收窄一档）
         MenuW = textW + Theme.Px(10) + Theme.Px(16) + Theme.Px(8) + Theme.Px(24) + Theme.Px(10) + PadX * 2;
         Size = new Size(MenuW, Perm.Labels.Length * RowH + PadY * 2);
+#if !NET10_0_OR_GREATER
+        _proxies = new RowProxy[Perm.Labels.Length];
+        for (int i = 0; i < Perm.Labels.Length; i++)
+        {
+            RowProxy p = new RowProxy(this, i);
+            _proxies[i] = p;
+            Controls.Add(p);
+        }
+        LayoutProxies();
+#endif
+    }
+
+#if !NET10_0_OR_GREATER
+    RowProxy[] _proxies;
+
+    internal void PickRow(int i)
+    {
+        if (i < 0 || i >= Perm.Labels.Length || i == Disabled || i == Current) return;
+        Current = i;
+        Invalidate();
+        InvalidateProxies();
+        if (RowPicked != null) RowPicked(this, EventArgs.Empty);
+    }
+
+    void LayoutProxies()
+    {
+        if (_proxies == null) return;
+        for (int i = 0; i < _proxies.Length; i++)
+        {
+            _proxies[i].Bounds = RowRect(i);
+            _proxies[i].BringToFront();
+        }
+    }
+
+    void InvalidateProxies()
+    {
+        if (_proxies == null) return;
+        for (int i = 0; i < _proxies.Length; i++) _proxies[i].Invalidate();
+    }
+
+    class RowProxy : Control
+    {
+        readonly PermMenu _owner;
+        readonly int _index;
+        public RowProxy(PermMenu owner, int index)
+        {
+            _owner = owner; _index = index;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint, true);
+            BackColor = owner.BackColor;
+            Cursor = Cursors.Hand;
+            TabStop = false;
+            AccessibleRole = AccessibleRole.RadioButton;
+            AccessibleName = Perm.Labels[index];
+            AccessibleDefaultActionDescription = "选择";
+        }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            using (SolidBrush b = new SolidBrush(_owner.BackColor)) e.Graphics.FillRectangle(b, ClientRectangle);
+            _owner.DrawRow(e.Graphics, _index, Left, Top);
+        }
+        protected override void OnMouseEnter(EventArgs e) { _owner._hover = _index; _owner.InvalidateProxies(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { _owner._hover = -1; _owner.InvalidateProxies(); base.OnMouseLeave(e); }
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button == MouseButtons.Left) _owner.PickRow(_index);
+        }
+    }
+#endif
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+#if !NET10_0_OR_GREATER
+        LayoutProxies();
+#endif
     }
 
     public Rectangle RowRect(int i)
     {
         return new Rectangle(PadX, PadY + i * RowH, Width - PadX * 2, RowH);
     }
+
+#if NET10_0_OR_GREATER
+    // .NET 10 的 WinForms 允许自定义 AccessibleObject 进入 UIA 树；
+    // 旧 .NET Framework 只保留控件级 Role/Name（子项会被 Control.AccessibilityObject 判空）。
+    protected override AccessibleObject CreateAccessibilityInstance()
+    {
+        return new MenuAccessible(this);
+    }
+
+    internal void PickRow(int i)
+    {
+        if (i < 0 || i >= Perm.Labels.Length || i == Disabled || i == Current) return;
+        Current = i;
+        Invalidate();
+        if (RowPicked != null) RowPicked(this, EventArgs.Empty);
+    }
+
+    class MenuAccessible : AccessibleObject
+    {
+        readonly PermMenu _owner;
+        public MenuAccessible(PermMenu owner) { _owner = owner; }
+        public override string Name { get { return "权限选择"; } }
+        public override AccessibleRole Role { get { return AccessibleRole.MenuItem; } }
+        public override int GetChildCount() { return Perm.Labels.Length; }
+        public override AccessibleObject GetChild(int index)
+        {
+            if (index < 0 || index >= Perm.Labels.Length) return null;
+            return new RowAccessible(_owner, index);
+        }
+        public override AccessibleObject GetFocused()
+        {
+            return _owner.Current >= 0 ? new RowAccessible(_owner, _owner.Current) : null;
+        }
+    }
+
+    class RowAccessible : AccessibleObject
+    {
+        readonly PermMenu _owner;
+        readonly int _index;
+        public RowAccessible(PermMenu owner, int index) { _owner = owner; _index = index; }
+        public override string Name { get { return Perm.Labels[_index]; } }
+        public override AccessibleRole Role { get { return AccessibleRole.RadioButton; } }
+        public override AccessibleObject Parent { get { return _owner.AccessibilityObject; } }
+        public override Rectangle Bounds { get { return _owner.RectangleToScreen(_owner.RowRect(_index)); } }
+        public override string DefaultAction { get { return "选择"; } }
+        public override AccessibleStates State
+        {
+            get
+            {
+                AccessibleStates s = AccessibleStates.Focusable | AccessibleStates.Selectable;
+                if (_owner.Current == _index) s |= AccessibleStates.Checked | AccessibleStates.Selected | AccessibleStates.Focused;
+                if (_owner.Disabled == _index) s |= AccessibleStates.Unavailable;
+                return s;
+            }
+        }
+        public override void DoDefaultAction() { _owner.PickRow(_index); }
+    }
+#endif
 
     int RowAt(Point p)
     {
@@ -5822,47 +7564,66 @@ class PermMenu : Control
         Graphics g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         using (SolidBrush bg = new SolidBrush(BackColor)) g.FillRectangle(bg, ClientRectangle);
-        Font f = Theme.F(10f);
-        for (int i = 0; i < Perm.Labels.Length; i++)
+        for (int i = 0; i < Perm.Labels.Length; i++) DrawRow(g, i);
+    }
+
+    internal void DrawRow(Graphics g, int i, int offsetX = 0, int offsetY = 0)
+    {
+        Font f = Theme.Cache(Theme.FontName, 9.5f, FontStyle.Regular);
+        Rectangle r = RowRect(i);
+        r.Offset(-offsetX, -offsetY);
+        bool dis = (i == Disabled);
+        bool cur = (i == Current);
+        if (cur || i == _down || (i == _hover && !dis))
         {
-            Rectangle r = RowRect(i);
-            if (i == _hover)
-                using (GraphicsPath hp = Ui.Round(r, Theme.Px(10)))
-                using (SolidBrush hb = new SolidBrush(Theme.Hover)) g.FillPath(hb, hp);
-            int ic = Theme.Px(16);
-            Icons.Draw(g, Perm.Icons2[i], new Rectangle(r.Left + Theme.Px(9), r.Top + (r.Height - ic) / 2, ic, ic),
-                Theme.FgMid, 1.5f);
-            TextRenderer.DrawText(g, Perm.Labels[i], f,
-                new Rectangle(r.Left + Theme.Px(32), r.Top, r.Width - Theme.Px(58), r.Height), Theme.Fg,
-                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding
-                | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
-            if (i == Current)
-                Icons.Draw(g, "check", new Rectangle(r.Right - Theme.Px(24), r.Top + r.Height / 2 - Theme.Px(8),
-                    Theme.Px(15), Theme.Px(15)), Theme.Fg, 1.7f);
+            Color fill = cur ? Theme.Sel : (i == _down ? Theme.ChipHover : Theme.Hover);
+            using (GraphicsPath hp = Ui.Round(r, Theme.Px(Theme.RadRow)))
+            using (SolidBrush hb = new SolidBrush(fill)) g.FillPath(hb, hp);
         }
+        int ic = Theme.Px(16);
+        Color icc = dis ? Theme.FgFaint : (cur ? Theme.Accent : Theme.FgMid);
+        Icons.Draw(g, Perm.Icons2[i], new Rectangle(r.Left + Theme.Px(10), r.Top + (r.Height - ic) / 2, ic, ic), icc, 1.5f);
+        TextRenderer.DrawText(g, Perm.Labels[i], f,
+            new Rectangle(r.Left + Theme.Px(34), r.Top, r.Width - Theme.Px(62), r.Height),
+            dis ? Theme.FgFaint : Theme.Fg,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding
+            | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+        if (cur)
+            Icons.Draw(g, "check", new Rectangle(r.Right - Theme.Px(22), r.Top + r.Height / 2 - Theme.Px(8),
+                Theme.Px(15), Theme.Px(15)), Theme.Accent, 1.7f);
     }
 
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
         int h = RowAt(e.Location);
+        if (h == Disabled) h = -1;
         if (h != _hover) { _hover = h; Cursor = h >= 0 ? Cursors.Hand : Cursors.Default; Invalidate(); }
     }
 
     protected override void OnMouseLeave(EventArgs e)
     {
         base.OnMouseLeave(e);
-        if (_hover != -1) { _hover = -1; Cursor = Cursors.Default; Invalidate(); }
+        if (_hover != -1 || _down != -1) { _hover = -1; _down = -1; Cursor = Cursors.Default; Invalidate(); }
     }
 
     protected override void OnMouseDown(MouseEventArgs e)
     {
         base.OnMouseDown(e);
         int h = RowAt(e.Location);
-        if (h < 0 || h == Current) return;      // 点当前档就不折腾了
+        if (h < 0 || h == Disabled) return;
+        _down = h;                       // 按下就先给一次视觉回应（选中态落定之前）
+        Invalidate();
+        if (h == Current) { _down = -1; Invalidate(); return; }   // 点当前档不折腾
         Current = h;
         Invalidate();
         if (RowPicked != null) RowPicked(this, EventArgs.Empty);
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        base.OnMouseUp(e);
+        if (_down != -1) { _down = -1; Invalidate(); }
     }
 }
 
@@ -5935,7 +7696,10 @@ class ModelPopover : PopoverForm
         };
         MaxH = Screen.FromPoint(Cursor.Position).WorkingArea.Height - Theme.Px(60);
         _hList = Math.Min(_pick.ListHeight, MaxH);
-        _pick.SetListHeight(_hList);
+        // 传"列表体"高度：ListHeight 已经含 _headH，而 SetListHeight 会再加一次 ——
+        // 直接传 ListHeight 会让子控件比卡片高一个 _headH（36px），正好盖掉卡片底边描边
+        // （用户看到的"多余的框/底边断掉"，2026-10-16 查到）。
+        _pick.SetListHeight(_hList - _pick.HeadHeight);
         _pick.Scrolled += delegate { _pick.Invalidate(); };
         _pick.Location = new Point(0, 0);        // Location 由 LayoutPage 统一摆
         _pick.Visible = false;
@@ -5945,7 +7709,8 @@ class ModelPopover : PopoverForm
         _eff = new EffortSlider();
         _eff.Head = "选择强度";
         _wStrength = Theme.Px(204);
-        _hStrength = Theme.Px(136);
+        // 卡片高 136 → 124：内容只画到 119（TrackY 106 + 轨道 13），底部那 17px 是凑出来的空白。
+        _hStrength = Theme.Px(124);
         _eff.Title = modelName;
         _eff.EffortSupported = effortSupported;
         _eff.Chip = Theme.Chip;
@@ -6013,6 +7778,7 @@ class ModelPopover : PopoverForm
             to.Invalidate();
             Invalidate();
             Reanchor();          // 卡片尺寸变了，重新贴回 chip
+            ForceRepaint();      // 不激活窗口换页后必须整窗重画，否则会短暂/持续空白
             return;
         }
         Animating = true;
@@ -6064,6 +7830,7 @@ class ModelPopover : PopoverForm
             to.Visible = true;
             to.Invalidate();
             Reanchor();          // 卡片尺寸变了，重新贴回 chip
+            ForceRepaint();      // 换页结束整窗重画，避免浮层变白/空白
         }
         Invalidate();
     }
@@ -6096,7 +7863,7 @@ class ModelPopover : PopoverForm
         if (room < _hList)
         {
             _hListUsed = room;
-            _pick.SetListHeight(room);
+            _pick.SetListHeight(room - _pick.HeadHeight);   // 同上：只给列表体高度
         }
         else _hListUsed = _hList;
         if (Page == PageModels) ApplyCard(_wList, _hListUsed);
@@ -6179,6 +7946,23 @@ class LogoMark : Control
 }
 
 // 小黑胶囊标签（LOGO 旁边的 LOCAL 之类）
+// 首屏那个云朵标（Codex 空状态的 logo）：只描边、不填色
+class CloudMark : Control
+{
+    public CloudMark()
+    {
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
+            | ControlStyles.UserPaint | ControlStyles.ResizeRedraw | ControlStyles.SupportsTransparentBackColor, true);
+    }
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        using (SolidBrush bg = new SolidBrush(BackColor)) g.FillRectangle(bg, ClientRectangle);
+        Icons.Draw(g, "cloudCode", new Rectangle(0, 0, Width - 1, Height - 1), Theme.FgFaint, 1.7f);
+    }
+}
+
 class PillLabel : Control
 {
     public Color Fill = Theme.Fg;
@@ -6240,9 +8024,9 @@ class SessionRowView : Control
         Cursor = Cursors.Hand;
         // 字体建一次就好：每次重绘都 new Font 会把 GDI 句柄耗光
         _fTitle = Theme.F(9.5f);
-        _fTime = Theme.F(8.4f);
+        _fTime = Theme.F(8.5f);
         Font = _fTitle;
-        Height = Theme.Px(32);
+        Height = Theme.Px(30);
     }
 
     protected override void Dispose(bool disposing)
@@ -6267,29 +8051,22 @@ class SessionRowView : Control
         Color fill = Selected ? Theme.Sel : (_hover ? Theme.Hover : Theme.Clear);
         if (fill.A > 0)
         {
-            using (GraphicsPath p = Ui.Round(new Rectangle(Theme.Px(10), Theme.Px(1), Width - Theme.Px(20), Height - Theme.Px(2)), Theme.Px(8)))
+            using (GraphicsPath p = Ui.Round(new Rectangle(Theme.Px(8), Theme.Px(1), Width - Theme.Px(16), Height - Theme.Px(2)), Theme.Px(8)))
             using (SolidBrush b = new SolidBrush(fill)) g.FillPath(b, p);
         }
 
-        int iconSize = 15;
-        int x = Theme.Px(IsProject ? 16 : 26);
-        iconSize = Theme.Px(iconSize);
-        Rectangle ir = new Rectangle(x, (Height - iconSize) / 2, iconSize, iconSize);
-        Icons.Draw(g, IsProject ? "folder" : "chat", ir, IsProject ? Theme.FgDim : Theme.FgFaint, 1.4f);
-
-        int textX = x + iconSize + Theme.Px(8);
-        int timeW = 0;
-        if (!IsProject && TimeText != null && TimeText.Length > 0)
+        // Codex 侧栏的行：项目行前面一个文件夹图标，会话行没有图标；
+        // 两种行的文字左边缘对齐（x=40），后面不跟时间（时间挪到鼠标悬停的提示里）。
+        if (IsProject)
         {
-            int pad = Theme.Px(10);
-            timeW = Ui.TextWidth(TimeText, _fTime) + pad;
-            Rectangle tr = new Rectangle(Width - Theme.Px(18) - timeW + pad, 0, timeW - pad, Height);
-            TextRenderer.DrawText(g, TimeText, _fTime, tr, Theme.FgFaint,
-                TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+            int iconSize = Theme.Px(14);
+            Icons.Draw(g, "folder", new Rectangle(Theme.Px(18), (Height - iconSize) / 2, iconSize, iconSize),
+                Theme.FgMid, 1.4f);
         }
 
-        Rectangle cr = new Rectangle(textX, 0, Math.Max(10, Width - textX - Theme.Px(16) - timeW), Height);
-        TextRenderer.DrawText(g, Text, _fTitle, cr, IsProject ? Theme.FgDim : Theme.Fg,
+        int textX = Theme.Px(40);
+        Rectangle cr = new Rectangle(textX, 0, Math.Max(10, Width - textX - Theme.Px(16)), Height);
+        TextRenderer.DrawText(g, Text, _fTitle, cr, IsProject ? Theme.Fg : Theme.FgMid,
             TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine);
     }
 }
@@ -6315,7 +8092,7 @@ class SidebarList : Panel
             c.Top = y;
             c.Width = RowWidth;
             Controls.Add(c);
-            y += c.Height + Theme.Px(2);
+            y += c.Height + Theme.Px(1);
         }
         AutoScrollMinSize = new Size(0, y + 6);
         ResumeLayout();
@@ -6364,32 +8141,177 @@ class TabsBar : Control
             | ControlStyles.UserPaint | ControlStyles.ResizeRedraw | ControlStyles.SupportsTransparentBackColor, true);
         SetStyle(ControlStyles.Selectable, false);   // 焦点留在对话区上，Ctrl+C 才归它管
         BackColor = Theme.Bg;
+        AccessibleRole = AccessibleRole.PageTabList;
+        AccessibleName = "对话与轨迹";
         Cursor = Cursors.Hand;
+#if !NET10_0_OR_GREATER
+        // 旧 Framework 的 Control.AccessibilityObject 不收自定义 AccessibleObject；
+        // 用真实子控件承载每个页签，MSAA/UIA 才能逐项朗读。
+        _proxies = new TabProxy[Tabs.Length];
+        for (int i = 0; i < Tabs.Length; i++)
+        {
+            TabProxy p = new TabProxy(this, i);
+            _proxies[i] = p;
+            Controls.Add(p);
+        }
+        LayoutProxies();
+#endif
+    }
+
+#if !NET10_0_OR_GREATER
+    TabProxy[] _proxies;
+
+    void LayoutProxies()
+    {
+        if (_proxies == null) return;
+        for (int i = 0; i < _proxies.Length; i++)
+        {
+            Rectangle r = TabBounds(i);
+            r.Height = Math.Max(1, Height - Theme.Px(1));
+            _proxies[i].Bounds = r;
+            _proxies[i].BringToFront();
+        }
+    }
+
+    void InvalidateProxies()
+    {
+        if (_proxies == null) return;
+        for (int i = 0; i < _proxies.Length; i++) _proxies[i].Invalidate();
+    }
+
+    class TabProxy : Control
+    {
+        readonly TabsBar _owner;
+        readonly int _index;
+        public TabProxy(TabsBar owner, int index)
+        {
+            _owner = owner; _index = index;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
+                | ControlStyles.UserPaint, true);
+            BackColor = owner.BackColor;
+            Cursor = Cursors.Hand;
+            TabStop = false;
+            AccessibleRole = AccessibleRole.PageTab;
+            AccessibleName = owner.Tabs[index];
+            AccessibleDefaultActionDescription = "切换";
+        }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            using (SolidBrush b = new SolidBrush(_owner.BackColor)) e.Graphics.FillRectangle(b, ClientRectangle);
+            _owner.DrawTab(e.Graphics, _index, Left);
+        }
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            _owner._hot = _index;
+            _owner.InvalidateProxies();
+            base.OnMouseEnter(e);
+        }
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            _owner._hot = -1;
+            _owner.InvalidateProxies();
+            base.OnMouseLeave(e);
+        }
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button == MouseButtons.Left) _owner.SelectTab(_index);
+        }
+    }
+#endif
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+#if !NET10_0_OR_GREATER
+        LayoutProxies();
+#endif
     }
 
     int TabX(int i)
     {
         int x = Theme.Px(22);
-        using (Font f = Theme.F(10f))
+        using (Font f = Theme.F(9.5f))
         {
-            for (int k = 0; k < i; k++) x += Ui.TextWidth(Tabs[k], f) + Theme.Px(34);
+            for (int k = 0; k < i; k++) x += Ui.TextWidth(Tabs[k], f) + Theme.Px(30);
         }
         return x;
     }
 
+    internal Rectangle TabBounds(int i)
+    {
+        using (Font f = Theme.F(9.5f))
+        {
+            int x = TabX(i);
+            int w = Ui.TextWidth(Tabs[i], f) + Theme.Px(30);
+            return new Rectangle(x - Theme.Px(8), 0, w, Height);
+        }
+    }
+
     int HitTest(Point p)
     {
-        using (Font f = Theme.F(10f))
-        {
-            for (int i = 0; i < Tabs.Length; i++)
-            {
-                int x = TabX(i);
-                int w = Ui.TextWidth(Tabs[i], f) + Theme.Px(34);
-                if (p.X >= x - Theme.Px(8) && p.X <= x + w - Theme.Px(8)) return i;
-            }
-        }
+        for (int i = 0; i < Tabs.Length; i++)
+            if (TabBounds(i).Contains(p)) return i;
         return -1;
     }
+
+    internal void SelectTab(int i)
+    {
+        if (i < 0 || i >= Tabs.Length || i == SelectedIndex) return;
+        SelectedIndex = i;
+        Invalidate();
+#if !NET10_0_OR_GREATER
+        InvalidateProxies();
+#endif
+        if (SelectedIndexChanged != null) SelectedIndexChanged(this, EventArgs.Empty);
+    }
+
+#if NET10_0_OR_GREATER
+    protected override AccessibleObject CreateAccessibilityInstance()
+    {
+        return new TabsAccessible(this);
+    }
+
+    class TabsAccessible : AccessibleObject
+    {
+        readonly TabsBar _owner;
+        public TabsAccessible(TabsBar owner) { _owner = owner; }
+        public override string Name { get { return "对话与轨迹"; } }
+        public override AccessibleRole Role { get { return AccessibleRole.PageTabList; } }
+        public override int GetChildCount() { return _owner.Tabs.Length; }
+        public override AccessibleObject GetChild(int index)
+        {
+            if (index < 0 || index >= _owner.Tabs.Length) return null;
+            return new TabAccessible(_owner, index);
+        }
+        public override AccessibleObject GetFocused()
+        {
+            return _owner.SelectedIndex >= 0 ? new TabAccessible(_owner, _owner.SelectedIndex) : null;
+        }
+    }
+
+    class TabAccessible : AccessibleObject
+    {
+        readonly TabsBar _owner;
+        readonly int _index;
+        public TabAccessible(TabsBar owner, int index) { _owner = owner; _index = index; }
+        public override string Name { get { return _owner.Tabs[_index]; } }
+        public override AccessibleRole Role { get { return AccessibleRole.PageTab; } }
+        public override AccessibleObject Parent { get { return _owner.AccessibilityObject; } }
+        public override Rectangle Bounds { get { return _owner.RectangleToScreen(_owner.TabBounds(_index)); } }
+        public override string DefaultAction { get { return "切换"; } }
+        public override AccessibleStates State
+        {
+            get
+            {
+                AccessibleStates s = AccessibleStates.Focusable | AccessibleStates.Selectable;
+                if (_owner.SelectedIndex == _index) s |= AccessibleStates.Selected | AccessibleStates.Focused;
+                return s;
+            }
+        }
+        public override void DoDefaultAction() { _owner.SelectTab(_index); }
+    }
+#endif
 
     protected override void OnMouseMove(MouseEventArgs e)
     {
@@ -6403,12 +8325,7 @@ class TabsBar : Control
     protected override void OnMouseDown(MouseEventArgs e)
     {
         int h = HitTest(e.Location);
-        if (h >= 0 && h != SelectedIndex)
-        {
-            SelectedIndex = h;
-            Invalidate();
-            if (SelectedIndexChanged != null) SelectedIndexChanged(this, EventArgs.Empty);
-        }
+        if (h >= 0) SelectTab(h);
         base.OnMouseDown(e);
     }
 
@@ -6417,25 +8334,27 @@ class TabsBar : Control
         Graphics g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         using (SolidBrush bg = new SolidBrush(BackColor)) g.FillRectangle(bg, ClientRectangle);
-        for (int i = 0; i < Tabs.Length; i++)
-        {
-            bool sel = i == SelectedIndex;
-            Font f = sel ? Theme.FB(10f) : Theme.F(10f);
-            Color c = sel ? Theme.Fg : (_hot == i ? Theme.FgMid : Theme.FgDim);
-            int x = TabX(i);
-            int w = Ui.TextWidth(Tabs[i], f);
-            Rectangle tr = new Rectangle(x, 0, w + 4, Height - Theme.Px(6));
-            TextRenderer.DrawText(g, Tabs[i], f, tr, c,
-                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
-            if (sel)
-            {
-                using (SolidBrush b = new SolidBrush(Theme.Accent))
-                using (GraphicsPath p = Ui.Round(new Rectangle(x, Height - Theme.Px(6), w, Theme.Px(3)), Theme.Px(2)))
-                    g.FillPath(b, p);
-            }
-            f.Dispose();
-        }
+        for (int i = 0; i < Tabs.Length; i++) DrawTab(g, i);
         using (Pen p = new Pen(Theme.LineSoft, Theme.Pxf(1f))) g.DrawLine(p, 0, Height - 1, Width, Height - 1);
+    }
+
+    internal void DrawTab(Graphics g, int i, int offsetX = 0)
+    {
+        bool sel = i == SelectedIndex;
+        Font f = Theme.Cache(Theme.FontName, 9.5f, sel ? FontStyle.Bold : FontStyle.Regular);
+        Color c = sel ? Theme.Fg : (_hot == i ? Theme.FgMid : Theme.FgDim);
+        int x = TabX(i) - offsetX;
+        int w = Ui.TextWidth(Tabs[i], f);
+        Rectangle tr = new Rectangle(x, 1, w + 4, Height - Theme.Px(8));
+        TextRenderer.DrawText(g, Tabs[i], f, tr, c,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+        if (sel)
+        {
+            using (SolidBrush b = new SolidBrush(Theme.Accent))
+            using (GraphicsPath p = Ui.Round(new Rectangle(x, Height - Theme.Px(5), w, Theme.Px(2)), Theme.Px(1)))
+                g.FillPath(b, p);
+        }
+        f.Dispose();
     }
 }
 
@@ -6471,6 +8390,21 @@ class MsgBlock : Control
     }
     private readonly List<Piece> _pieces = new List<Piece>();
     private int _contentH;
+    private int _bubbleH;      // 气泡实际高度（含操作行；_contentH 仍只算正文）
+
+    // ---------- 气泡里的图片缩略图（2026-10-18 补回）----------
+    public readonly List<string> Images = new List<string>();
+    private readonly List<Size> _imgSizes = new List<Size>();
+    private readonly List<Size> _thumbs = new List<Size>();
+    private readonly List<Rectangle> _thumbRects = new List<Rectangle>();
+    private readonly List<Bitmap> _thumbCache = new List<Bitmap>();
+    private int _imgH, _imgTop;
+
+    // 正文的左右边界与气泡矩形（用户气泡靠右、AI 气泡靠左，见 LayoutBox）；
+    // 排版一律用 _left/_right，绘制再按 _bubX/_bubW 铺底 —— 只改绘制不改排版的话，
+    // 拖选高亮和"点哪儿选哪儿"会跟画面错位。
+    private int _left, _right, _bubX, _bubW;
+    private int _laidLeft;         // 上次排版用的 _left（宽度变化判据要带上它，否则换宽度不重排）
 
     // 增量排版用的"定稿点"：流式追加时，前面已经排好的部分不会变，只有尾巴要重排。
     // 不做这个的话，一段 12000 字的回答每来一批都要把全篇重新量一遍（实测每批 50ms，最慢 180ms）。
@@ -6497,10 +8431,46 @@ class MsgBlock : Control
     public int MsgIdx = -1;        // 对应 runner.Messages 里的第几条（-1 = 不确定，分支时按末尾算）
     private int _actY, _actH;
 
+    // ---------- 长内容折叠（⑤）：工具结果 / 轨迹页思考默认收起 ----------
+    // 收起态只画一行摘要，排版**直接 return、不推进定稿点 _laidChars** ——
+    // 否则流式期间每来一批就要把全量文字重排一遍，退回 O(n²)（硬约束）。
+    public bool Foldable;          // 这条允许折叠（定稿后才置位，流式期间不折叠）
+    public bool Collapsed;         // 是不是收起态（权威在 TranscriptView._foldedKeys，这里只是镜像）
+    public string FoldSummary;     // 摘要行文案："已执行 run_shell · 12 行"
+    public string FoldTool;        // 这条工具结果是哪个工具跑的（摘要里要报工具名）
+    public int FoldKey = -1;       // 没有 MsgIdx 的块（实时流式）拿它当折叠状态的 key
+    private Rectangle _foldRect;   // 摘要行 / 收起按钮的客户区矩形（和 CopyRect 一样是客户区坐标）
+    private int _foldChars = -1;   // 摘要里的行数是按多少字符算的（文本长过就要重算）
+    private bool _foldHot;         // 鼠标压在这行的折叠入口上
+    internal int FoldToggles = 0;  // 自测用：这条被折叠/展开过几次
+
+    internal Rectangle FoldRect { get { return _foldRect; } }
+
+    internal bool ToggleFold()
+    {
+        if (!Foldable) return false;
+        Collapsed = !Collapsed;
+        FoldToggles++;
+        ResetLayout();          // 定稿点作废（_laidChars/_laidPieces 只清不删）
+        Rebuild();
+        return true;
+    }
+
+    // 定稿后置位：默认收起（视图那边同时把 key 记进 _foldedKeys）
+    internal void SetFold(bool foldable, string summary, bool collapsed)
+    {
+        Foldable = foldable;
+        FoldSummary = summary;
+        _foldChars = summary == null ? -1 : Raw.Length;
+        Collapsed = foldable && collapsed;
+        ResetLayout();
+        Rebuild();
+    }
+
     internal const int ActCopy = 0, ActBranch = 1;
 
-    Rectangle CopyRect() { return new Rectangle(_pads, _actY + Theme.Px(2), Theme.Px(17), Theme.Px(17)); }
-    Rectangle BranchRect() { return new Rectangle(_pads + Theme.Px(28), _actY + Theme.Px(2), Theme.Px(17), Theme.Px(17)); }
+    Rectangle CopyRect() { return new Rectangle(_left, _actY + Theme.Px(2), Theme.Px(17), Theme.Px(17)); }
+    Rectangle BranchRect() { return new Rectangle(_left + Theme.Px(28), _actY + Theme.Px(2), Theme.Px(17), Theme.Px(17)); }
     internal Rectangle CopyIconRect() { return CopyRect(); }
     internal Rectangle BranchIconRect() { return BranchRect(); }
 
@@ -6547,7 +8517,9 @@ class MsgBlock : Control
         for (int i = 0; i < CardFiles.Count; i++) { CardRows.Add(new Rectangle(_pads, y, w, rowH)); y += rowH; }
         CardListRect = new Rectangle(_pads, top, w, Math.Max(0, y - top));
         _contentH = y + Theme.Px(2);
+        _imgH = 0; _imgTop = 0; _thumbRects.Clear();
         _actH = 0; _actY = _contentH;
+        _bubbleH = _contentH;
         Height = _contentH + Theme.Px(4);
         Invalidate();
     }
@@ -6693,7 +8665,150 @@ class MsgBlock : Control
         Rebuild();
     }
 
+    // 真路径进 Images，正文只显示 [图片 文件名]（MainForm.Attach.Show.Text 负责替换）。
+    // 坏路径 / 不存在的文件直接忽略：不能因为一张图把整条消息排崩。
+    public void SetImages(List<string> paths)
+    {
+        Images.Clear();
+        _imgSizes.Clear();
+        DisposeThumbs();
+        _thumbs.Clear();
+        _thumbRects.Clear();
+        if (paths != null)
+        {
+            foreach (string p in paths)
+            {
+                if (string.IsNullOrEmpty(p)) continue;
+                try
+                {
+                    if (!File.Exists(p)) continue;
+                    int w, h;
+                    using (Image img = Image.FromFile(p)) { w = img.Width; h = img.Height; }
+                    if (w <= 0 || h <= 0) continue;
+                    Images.Add(p);
+                    _imgSizes.Add(new Size(w, h));
+                }
+                catch { }
+            }
+        }
+        ResetLayout();
+        Rebuild();
+    }
+
+    // 缩略图按 220×160 逻辑像素等比缩（只缩不放），每行放不下就换行。
+    void LayoutImages(int top)
+    {
+        _thumbs.Clear();
+        _thumbRects.Clear();
+        _imgTop = 0;
+        _imgH = 0;
+        if (Images.Count == 0) return;
+        int maxW = Theme.Px(220), maxH = Theme.Px(160), gap = Theme.Px(Theme.Sp8);
+        List<Size> sizes = new List<Size>();
+        foreach (Size s in _imgSizes)
+        {
+            double k = Math.Min(1.0, Math.Min(maxW / (double)s.Width, maxH / (double)s.Height));
+            int tw = Math.Max(1, (int)Math.Round(s.Width * k));
+            int th = Math.Max(1, (int)Math.Round(s.Height * k));
+            sizes.Add(new Size(tw, th));
+        }
+        int x = _left, y = top, rowH = 0;
+        foreach (Size s in sizes)
+        {
+            if (x > _left && x + s.Width > _right)
+            {
+                x = _left;
+                y += rowH + gap;
+                rowH = 0;
+            }
+            _thumbs.Add(s);
+            _thumbRects.Add(new Rectangle(x, y, s.Width, s.Height));
+            x += s.Width + gap;
+            if (s.Height > rowH) rowH = s.Height;
+        }
+        _imgTop = top;
+        _imgH = (y + rowH) - top;
+    }
+
+    // 真加载缩略图（不是只算尺寸）；缓存到 Dispose 时逐个释放。
+    internal Bitmap LoadThumb(int i)
+    {
+        if (i < 0 || i >= Images.Count || i >= _thumbs.Count) return null;
+        while (_thumbCache.Count <= i) _thumbCache.Add(null);
+        if (_thumbCache[i] != null) return _thumbCache[i];
+        try
+        {
+            using (Image src = Image.FromFile(Images[i]))
+            {
+                Bitmap b = new Bitmap(_thumbs[i].Width, _thumbs[i].Height);
+                using (Graphics g = Graphics.FromImage(b))
+                {
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    g.DrawImage(src, 0, 0, b.Width, b.Height);
+                }
+                _thumbCache[i] = b;
+                return b;
+            }
+        }
+        catch { return null; }
+    }
+
+    void DrawImages(Graphics g)
+    {
+        for (int i = 0; i < _thumbRects.Count; i++)
+        {
+            Bitmap b = LoadThumb(i);
+            if (b == null) continue;
+            g.DrawImage(b, _thumbRects[i]);
+        }
+    }
+
+    void DisposeThumbs()
+    {
+        foreach (Bitmap b in _thumbCache) if (b != null) b.Dispose();
+        _thumbCache.Clear();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) DisposeThumbs();
+        base.Dispose(disposing);
+    }
+
     // ---------- 排版：把文本切成"行内片段"，算出每个片段的位置 ----------
+
+    // 这条消息带不带气泡：只有用户消息和助手回复是"气泡"，思考/工具/提示仍是通栏小字
+    bool Bubbled { get { return Kind == OutKind.User || Kind == OutKind.Assistant; } }
+
+    // 气泡几何 + 正文左右边界。必须在排版之前调用；换了宽度/字号也要重算。
+    void LayoutBox()
+    {
+        int pad = Theme.Px(Theme.PadBubbleX);
+        int gap = Theme.Px(Theme.Sp4);
+        if (!Bubbled)
+        {
+            // 非气泡消息保持原样：正文左边界就是原来的 _pads，右边界也照旧
+            _bubX = 0; _bubW = Width;
+            _left = _pads; _right = Math.Max(_pads + Theme.Px(40), Width - _pads);
+            return;
+        }
+        if (Kind == OutKind.User)
+        {
+            // 靠右：左边留出 25%，气泡最宽 75%（窄块下保底一个内边距）
+            _bubX = (int)((Width - gap) * (100 - Theme.BubbleMaxPct) / 100);
+            if (_bubX < pad) _bubX = pad;
+        }
+        else
+        {
+            _bubX = gap;                     // 靠左：左右各留 4
+        }
+        _bubW = Math.Max(Theme.Px(48), Width - _bubX - gap);
+        _left = _bubX + pad;
+        _right = _bubX + _bubW - pad;
+        if (_right - _left < Theme.Px(48)) _right = _left + Theme.Px(48);
+    }
+
     void Rebuild()
     {
         // 设 Height 会触发 OnResize 又回到 Rebuild，这里加个闸门，避免自己递归自己
@@ -6718,9 +8833,12 @@ class MsgBlock : Control
     {
         _pieces.Clear();
         _laidChars = 0; _laidPieces = 0;
-        _laidX = _pads; _laidY = Theme.Px(3);
+        // 气泡里面要留 PadBubbleY 的内边距；思考/工具/提示这些通栏小字维持原来的紧凑排版
+        _laidX = _left;
+        _laidY = (Bubbled ? Theme.Px(Theme.PadBubbleY) : Theme.Px(3)) + FoldHeaderH();
         _laidBlank = false; _laidMidLine = false; _laidWrap = 0;
         _laidInCode = false;
+        _laidLeft = _left;
     }
 
     // 这一段里没有"还没配对的" ** 或 ` 时，后面再追加文字也不会改变它的样式/位置
@@ -6739,12 +8857,16 @@ class MsgBlock : Control
     void RebuildCore()
     {
         Rebuilds++;
+        LayoutBox();                                             // 气泡/左右边界先定下来，再谈排版
         if (Kind == OutKind.Changes) { BuildCard(); return; }     // 卡片有自己的一套排版
+        // 收起态：只有一行摘要，**不碰定稿点**（_laidChars 不推进）。
+        // 推进了就等于"收起时也把全文排了一遍"，流式期间每批一次 → O(n²)。
+        if (Foldable && Collapsed) { LayoutCollapsed(); return; }
         string text = Raw.ToString();
-        int wrapW = Math.Max(Theme.Px(80), Width - _pads * 2);
-        int lineH = BaseFont().Height + Theme.Px(3);
+        int wrapW = Math.Max(Theme.Px(80), _right - _left);
+        int lineH = BaseFont().Height + Theme.Px(Theme.Sp4);      // 行高吸附 4px 栅格（原来 +3）
 
-        if (text.Length < _laidChars || _laidWrap != wrapW) ResetLayout();
+        if (text.Length < _laidChars || _laidWrap != wrapW || _laidLeft != _left) ResetLayout();
         if (_pieces.Count > _laidPieces) _pieces.RemoveRange(_laidPieces, _pieces.Count - _laidPieces);
 
         int x = _laidX, y = _laidY;
@@ -6767,7 +8889,7 @@ class MsgBlock : Control
 
             if (line.Length == 0)
             {
-                if (midLine) { x = _pads; y += lineH + Theme.Px(2); lastBlank = false; }
+                if (midLine) { x = _left; y += lineH + Theme.Px(2); lastBlank = false; }
                 else { if (y > 0) y += (int)(lineH * 0.55f); lastBlank = true; }
             }
             else
@@ -6777,26 +8899,26 @@ class MsgBlock : Control
                 {
                     // 续排上一次定稿留下的半行：它是普通正文的一部分，不能再按行首去识别标题/列表/表格
                     LayLine(line, lineAbs, null, 0, null, null, lineH, wrapW, 0, ref x, ref y);
-                    x = _pads; y += lineH + Theme.Px(2);
+                    x = _left; y += lineH + Theme.Px(2);
                 }
                 else if (trimmed.StartsWith("```"))
                 {
-                    // 代码块围栏：本身不画字，只留一点间距
-                    if (inCode) { inCode = false; y += Theme.Px(2); }
-                    else { inCode = true; if (y > 0) y += Theme.Px(4); }
+                    // 代码块围栏：本身不画字，只留间距（正文的圆角框由相邻 style==3 的片段聚合成一个）
+                    if (inCode) { inCode = false; y += Theme.Px(Theme.Sp12); }
+                    else { inCode = true; if (y > 0) y += Theme.Px(Theme.Sp12); }
                     lastBlank = false;
-                    x = _pads; y += lineH + Theme.Px(2);
+                    x = _left;
                 }
                 else if (inCode)
                 {
                     // 代码块内容：等宽、浅底、保留原样
                     LayLine(line, lineAbs, _fontMono, 0, null, null, lineH, wrapW, 3, ref x, ref y);
-                    x = _pads; y += lineH + Theme.Px(2);
+                    x = _left; y += lineH + Theme.Px(2);
                 }
                 else if (Kind == OutKind.Assistant && ToolNoise.IsAnnounceLine(line))
                 {
                     // 模型把"要调用工具"写成了正文：不显示（否则对话区会被十几条 [调用] 刷屏）
-                    x = _pads; y += Theme.Px(3);
+                    x = _left; y += Theme.Px(3);
                     lastBlank = false;
                 }
                 else
@@ -6806,11 +8928,11 @@ class MsgBlock : Control
                     if (lvl > 0)
                     {
                         Font hf = HeadingFont(lvl);
-                        int hh = hf.Height + Theme.Px(3);
+                        int hh = hf.Height + Theme.Px(Theme.Sp4);
                         if (y > 0) y += Theme.Px(lvl == 1 ? 10 : 7);
                         string body = line.Substring(hPrefix).TrimStart();
                         LayLine(body, lineAbs + (line.Length - body.Length), hf, 0, null, null, hh, wrapW, 0, ref x, ref y);
-                        x = _pads; y += hh + Theme.Px(4);
+                        x = _left; y += hh + Theme.Px(4);
                     }
                     else if (IsTableRow(line))
                     {
@@ -6826,7 +8948,7 @@ class MsgBlock : Control
                         if (lastBlank && y > 0) y += (int)(lineH * 0.15f);
                         lastBlank = false;
                         LayLine(body, lineAbs + (line.Length - body.Length), null, hang, marker, _fontBold, lineH, wrapW, 0, ref x, ref y);
-                        x = _pads; y += lineH + Theme.Px(2);
+                        x = _left; y += lineH + Theme.Px(2);
                     }
                 }
             }
@@ -6837,17 +8959,81 @@ class MsgBlock : Control
             // 整行定稿（行首状态）
             _laidChars = baseChars + pos;
             _laidPieces = _pieces.Count;
-            _laidX = _pads; _laidY = y;
+            _laidX = _left; _laidY = y;
             _laidBlank = lastBlank; _laidMidLine = false; _laidWrap = wrapW;
+            _laidLeft = _left;
             _laidInCode = inCode;
         }
 
-        _contentH = Math.Max(1, y);
+        // 气泡底边 = 正文底 + 下内边距；通栏小字（思考/工具/提示）保持原来的紧凑留白
+        // 图片放在正文下面：文本排版完全不动，只在最后加一段图片区。
+        if (Images.Count > 0)
+        {
+            LayoutImages(y + Theme.Px(Theme.Sp8));
+            y = _imgTop + _imgH;
+        }
+        else LayoutImages(0);
+        _contentH = Math.Max(1, y + (Bubbled ? Theme.Px(Theme.PadBubbleY) : Theme.Px(2)));
+        // AI 气泡按正文实际右边界收窄；否则短回复会拉成整行白卡片，右边一大块空白（截图里红叉那块）。
+        if (Kind == OutKind.Assistant && _bubW > Theme.Px(80))
+        {
+            int maxR = _left;
+            foreach (Piece pc in _pieces) if (pc.Rect.Width > 0 && pc.Rect.Right > maxR) maxR = pc.Rect.Right;
+            foreach (Rectangle tr in _thumbRects) if (tr.Right > maxR) maxR = tr.Right;
+            int pad = _left - _bubX;
+            int want = Math.Max(Theme.Px(160), maxR + pad - _bubX);
+            if (want < _bubW) _bubW = want;
+        }
         _actH = (ShowCopy || ShowBranch) ? Theme.Px(22) : 0;
-        _actY = _contentH + Theme.Px(2);
-        Height = _contentH + Theme.Px(4) + _actH;
+        _actY = _contentH + Theme.Px(Theme.Sp8);                   // 操作行留 8px（轮内间距吸附栅格）
+        _bubbleH = Bubbled ? Math.Max(_contentH, _actY + _actH + Theme.Px(Theme.Sp4)) : _contentH;
+        Height = Math.Max(_bubbleH, _actY + _actH);
         _laidWrap = wrapW;
+        _laidLeft = _left;
+        // 展开态的摘要行（表头）：还是块顶那一格，和收起态位置完全一样 —— 正文从它下面开始
+        if (Foldable)
+            _foldRect = new Rectangle(_pads, 0, Math.Max(Theme.Px(40), Width - _pads * 2),
+                FoldHeaderH() - Theme.Px(Theme.Sp4));
         Invalidate();
+    }
+
+    // ---------- 折叠的两种版面 ----------
+    // 摘要行（表头）在**收起和展开时都占块顶同一格**：
+    // 这样 _foldRect.Top 在两种状态下是同一个点，防跳位那套"记它切换前的位置"才有意义。
+
+    // 可折叠的块顶上那一行摘要有多高（收起/展开一样高）
+    int FoldHeaderH()
+    {
+        if (!Foldable) return 0;
+        return BaseFont().Height + Theme.Px(Theme.Sp8) + Theme.Px(Theme.Sp4);
+    }
+
+    // 收起态：只有一行摘要 + 操作行。_laidChars/_laidPieces 只能由 ResetLayout 作废，这里不动它们。
+    void LayoutCollapsed()
+    {
+        if (_pieces.Count > 0) ResetLayout();
+        RefreshFoldSummary();
+        int fh = FoldHeaderH();
+        _contentH = fh;
+        _imgH = 0; _imgTop = 0; _thumbRects.Clear();
+        _foldRect = new Rectangle(_pads, 0, Math.Max(Theme.Px(40), Width - _pads * 2), fh - Theme.Px(Theme.Sp4));
+        _actH = (ShowCopy || ShowBranch) ? Theme.Px(22) : 0;
+        _actY = _contentH + Theme.Px(Theme.Sp4);
+        _bubbleH = Bubbled ? Math.Max(_contentH, _actY + _actH + Theme.Px(Theme.Sp4)) : _contentH;
+        Height = Math.Max(_bubbleH, _actY + _actH);
+        Invalidate();
+    }
+
+    // 收起期间文本还会长（轨迹页的思考就是一条大块一路续）：
+    // 只有"字符数变了"才重算行数，避免每次 Append 都扫一遍全文。
+    void RefreshFoldSummary()
+    {
+        if (FoldSummary == null || Raw.Length == _foldChars) return;
+        _foldChars = Raw.Length;
+        string t = Raw.ToString().Replace("\r\n", "\n").TrimEnd('\n', '\r');
+        string head = Kind == OutKind.Thinking ? "思考"
+            : (string.IsNullOrEmpty(FoldTool) ? "已执行" : ("已执行 " + FoldTool));
+        FoldSummary = head + " · " + Txt.LineCount(t) + " 行";
     }
 
     // ---------- 块级 Markdown：标题 / 列表 / 代码块 / 表格 ----------
@@ -6934,6 +9120,14 @@ class MsgBlock : Control
         return cells;
     }
 
+    // 表格单元格不做行内 Markdown 排版（整张表用等宽字体对齐），但至少把 **粗体** / `代码`
+    // 的标记剥掉，别让模型输出的 "**状态码**" 原样带星号显示（2026-10-18 验收）。
+    static string TableCellText(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return s;
+        return s.Replace("**", "").Replace("__", "").Replace("`", "").Trim();
+    }
+
     static int Measure(string s, Font f)
     {
         if (s == null || s.Length == 0) return 0;
@@ -6945,7 +9139,7 @@ class MsgBlock : Control
     void LayLine(string line, int lineAbs, Font forceFont, int hang, string marker, Font markerFont,
                  int lineH, int wrapW, int style, ref int x, ref int y)
     {
-        int left = _pads + hang;
+        int left = _left + hang;
         if (marker != null && marker.Length > 0)
         {
             Font mf = markerFont != null ? markerFont : (forceFont != null ? forceFont : BaseFont());
@@ -6957,7 +9151,7 @@ class MsgBlock : Control
             mp.Font = mf;
             // 标记右对齐到悬挂缩进处：这样 "•" 和 "10." 的文字起始位置一致，不会忽左忽右
             int mw = Math.Max(1, Measure(marker, mf));
-            mp.Rect = new Rectangle(Math.Max(_pads, _pads + hang - mw - Theme.Px(6)), y, mw, lineH + Theme.Px(2));
+            mp.Rect = new Rectangle(Math.Max(_left, _left + hang - mw - Theme.Px(6)), y, mw, lineH + Theme.Px(2));
             _pieces.Add(mp);
         }
         x = left;
@@ -6969,17 +9163,19 @@ class MsgBlock : Control
             Font f = forceFont != null ? forceFont : FontFor(p.Style);
             string seg = p.Text;
             int markerLen = p.Style == 1 ? 2 : (p.Style == 2 ? 1 : 0);
+            // 行内代码的底框比文字左右各宽 3px，文字前面也要让出一点，否则底框会压到前一个字上
+            if (p.Style == 2 && x > left) x += Theme.Px(Theme.Sp4);
             // inPart 是"这一段内部"已经排掉的字符数：必须每段归零，
             // 否则第二段起的 SrcAt 会把前面所有段的长度重复加一遍（选中高亮就会错位、盖不住字）
             int inPart = 0;
             while (seg.Length > 0)
             {
-                int room = wrapW - (x - _pads);
+                int room = wrapW - (x - _left);
                 if (room < Theme.Px(24) && x > left)
                 {
                     x = left;
                     y += lineH + Theme.Px(2);
-                    room = wrapW - (x - _pads);
+                    room = wrapW - (x - _left);
                 }
                 int avail = Math.Max(Theme.Px(24), room);
                 int fit = Fitting(seg, f, avail);
@@ -6998,7 +9194,7 @@ class MsgBlock : Control
                 seg = seg.Substring(fit);
                 if (seg.Length > 0) { x = left; y += lineH + Theme.Px(2); }
             }
-            if (p.Style == 2) x += Theme.Px(3);
+            if (p.Style == 2) x += Theme.Px(Theme.Sp4);
             partAt += p.SrcLen;
             // 只有"普通正文行"才允许行中定稿：标题/列表/代码行都有"行首含义"，
             // 从行中间续排会丢掉这个上下文（字号、悬挂缩进、等宽），必须整行重排
@@ -7054,7 +9250,7 @@ class MsgBlock : Control
             if (IsTableRule(rows[k])) continue;
             for (int j = 0; j < rows[k].Count; j++)
             {
-                int w = Measure(rows[k][j], fm);
+                int w = Measure(TableCellText(rows[k][j]), fm);
                 if (w > colW[j]) colW[j] = w;
             }
         }
@@ -7062,7 +9258,7 @@ class MsgBlock : Control
         for (int j = 0; j < cols; j++) { colW[j] += pad; total += colW[j]; }
         if (total > wrapW) return -1;                       // 太宽：退回普通文本折行
         int[] colX = new int[cols];
-        int cx = _pads;
+        int cx = _left;
         for (int j = 0; j < cols; j++) { colX[j] = cx; cx += colW[j]; }
         for (int k = 0; k < rows.Count; k++)
         {
@@ -7073,16 +9269,17 @@ class MsgBlock : Control
                 sp.Style = 6;
                 sp.SrcLen = 0;
                 sp.SrcAt = rowAbs[k];
-                sp.Rect = new Rectangle(_pads, y + lineH / 2, total, Math.Max(1, Theme.Px(1)));
+                sp.Rect = new Rectangle(_left, y + lineH / 2, total, Math.Max(1, Theme.Px(1)));
                 _pieces.Add(sp);
             }
             else
             {
                 for (int j = 0; j < rows[k].Count; j++)
                 {
-                    if (rows[k][j].Length == 0) continue;
+                    string cell = TableCellText(rows[k][j]);
+                    if (cell.Length == 0) continue;
                     Piece cp = new Piece();
-                    cp.Text = rows[k][j];
+                    cp.Text = cell;
                     cp.Style = k == 0 ? 5 : 4;
                     cp.SrcLen = 0;
                     cp.SrcAt = rowAbs[k];
@@ -7093,7 +9290,7 @@ class MsgBlock : Control
             }
             y += lineH + Theme.Px(2);
         }
-        x = _pads;
+        x = _left;
         return rowNext[rowNext.Count - 1];
     }
 
@@ -7127,7 +9324,12 @@ class MsgBlock : Control
                 TextFormatFlags.NoPadding | TextFormatFlags.SingleLine).Width;
             if (mw <= avail) lo = mid; else hi = mid - 1;
         }
-        // 尽量断在空格/标点后
+#if NET10_0_OR_GREATER
+        // .NET 10：不做"往前找标点"的二次切分。Fitting 只拿到当前 chunk，看不到后面的字，
+        // 按标点回退会让同一段文字在"流式分片"和"全量重排"下切在不同位置，高度对不上。
+        return Math.Max(1, lo);
+#else
+        // .NET Framework：保留旧的"尽量断在空格/标点后"视觉；旧版测量下回归全过。
         int cut = lo;
         for (int i = lo - 1; i > lo - 12 && i > 0; i--)
         {
@@ -7135,6 +9337,7 @@ class MsgBlock : Control
             if (c == ' ' || c == '，' || c == '。' || c == ',' || c == '.' || c == '、' || c == '：' || c == ':') { cut = i; break; }
         }
         return Math.Max(1, cut);
+#endif
     }
 
     List<Piece> SplitInline(string line)
@@ -7252,6 +9455,13 @@ class MsgBlock : Control
             if (tv0 != null) tv0.ChildAction(this, act);
             return;                       // 点按钮不进入拖选
         }
+        // 长内容折叠：点摘要行 / 「收起」小按钮 → 切换（同样不进入拖选）
+        if (Foldable && _foldRect.Contains(e.Location))
+        {
+            TranscriptView tvf = Parent as TranscriptView;
+            if (tvf != null) tvf.ChildFold(this);
+            return;
+        }
         TranscriptView tv = Parent as TranscriptView;
         if (tv != null) tv.ChildMouseDown(this, e);
         base.OnMouseDown(e);
@@ -7280,6 +9490,14 @@ class MsgBlock : Control
     // 悬停状态（鼠标事件和自测都走这里）
     internal void HoverAt(Point pt)
     {
+        // 折叠入口也要给"手型"：否则用户不知道那一行能点
+        bool foldHot = Foldable && _foldRect.Contains(pt);
+        if (foldHot != _foldHot)
+        {
+            _foldHot = foldHot;
+            Cursor = (foldHot || ActionAt(pt) >= 0) ? Cursors.Hand : Cursors.Default;
+            Invalidate();
+        }
         int act = ActionAt(pt);
         if (act != HoverAct)
         {
@@ -7293,9 +9511,10 @@ class MsgBlock : Control
 
     protected override void OnMouseLeave(EventArgs e)
     {
-        if (HoverAct != -1 || Tip != null)
+        if (HoverAct != -1 || Tip != null || _foldHot)
         {
             HoverAct = -1; Tip = null; TipAct = -1; Cursor = Cursors.Default;
+            _foldHot = false;
             Invalidate();
         }
         base.OnMouseLeave(e);
@@ -7315,10 +9534,9 @@ class MsgBlock : Control
         Graphics g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         Color fg = Theme.Fg;
-        Color back = Theme.Bg;
         switch (Kind)
         {
-            case OutKind.User: back = Theme.Band; fg = Theme.Fg; break;
+            case OutKind.User: fg = Theme.Fg; break;
             case OutKind.Thinking: fg = Theme.FgDim; break;
             case OutKind.ToolCall: fg = Theme.FgMid; break;
             case OutKind.ToolResult: fg = Theme.FgFaint; break;
@@ -7327,28 +9545,29 @@ class MsgBlock : Control
             case OutKind.Stats: fg = Theme.FgFaint; break;
         }
         using (SolidBrush bg = new SolidBrush(BackColor)) g.FillRectangle(bg, ClientRectangle);
-        if (Kind == OutKind.User)
+        // 两套气泡：用户靠右、AI 靠左，填充 + 1px 描边 + 圆角 10（几何由 LayoutBox 算好）
+        if (Bubbled)
         {
-            using (GraphicsPath p = Ui.Round(new Rectangle(0, 0, Width - 1, _contentH), Theme.Px(10)))
-            using (SolidBrush b = new SolidBrush(back)) g.FillPath(b, p);
+            Rectangle br = new Rectangle(_bubX, 0, Math.Max(Theme.Px(8), _bubW), Math.Max(Theme.Px(8), _bubbleH));
+            using (GraphicsPath bp = Ui.Round(br, Theme.Px(Theme.RadCard)))
+            {
+                using (SolidBrush b = new SolidBrush(Kind == OutKind.User ? Theme.BubbleUserFill : Theme.BubbleAiFill))
+                    g.FillPath(b, bp);
+                // 1px 细线要配 PixelOffsetMode.Half，否则抗锯齿会把描边糊成 2px 灰边
+                g.PixelOffsetMode = PixelOffsetMode.Half;
+                using (Pen p = new Pen(Kind == OutKind.User ? Theme.BubbleUserLine : Theme.BubbleAiLine, Theme.Pxf(1f)))
+                    g.DrawPath(p, bp);
+                g.PixelOffsetMode = PixelOffsetMode.Default;
+            }
         }
         if (Kind == OutKind.Changes) { DrawCard(g); return; }
 
+        // 折叠的摘要行（表头）：收起时它下面是空的，展开时它下面是全文
+        if (Foldable) DrawFoldRow(g);
+
         // 分三趟画：先底（代码块底/行内代码底/表格线）→ 再选中高亮 → 最后文字。
         // 高亮必须在"所有底色之上、文字之下"，否则合并后的高亮会被后面的代码底色盖住。
-        foreach (Piece p in _pieces)
-        {
-            if (p.Style == 6)
-                using (SolidBrush lb = new SolidBrush(Theme.LineSoft)) g.FillRectangle(lb, p.Rect);
-            else if (p.Style == 3)
-                using (SolidBrush cb = new SolidBrush(Theme.Card))
-                    g.FillRectangle(cb, _pads - Theme.Px(6), p.Rect.Y + Theme.Px(1),
-                        Math.Max(Theme.Px(20), Width - 2 * _pads + Theme.Px(12)), p.Rect.Height - Theme.Px(2));
-            else if (p.Style == 2)
-                using (GraphicsPath cp = Ui.Round(new Rectangle(p.Rect.X - Theme.Px(2), p.Rect.Y + Theme.Px(1),
-                        p.Rect.Width + Theme.Px(4), p.Rect.Height - Theme.Px(2)), Theme.Px(4)))
-                using (SolidBrush cb = new SolidBrush(Theme.Chip)) g.FillPath(cb, cp);
-        }
+        DrawPieceBacks(g);
         if (HasSel)
             foreach (Rectangle hr in HighlightRects())
                 using (SolidBrush sb = new SolidBrush(Theme.SelFill)) g.FillRectangle(sb, hr);
@@ -7360,6 +9579,7 @@ class MsgBlock : Control
                 (p.Style == 2 || p.Style == 3 || p.Style == 4 || p.Style == 5) ? Theme.Fg : fg,
                 TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
         }
+        DrawImages(g);
 
         // 操作行：复制 / 分支 / 时间
         if (_actH > 0)
@@ -7380,7 +9600,7 @@ class MsgBlock : Control
                 Font f2 = _fontSmall != null ? _fontSmall : _fontNorm;
                 string ts = Stamp.Value.ToString("HH:mm");
                 int tw = Ui.TextWidth(ts, f2);
-                TextRenderer.DrawText(g, ts, f2, new Point(Math.Max(_pads, Width - _pads - tw - Theme.Px(2)), _actY + Theme.Px(4)),
+                TextRenderer.DrawText(g, ts, f2, new Point(Math.Max(_left, _right - tw), _actY + Theme.Px(4)),
                     Theme.FgFaint, TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
             }
 
@@ -7390,6 +9610,79 @@ class MsgBlock : Control
             if (bubble != null && bubble.Length > 0)
                 DrawBubble(g, bubble, bAct == ActBranch ? BranchRect() : CopyRect());
         }
+    }
+
+    // 折叠的摘要行：一个浅底圆角条 + ▸/▾ + "已执行 run_shell · 12 行 · 点击展开"
+    // 收起 / 展开都用它（位置也一样），所以点它就能来回切。
+    void DrawFoldRow(Graphics g)
+    {
+        Font f = BaseFont();
+        Color fg = Kind == OutKind.Thinking ? Theme.FgDim : Theme.FgFaint;
+        using (GraphicsPath bp = Ui.Round(_foldRect, Theme.Px(Theme.RadRow)))
+        {
+            using (SolidBrush b = new SolidBrush(_foldHot ? Theme.Hover : Theme.Card)) g.FillPath(b, bp);
+            using (Pen p = new Pen(Theme.Line, 1f)) g.DrawPath(p, bp);
+        }
+        Rectangle ic = new Rectangle(_foldRect.Left + Theme.Px(8),
+            _foldRect.Top + (_foldRect.Height - Theme.Px(14)) / 2, Theme.Px(14), Theme.Px(14));
+        Icons.Draw(g, Collapsed ? "chevronRight" : "chevronDown", ic, fg, 1.3f);
+        string head = FoldSummary == null || FoldSummary.Length == 0 ? "长内容" : FoldSummary;
+        // 高度就是"字体高 + Sp8"，文字正好居中；末尾那句提示让用户知道这行能点
+        TextRenderer.DrawText(g, head + (Collapsed ? " · 点击展开" : " · 点击收起"), f,
+            new Point(ic.Right + Theme.Px(6), _foldRect.Top + Theme.Px(Theme.Sp4)), fg,
+            TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix
+            | TextFormatFlags.EndEllipsis);
+    }
+
+    // 片段底色：代码块聚合成"一个"圆角描边矩形（以前逐行各画一个平矩形，
+    // 行与行之间留 2px 白缝，看着像被切成一条条）；行内代码补 1px 描边。
+    void DrawPieceBacks(Graphics g)
+    {
+        g.PixelOffsetMode = PixelOffsetMode.Half;
+        int i = 0;
+        while (i < _pieces.Count)
+        {
+            Piece p = _pieces[i];
+            if (p.Style == 6)
+            {
+                using (SolidBrush lb = new SolidBrush(Theme.LineSoft)) g.FillRectangle(lb, p.Rect);
+                i++;
+                continue;
+            }
+            if (p.Style == 3)
+            {
+                // 连续 style==3 的片段 = 同一个代码块：取并集，只画一个框
+                int top = p.Rect.Top, bot = p.Rect.Bottom, j = i;
+                while (j + 1 < _pieces.Count && _pieces[j + 1].Style == 3)
+                {
+                    j++;
+                    if (_pieces[j].Rect.Top < top) top = _pieces[j].Rect.Top;
+                    if (_pieces[j].Rect.Bottom > bot) bot = _pieces[j].Rect.Bottom;
+                }
+                Rectangle box = new Rectangle(_left - Theme.Px(Theme.Sp8), top - Theme.Px(6),
+                    Math.Max(Theme.Px(20), (_right - _left) + Theme.Px(Theme.Sp16)),
+                    Math.Max(Theme.Px(12), bot - top + Theme.Px(12)));
+                using (GraphicsPath bp = Ui.Round(box, Theme.Px(Theme.RadRow)))
+                {
+                    using (SolidBrush cb = new SolidBrush(Theme.CodeFill)) g.FillPath(cb, bp);
+                    using (Pen cp = new Pen(Theme.CodeLine, Theme.Pxf(1f))) g.DrawPath(cp, bp);
+                }
+                i = j + 1;
+                continue;
+            }
+            if (p.Style == 2)
+            {
+                Rectangle ip = new Rectangle(p.Rect.X - Theme.Px(3), p.Rect.Y + Theme.Px(1),
+                    p.Rect.Width + Theme.Px(6), Math.Max(Theme.Px(4), p.Rect.Height - Theme.Px(2)));
+                using (GraphicsPath cp = Ui.Round(ip, Theme.Px(Theme.RadMenu)))
+                {
+                    using (SolidBrush cb = new SolidBrush(Theme.InlineFill)) g.FillPath(cb, cp);
+                    using (Pen pen = new Pen(Theme.InlineLine, Theme.Pxf(1f))) g.DrawPath(pen, cp);
+                }
+            }
+            i++;
+        }
+        g.PixelOffsetMode = PixelOffsetMode.Default;
     }
 
     // 按钮上方的深色提示气泡（和 Codex 一样）
@@ -7541,18 +9834,20 @@ class SelBar : Control
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
             | ControlStyles.UserPaint | ControlStyles.SupportsTransparentBackColor | ControlStyles.Selectable, true);
         BackColor = Theme.Bg;
+        AccessibleRole = AccessibleRole.ToolBar;
+        AccessibleName = "选中文字操作";
         Visible = false;
     }
 
     int BtnW(int i)
     {
-        return Ui.TextWidth(Labels[i], Theme.F(9f)) + Theme.Px(20);
+        return Ui.TextWidth(Labels[i], Theme.Cache(Theme.FontName, 9f, FontStyle.Regular)) + Theme.Px(20);
     }
 
     // 整条小操作条的高度：文字高度 + 上下各 6（以前写死 32，150% 下文字贴着上下边，看着"框太大/不贴合"）
     public static int PreferredH()
     {
-        return Theme.F(9f).Height + Theme.Px(12);
+        return Theme.Cache(Theme.FontName, 9f, FontStyle.Regular).Height + Theme.Px(12);
     }
 
     public Rectangle Btn(int i)
@@ -7578,7 +9873,7 @@ class SelBar : Control
         g.SmoothingMode = SmoothingMode.AntiAlias;
         using (GraphicsPath p = Ui.Round(new Rectangle(0, 0, Width - 1, Height - 1), Theme.Px(9)))
         using (SolidBrush b = new SolidBrush(Color.FromArgb(33, 35, 40))) g.FillPath(b, p);
-        Font f = Theme.F(9f);
+        Font f = Theme.Cache(Theme.FontName, 9f, FontStyle.Regular);
         for (int i = 0; i < Labels.Length; i++)
         {
             Rectangle r = Btn(i);
@@ -7633,7 +9928,14 @@ class TranscriptView : Panel
     public int Repaints = 0;      // 自测用：整个视图重画次数
     private MsgBlock _hot;        // 右键点到的那一条
     private ContextMenuStrip _menu;
+    // ---------- 长内容折叠（⑤）----------
+    // 折叠状态只放内存：key = MsgIdx（实时流式的块没有 MsgIdx，就用块自己的 FoldKey），
+    // **不写进 Session.messages** —— 那是原始 OpenAI 消息，加 UI 位会被 ConvertMessages 带进请求。
+    private readonly HashSet<int> _foldedKeys = new HashSet<int>();
+    private int _foldSeq = -2;          // 实时块的折叠 key（负数，永远不和 MsgIdx 撞）
+    public bool IsTrace;                // 轨迹页：思考默认只在这里收起（对话区归 hide_thinking 管）
     private bool _autoFollow = true;    // 配置项 follow_output 的镜像（主窗体同步过来）
+    private bool _inRelayout;           // Relayout / 程序化改位置期间：防自反馈，也防把"框架自己挪位置"误判成用户滚动
     private MsgBlock _selA, _selB;      // 拖选的两个端点
     private int _selAi, _selBi;
     private bool _dragging;
@@ -7693,6 +9995,8 @@ class TranscriptView : Panel
             | ControlStyles.UserPaint | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
         DoubleBuffered = true;
         TabStop = true;          // 要能拿到焦点，Ctrl+C 才收得到
+        AccessibleRole = AccessibleRole.Pane;
+        AccessibleName = "对话内容";
         BuildMenu();
         _bar = new SelBar();
         _bar.OnAct = delegate(int i) { if (OnBarAct != null) OnBarAct(i); };
@@ -7700,39 +10004,59 @@ class TranscriptView : Panel
     }
 
     // 让小操作条跟着选区走（拖动中不显示，松手才浮出来——和 Codex 一样）
+    //
+    // 定位规则（2026-10-16 重写）：以**选区几何**为准，不用任何魔数。
+    //   水平：贴选区首行左端 → 右边放不下就翻到首行右端 → 最后夹进可视区。
+    //   竖直：优先浮在首行**上方** → 上方放不下就贴**整个选区下方** → 再不够就夹进可视区。
+    // 以前是"上翻失败就 y = minY + 26"（26 与条高 bh 无关，150% DPI 下 bh≈41），
+    // 于是小条压住选区第 2/3 行文字，而且 DPI 越大压得越多。
     void UpdateBar()
     {
         if (_bar == null) return;
-        if (_dragging || !HasSelection) { _bar.Visible = false; return; }
-        int minX = int.MaxValue, minY = int.MaxValue, maxX = int.MinValue;
+        if (_dragging || !HasSelection)
+        {
+            if (_bar.Visible) _bar.Visible = false;
+            return;
+        }
+        int pad = Theme.Px(4);
+        int gap = Theme.Px(6);
+        int vw = ClientSize.Width, vh = ClientSize.Height;
+        int selTop = int.MaxValue, selBottom = int.MinValue;
+        int rowTop = int.MaxValue, rowL = 0, rowR = 0;
         foreach (MsgBlock b in _blocks)
         {
             if (!b.HasSel) continue;
             List<Rectangle> hl = b.HighlightRects();
             if (hl.Count == 0) continue;
-            int bx = int.MaxValue, by = int.MaxValue, ex = int.MinValue;
             foreach (Rectangle r in hl)
             {
-                if (r.Left < bx) bx = r.Left;
-                if (r.Top < by) by = r.Top;
-                if (r.Right > ex) ex = r.Right;
+                int left = r.Left + b.Left, top = r.Top + b.Top;
+                int right = r.Right + b.Left, bottom = r.Bottom + b.Top;
+                if (top < selTop) selTop = top;
+                if (bottom > selBottom) selBottom = bottom;
+                if (top < rowTop) { rowTop = top; rowL = left; rowR = right; }
+                else if (top == rowTop)
+                {
+                    if (left < rowL) rowL = left;
+                    if (right > rowR) rowR = right;
+                }
             }
-            bx += b.Left; by += b.Top; ex += b.Left;
-            if (bx < minX) minX = bx;
-            if (by < minY) minY = by;
-            if (ex > maxX) maxX = ex;
         }
-        if (minX == int.MaxValue) { _bar.Visible = false; return; }
+        if (selBottom == int.MinValue) { if (_bar.Visible) _bar.Visible = false; return; }
         int w = SelBar.PreferredW();
         int bh = SelBar.PreferredH();
-        // 水平方向：贴着选区中间，看起来才像"挂在选中的字上"（以前是左对齐，常常偏出去一大截）
-        int x = minX + (maxX - minX - w) / 2;
-        x = Math.Max(Theme.Px(4), Math.Min(x, Math.Max(Theme.Px(4), ClientSize.Width - w - Theme.Px(4))));
-        int y = minY - bh - Theme.Px(6);
-        if (y < Theme.Px(4)) y = minY + Theme.Px(26);
+        int x = rowL;
+        if (x + w > vw - pad) x = rowR - w;
+        if (x < pad) x = pad;
+        if (x + w > vw - pad) x = Math.Max(pad, vw - pad - w);
+        int y = rowTop - bh - gap;
+        if (y < pad) y = selBottom + gap;
+        if (y + bh > vh - pad) y = vh - pad - bh;
+        if (y < pad) y = pad;
         _bar.SetBounds(x, y, w, bh);
-        _bar.Visible = y + bh <= ClientSize.Height;
-        _bar.BringToFront();
+        _bar.Visible = selBottom > 0 && selTop < vh;
+        // SetChildIndex 会触发一次布局，没必要每次滚动都做
+        if (Controls.GetChildIndex(_bar) != 0) _bar.BringToFront();
     }
 
     // ---------- 选中与复制 ----------
@@ -7869,6 +10193,13 @@ class TranscriptView : Panel
         if (e.Control && e.KeyCode == Keys.C) { CopySelection(); e.Handled = true; }
         else if (e.Control && e.KeyCode == Keys.A) { SelectAll(); e.Handled = true; }
         else if (e.KeyCode == Keys.Escape) { ClearSelection(); e.Handled = true; }
+        else if (e.KeyCode == Keys.PageUp || e.KeyCode == Keys.PageDown
+            || e.KeyCode == Keys.Home || e.KeyCode == Keys.End)
+        {
+            // 键盘翻页也是"用户意图"：现在只是记一笔，实际滚动交给框架，随后由 OnScroll 落到跟随状态上
+            NoteUserScroll();
+            UpdateBar();
+        }
         base.OnKeyDown(e);
     }
 
@@ -7883,13 +10214,14 @@ class TranscriptView : Panel
     void BuildMenu()
     {
         _menu = new ContextMenuStrip();
+        MenuRound.Apply(_menu);
         _menu.Renderer = new MenuSkin();
         _menu.Font = Theme.F(9.5f);
         _menu.ShowImageMargin = true;
         // 试过自己切圆角：WinForms 的下拉会强制自己的方角 Region，改不动。
         // 所以保留系统阴影（至少不像一块平板），里面用白底 + 圆角悬停 + 图标 + 快捷键做得干净些。
         _menu.DropShadowEnabled = true;
-        _menu.Padding = new Padding(Theme.Px(4), Theme.Px(5), Theme.Px(4), Theme.Px(5));
+        _menu.Padding = new Padding(Theme.Px(Theme.Sp4));
         _menu.Opening += delegate(object s2, System.ComponentModel.CancelEventArgs e2)
         {
             if (_menu.Items.Count >= 1) _menu.Items[0].Enabled = HasSelection;
@@ -7911,6 +10243,10 @@ class TranscriptView : Panel
             string t = _hot.Body;
             if (t.Length > 0) { try { Clipboard.SetText(t); } catch { } if (OnCopied != null) OnCopied(t.Length); }
         });
+        // 长内容折叠：批量展开 / 收起（只作用在右键点开的这一页）
+        _menu.Items.Add(new ToolStripSeparator());
+        it = (ToolStripMenuItem)_menu.Items.Add("全部展开长内容", MenuIcon("chevronRight"), delegate(object s2, EventArgs e2) { ExpandAll(); });
+        it = (ToolStripMenuItem)_menu.Items.Add("全部收起长内容", MenuIcon("chevronDown"), delegate(object s2, EventArgs e2) { CollapseAll(); });
         foreach (ToolStripItem o in _menu.Items)
         {
             ToolStripMenuItem mi2 = o as ToolStripMenuItem;
@@ -7968,6 +10304,9 @@ class TranscriptView : Panel
         _last = null;
         _hasLast = false;
         _hot = null;
+        // 折叠状态跟着块一起清掉：重开会话回默认收起，不会拿旧 MsgIdx 的折叠位套到新块上
+        _foldedKeys.Clear();
+        _foldSeq = -2;
         _follow = true;                         // 清空 = 回到"跟着最新"的状态
         AutoScrollMinSize = new Size(0, 0);
         AutoScrollPosition = new Point(0, 0);   // 清空就得回到顶部，否则下一轮排版会带着旧偏移
@@ -7977,12 +10316,22 @@ class TranscriptView : Panel
 
     public MsgBlock LastBlock { get { return _last; } }
 
+    // 历史渲染专用的"下一条块的标记"：这条消息属于哪一步（分支切点）＋它的时间。
+    // 以前是"写完立刻抓 LastBlock"，所以每条后面都得 FlushNow() —— 891 条就是 891 次
+    // 全量重排（每次还要把最多 400 个块重新摆一遍），实测打开那条会话 >95 秒，窗口直接"(未响应)"。
+    // 改成先把标记存着、等块真建出来时贴上，这样渲染历史就能攒批刷新。
+    public int PendingIdx = -1;
+    public DateTime? PendingStamp;
+    // 侧信道：历史/实时渲染先把真路径放这里，下一条 User 块建出来时取走并清空。
+    public List<string> PendingImages;
+
     // ---------- 攒批：120ms 一刷。不然每个 token 都要把这一条消息重新排版一次 ----------
     class Pend
     {
         public OutKind Kind;
         public StringBuilder Text;
         public bool BreakOnly;
+        public string Tool;      // 工具结果专属：跑它的工具名（折叠摘要行要报）
     }
     private readonly List<Pend> _pend = new List<Pend>();
     private System.Windows.Forms.Timer _timer;
@@ -7994,6 +10343,19 @@ class TranscriptView : Panel
         Pend p = new Pend();
         p.Kind = kind;
         p.Text = new StringBuilder(text);
+        _pend.Add(p);
+        EnsureTimer();
+    }
+
+    // 工具结果要带"是谁跑的"：名字跟着这一批文字走，建块时才贴上
+    // （不能用视图上的一个共享槽位 —— 一批里可能有好几条工具结果，名字会串）
+    public void AddToolChunk(string text, string tool)
+    {
+        if (string.IsNullOrEmpty(text)) return;
+        Pend p = new Pend();
+        p.Kind = OutKind.ToolResult;
+        p.Text = new StringBuilder(text);
+        p.Tool = tool;
         _pend.Add(p);
         EnsureTimer();
     }
@@ -8032,25 +10394,174 @@ class TranscriptView : Panel
         {
             Pend m = merged.Count > 0 ? merged[merged.Count - 1] : null;
             if (m != null && !m.BreakOnly && !p.BreakOnly && m.Kind == p.Kind)
+            {
                 m.Text.Append(p.Text);
+                if (p.Tool != null) m.Tool = p.Tool;      // 合并后仍然记得是谁跑的
+            }
             else
                 merged.Add(p);
         }
-        bool follow = _follow && _autoFollow;
+        // 只有"这一批写进来之前用户就贴在底部"才自动跟随；
+        // 用户在中间看历史时（_follow 为 false 或已经滚离底部）绝不拽走他的视口。
+        bool follow = _follow && _autoFollow && NearBottom();
         bool touched = false;
         foreach (Pend p in merged)
         {
             if (p.BreakOnly) { _last = null; _hasLast = false; continue; }
-            WriteNow(p.Kind, p.Text.ToString());
+            WriteNow(p.Kind, p.Text.ToString(), p.Tool);
             touched = true;
         }
         if (!touched) return;
+        ApplyFoldDefaults();     // 定稿后再谈默认收起（流式期间不折叠，见下）
         Relayout();
         if (follow) ScrollToEnd();
     }
 
+    // ---------- 默认折叠策略 ----------
+    // 工具结果：行 ≥ 8 或 字 ≥ 600 → 默认收起；轨迹页思考：行 ≥ 6 → 默认收起；
+    // 助手长回答里**以长代码块为主**的（代码 ≥ 20 行且占正文 60% 以上）也整条收起 —— 用户的验收原话里
+    // "所有长文本、代码块、命令执行结果"都要能折，但纯讲解类回答不该被折掉正文，所以加了占比判据。
+    // 已经 Foldable 的不再动 —— 用户手点过就得尊重。
+    void ApplyFoldDefaults()
+    {
+        foreach (MsgBlock b in _blocks) ApplyFoldDefault(b);
+    }
+
+    void ApplyFoldDefault(MsgBlock b)
+    {
+        if (b == null || b.Foldable) return;
+        if (b.Kind == OutKind.ToolResult)
+        {
+            string t = b.Body.Replace("\r\n", "\n").TrimEnd('\n', '\r');
+            if (t.Length == 0) return;
+            int lines = Txt.LineCount(t);
+            if (lines < 8 && t.Length < 600) return;
+            MarkFolded(b, (string.IsNullOrEmpty(b.FoldTool) ? "已执行" : ("已执行 " + b.FoldTool))
+                + " · " + lines + " 行");
+            return;
+        }
+        // 对话区的思考内容不在这里折叠：显不显示归 config.hide_thinking 那个开关（那套逻辑不动）
+        if (b.Kind == OutKind.Thinking && IsTrace)
+        {
+            string t = b.Body.Replace("\r\n", "\n").TrimEnd('\n', '\r');
+            int lines = Txt.LineCount(t);
+            if (lines < 6) return;
+            MarkFolded(b, "思考 · " + lines + " 行");
+            return;
+        }
+        if (b.Kind == OutKind.Assistant)
+        {
+            int codeLines, totalLines;
+            CodeShare(b.Body, out codeLines, out totalLines);
+            if (codeLines >= 20 && codeLines * 10 >= totalLines * 6)
+                MarkFolded(b, "代码 · " + codeLines + " 行");
+        }
+    }
+
+    // 统计正文里围栏代码块的行数与正文总行数（判"长代码块为主的回答才折叠"）
+    static void CodeShare(string body, out int codeLines, out int totalLines)
+    {
+        codeLines = 0; totalLines = 0;
+        if (string.IsNullOrEmpty(body)) return;
+        string[] lines = body.Replace("\r\n", "\n").Split('\n');
+        bool inCode = false;
+        int cur = 0;
+        for (int i = 0; i < lines.Length; i++)
+        {
+            string t = lines[i].TrimStart();
+            bool fence = t.StartsWith("```") || t.StartsWith("~~~");
+            if (fence)
+            {
+                if (inCode) { codeLines += cur; cur = 0; inCode = false; }
+                else inCode = true;
+                continue;
+            }
+            if (inCode) cur++;
+            else if (lines[i].Trim().Length > 0) totalLines++;
+        }
+        if (inCode) codeLines += cur;        // 没闭合的围栏也算（模型常忘了收尾）
+        totalLines += codeLines;
+    }
+
+    // 把一块置成"可折叠 + 默认收起"，并把状态记进内存（key = MsgIdx / FoldKey）
+    void MarkFolded(MsgBlock b, string summary)
+    {
+        _foldedKeys.Add(FoldKeyOf(b));
+        b.SetFold(true, summary, true);
+    }
+
+    internal int FoldKeyOf(MsgBlock b)
+    {
+        return b.MsgIdx >= 0 ? b.MsgIdx : b.FoldKey;
+    }
+
+    // 块的折叠入口（MsgBlock 点摘要行时调进来）
+    internal void ChildFold(MsgBlock b) { ToggleFold(b); }
+
+    // 单块展开 / 收起。
+    // 防跳位：切换前记下摘要行的视口坐标，重排后**只在它已经滚出视口上方**时补偿滚动位置；
+    // 块顶还看得见就一动不动。展开块顶出视口底部时也不许 ScrollToEnd（别跟智能跟随打架）。
+    internal bool ToggleFold(MsgBlock b)
+    {
+        if (b == null || !b.Foldable) return false;
+        int top0 = b.Top + b.FoldRect.Top;
+        if (!b.ToggleFold()) return false;
+        int key = FoldKeyOf(b);
+        if (b.Collapsed) _foldedKeys.Add(key); else _foldedKeys.Remove(key);
+        Relayout();                    // 重算可滚范围（不然就是"幽灵高度"）
+        if (top0 < 0)
+        {
+            int top1 = b.Top + b.FoldRect.Top;
+            int cur = -AutoScrollPosition.Y;
+            int want = cur + (top1 - top0);
+            if (want < 0) want = 0;
+            int max = MaxScroll();
+            if (want > max) want = max;
+            if (want != cur)
+            {
+                _inRelayout = true;
+                try { AutoScrollPosition = new Point(0, want); } catch { }
+                finally { _inRelayout = false; }
+            }
+        }
+        return true;
+    }
+
+    // 批量：全部展开 / 全部收起（遍历所有块，最后一次 Relayout）
+    public void ExpandAll() { SetAllFolds(false); }
+    public void CollapseAll() { SetAllFolds(true); }
+
+    void SetAllFolds(bool collapsed)
+    {
+        bool any = false;
+        foreach (MsgBlock b in _blocks)
+        {
+            if (!b.Foldable || b.Collapsed == collapsed) continue;
+            b.ToggleFold();
+            int key = FoldKeyOf(b);
+            if (collapsed) _foldedKeys.Add(key); else _foldedKeys.Remove(key);
+            any = true;
+        }
+        if (any) Relayout();
+    }
+
+    // 自测用：还有几块是可折叠的 / 其中几块是收起的
+    public int FoldableCount()
+    {
+        int n = 0;
+        foreach (MsgBlock b in _blocks) if (b.Foldable) n++;
+        return n;
+    }
+
+    public int CollapsedCount()
+    {
+        int n = 0;
+        foreach (MsgBlock b in _blocks) if (b.Foldable && b.Collapsed) n++;
+        return n;
+    }
+
     // 追加一段文字：同一种 kind 就接到最后一块上
-    void WriteNow(OutKind kind, string text)
+    void WriteNow(OutKind kind, string text, string tool)
     {
         if (!_hasLast || _lastKind != kind)
         {
@@ -8059,9 +10570,22 @@ class TranscriptView : Panel
             if (text.Length == 0) return;
             _last = new MsgBlock(kind, _norm, _bold, _mono, _small);
             _last.Width = BodyWidth;
-            _last.Stamp = DateTime.Now;
+            _last.FoldKey = _foldSeq--;      // 实时块（没有 MsgIdx）的折叠状态 key
+            // 工具结果是谁跑的：摘要行要报工具名（名字跟着这一批文字一起来，见 Pend.Tool）
+            if (tool != null) _last.FoldTool = tool;
+            // 历史渲染会先给 PendingStamp/PendingIdx（攒批时块还没建出来，抓不到 LastBlock）；
+            // 实时流式没有 pending，就用"现在"。
+            _last.Stamp = PendingStamp.HasValue ? PendingStamp : (DateTime?)DateTime.Now;
+            if (PendingIdx >= 0) _last.MsgIdx = PendingIdx;
+            PendingIdx = -1;
+            PendingStamp = null;
             _last.ShowCopy = (kind == OutKind.Assistant || kind == OutKind.User);
             _last.ShowBranch = (kind == OutKind.Assistant);
+            if (kind == OutKind.User && PendingImages != null)
+            {
+                _last.SetImages(PendingImages);
+                PendingImages = null;      // 取走即清空，绝不串到下一块
+            }
             MsgBlock nb = _last;
             nb.MouseDown += delegate(object s2, MouseEventArgs me) { _hot = nb; };
             nb.ContextMenuStrip = _menu;
@@ -8097,57 +10621,169 @@ class TranscriptView : Panel
         }
     }
 
-    void Relayout()
+    // 内容的真实总高（唯一权威）：所有块高 + 段间距 + 底部留白。
+    // 以前这个值只在 Relayout 末尾算一次，却有三种语义的读点（BodyWidth / ScrollToEnd / AtEnd），
+    // 三者看到的"范围"互不一致 —— 底部空白和回弹就是这么来的。
+    int ContentHeight()
     {
-        // 先把滚动位置夹回合法范围：窗口变大 / 内容变短时，面板会自己把偏移夹住（子控件也跟着挪），
-        // 这里补一次，保证下面用的 off 和真实的滚动位置一致，不会又把内容推偏。
-        int maxPrev = Math.Max(0, AutoScrollMinSize.Height - ClientSize.Height);
-        if (-AutoScrollPosition.Y > maxPrev) AutoScrollPosition = new Point(0, maxPrev);
-
-        int w = BodyWidth;
         int y = 0;
-        // 关键：AutoScroll 面板里，子控件的 Top 是"客户区坐标"，而 y 是"内容坐标"。
-        // 不补上这个滚动偏移，面板滚一段就把所有消息块整体推下去一段，
-        // 面板又会把"子控件的范围"算进可滚动区 —— 越滚越大，内容就被顶到中间去了。
-        int off = AutoScrollPosition.Y;      // 已经往下滚了多少（负数）
-        bool first = true;
-        foreach (MsgBlock b in _blocks)
+        for (int i = 0; i < _blocks.Count; i++)
         {
-            if (b.Width != w) b.Width = w;
-            b.Left = 0;
-            if (!first) y += GapBefore(b);
-            first = false;
-            b.Top = y + off;
-            y += b.Height;
+            if (i > 0) y += GapBefore(_blocks[i]);
+            y += _blocks[i].Height;
         }
-        AutoScrollMinSize = new Size(0, y + Theme.Px(8));
+        return y + Theme.Px(8);
     }
 
-    // 块前面留多少空隙。同一轮任务内部紧凑（9px），
-    // 轮到"用户又提了新问题"就直接拉开一大截 —— 这样一眼就能看出哪几段是同一轮干的活。
+    int MaxScroll()
+    {
+        int m = ContentHeight() - ClientSize.Height;
+        return m < 0 ? 0 : m;
+    }
+
+    // 把可滚范围刷成 content。WinForms 的 AutoScrollMinSize setter 在"值没变"时是 no-op，
+    // 于是滚动范围会停在上一帧算出来的旧值（实测能差 12~86px，正是"滚到底留空白/幽灵高度"的来源）。
+    // 先写一个不同的值逼它重算，再写目标值。
+    void ApplyScrollRange(int content)
+    {
+        Size want = new Size(0, content);
+        // 宽度也要"逼"一次：WinForms 对同值 AutoScrollMinSize 是 no-op，窗口从宽拖窄时
+        // 横向滚动条会残留下来（内容其实不宽），2026-10-18 验收在 920 逻辑宽下复现。
+        if (AutoScrollMinSize.Width == 0) AutoScrollMinSize = new Size(1, content + 1);
+        else if (AutoScrollMinSize == want) AutoScrollMinSize = new Size(0, content + 1);
+        AutoScrollMinSize = want;
+    }
+
+    bool StickToBottom { get { return _follow && _autoFollow; } }
+
+    // "贴底"判定，容差 2 逻辑像素。原来这里写死 28 —— 等于离底还剩 28px 就认为"到底了"，
+    // 跟随状态下视口就永远停在那 28px 上，看上去就是"滚到底还留一片空白"。
+    bool NearBottom()
+    {
+        int m = MaxScroll();
+        if (m <= Theme.Px(2)) return true;
+        int pos = -AutoScrollPosition.Y;
+        if (pos >= m - Theme.Px(2)) return true;
+        // 框架自己那套可滚范围（DisplayRectangle）会晚一帧才生效，可能比我们算的小几像素：
+        // 只要位置已经顶到框架给的上限，也算"到底"，否则滚动条永远判不成贴底、跟随回不来。
+        try
+        {
+            int real = VerticalScroll.Maximum - VerticalScroll.LargeChange;
+            if (real > 0 && pos >= real - Theme.Px(2)) return true;
+        }
+        catch { }
+        return false;
+    }
+
+    // 用户主动滚动 → 停止自动跟随。滚轮、拖动滚动条、PageUp/PageDown 都要走到这里。
+    void NoteUserScroll()
+    {
+        _follow = false;
+    }
+
+    void Relayout()
+    {
+        // 防自反馈：Relayout 里会改 AutoScrollMinSize / AutoScrollPosition，框架会回抛 OnScroll，
+        // 那种"滚动"不是用户意图，不能拿来改跟随状态。
+        if (_inRelayout) return;
+        _inRelayout = true;
+        // 搬运期间挂起布局：否则框架每改一次子控件位置就按"中间态"重算一次范围并钳位置，
+        // 中间态范围偏小 → 位置被钳到 0 → 表现就是"新消息一来滚动条跳回顶端"。
+        SuspendLayout();
+        try
+        {
+            int w = BodyWidth;
+            // 先只量宽、不摆位：这一步会触发 MsgBlock.OnResize → Rebuild → 改 Height，
+            // 所以必须等所有块的高度都稳定下来，再去算内容高与位置。
+            foreach (MsgBlock b in _blocks) if (b.Width != w) b.Width = w;
+
+            bool follow = StickToBottom;
+            int content = ContentHeight();
+            // 两趟收敛：MsgBlock 的高度可能在"改宽度"或"摆位置"之后还会再变一次，
+            // 一趟算出来的内容高与真正摆出来的高度会差几个像素（幽灵高度就是这么来的）。
+            for (int pass = 0; pass < 2; pass++)
+            {
+                // 先定范围、再定位置；这两步之后位置可能被框架夹住
+                ApplyScrollRange(content);
+                if (follow)
+                {
+                    int max = content - ClientSize.Height; if (max < 0) max = 0;
+                    try { AutoScrollPosition = new Point(0, max); } catch { }
+                }
+                // 之后一律以**读回的**偏移为准来摆子控件。
+                // 教训（2026-10-16）：每设一次 AutoScrollPosition，框架就会把所有子控件整体平移一次；
+                // 摆完再去"复核位置"就等于把子控件二次平移，坐标与内容高错位 —— 底部空白就是这么来的。
+                int off = AutoScrollPosition.Y;
+                int y = 0;
+                bool first = true;
+                foreach (MsgBlock b in _blocks)
+                {
+                    b.Left = 0;
+                    if (!first) y += GapBefore(b);
+                    first = false;
+                    b.Top = y + off;
+                    y += b.Height;
+                }
+                int after = ContentHeight();
+                if (after == content) break;
+                content = after;
+            }
+        }
+        finally
+        {
+            ResumeLayout(false);
+            _inRelayout = false;
+        }
+        // 字号/宽度变了但选区还在：小条必须跟着重算，否则停在旧坐标（缩放字号后最明显）
+        if (_bar != null && _bar.Visible)
+        {
+            _inRelayout = true;
+            try { UpdateBar(); } finally { _inRelayout = false; }
+        }
+    }
+
+    // 块前面留多少空隙。同一轮任务内部紧凑（6px），
+    // 轮到"用户又提了新问题"就直接拉开一大截（24px，吸附 4px 栅格）—— 这样一眼就能看出哪几段是同一轮干的活。
+    // 同轮内部 8px（栅格值）：原来是 6px，不在 4/8 栅格上。
+    // 注意 flicker §27 那条断言也跟着钉到 Theme.Px(Theme.Sp8) —— 这是"有意改设计值"，不是放宽断言：
+    // 它守的语义仍是"同轮内部保持紧凑"，只是把值从 6 钉到栅格上（改前 6px 是该节里唯一脱栅格的数）。
     int GapBefore(MsgBlock b)
     {
-        return b.Kind == OutKind.User ? Theme.Px(26) : Theme.Px(6);
+        return b.Kind == OutKind.User ? Theme.Px(Theme.Sp24) : Theme.Px(Theme.Sp8);
     }
 
     public void ScrollToEnd()
     {
-        try
+        // 先用权威值刷范围，再滚。以前目标写的是"刚赋值、这一帧还没生效"的 AutoScrollMinSize.Height ——
+        // setter 超范围会被静默钳到旧上限，于是"滚到底还差一截"，那截就是底部空白。
+        ApplyScrollRange(ContentHeight());
+        _follow = true;
+        int max = MaxScroll();        try { AutoScrollPosition = new Point(0, max); } catch { }
+        // 不足一屏时 max=0，这里会明确回到顶部（原来是提前 return，页面停在中间留一片空白）；
+        // 被框架钳住则下一帧再补一次（只补一次，不自我循环）。
+        if (-AutoScrollPosition.Y < max - Theme.Px(2) && IsHandleCreated)
         {
-            if (AutoScrollMinSize.Height <= ClientSize.Height) return;
-            AutoScrollPosition = new Point(0, AutoScrollMinSize.Height);
+            BeginInvoke(new MethodInvoker(delegate
+            {
+                try { AutoScrollPosition = new Point(0, MaxScroll()); } catch { }
+            }));
         }
-        catch { }
     }
 
-    // 视野是不是已经在最底下
-    public bool AtEnd
+    // 视野是不是已经在最底下（统一走 NearBottom，容差 2px）
+    public bool AtEnd { get { return NearBottom(); } }
+
+    // 拖动滚动条 / PageUp / PageDown / Home / End 都会走这里。
+    // 以前只有滚轮记"用户意图"，拖滚动条时 _follow 还是 true —— 下一批内容就把视口拽回底部，
+    // 用户看到的就是"手动滑下去又被弹回原来的位置"。
+    protected override void OnScroll(ScrollEventArgs se)
     {
-        get
+        base.OnScroll(se);
+        if (se.ScrollOrientation == ScrollOrientation.VerticalScroll && !_inRelayout)
         {
-            int viewH = ClientSize.Height;
-            if (AutoScrollMinSize.Height <= viewH) return true;
-            return (-AutoScrollPosition.Y) >= AutoScrollMinSize.Height - viewH - Theme.Px(28);
+            if (NearBottom()) { _follow = true; }
+            else NoteUserScroll();
+            UpdateBar();
         }
     }
 
@@ -8158,12 +10794,15 @@ class TranscriptView : Panel
         int lines = SystemInformation.MouseWheelScrollLines;
         if (lines < 1) lines = 3;
         int step = Theme.Px(18) * lines;
-        int max = Math.Max(0, AutoScrollMinSize.Height - ClientSize.Height);
+        int max = MaxScroll();
         int target = (-AutoScrollPosition.Y) - (e.Delta * step / 120);
         if (target < 0) target = 0;
         if (target > max) target = max;
-        AutoScrollPosition = new Point(0, target);
-        if (_autoFollow) _follow = AtEnd;
+        _inRelayout = true;      // 这次是程序化改位置，别让 OnScroll 把自己的动作算成"用户滚动"
+        try { AutoScrollPosition = new Point(0, target); }
+        finally { _inRelayout = false; }
+        if (NearBottom()) { _follow = true; }
+        else NoteUserScroll();
         UpdateBar();          // 滚动时选区跟着走，小条也要跟着挪
     }
 
@@ -8221,10 +10860,10 @@ class MenuSkin : ToolStripProfessionalRenderer
         public override Color MenuItemSelectedGradientEnd { get { return Theme.Hover; } }
         public override Color MenuItemBorder { get { return Color.Transparent; } }
         public override Color MenuBorder { get { return Theme.Line; } }
-        public override Color ToolStripDropDownBackground { get { return Color.White; } }
-        public override Color ImageMarginGradientBegin { get { return Color.White; } }
-        public override Color ImageMarginGradientMiddle { get { return Color.White; } }
-        public override Color ImageMarginGradientEnd { get { return Color.White; } }
+        public override Color ToolStripDropDownBackground { get { return Theme.Card; } }
+        public override Color ImageMarginGradientBegin { get { return Theme.Card; } }
+        public override Color ImageMarginGradientMiddle { get { return Theme.Card; } }
+        public override Color ImageMarginGradientEnd { get { return Theme.Card; } }
         public override Color SeparatorDark { get { return Theme.LineSoft; } }
         public override Color SeparatorLight { get { return Theme.LineSoft; } }
     }
@@ -8275,11 +10914,219 @@ class MenuSkin : ToolStripProfessionalRenderer
     }
 }
 
+// 自绘只读文本：旧栈不再用 RichTextBox；支持按行换色/底色、滚轮、Text 接口。
+class UiReadOnlyText : Panel
+{
+    class Line { public string Text; public Color Fg, Bg; public bool Bold; }
+    readonly List<Line> _lines = new List<Line>();
+    int _selStart;
+
+    public new BorderStyle BorderStyle { get; set; }
+    public bool ReadOnly { get; set; }
+    public bool Multiline { get; set; }
+    public ScrollBars ScrollBars { get; set; }
+    public bool WordWrap { get; set; }
+    public int SelectionStart
+    {
+        get { return _selStart; }
+        set { _selStart = Math.Max(0, value); }
+    }
+    public int TextLength
+    {
+        get
+        {
+            int n = 0;
+            foreach (Line l in _lines) n += l.Text.Length + 1;
+            return n;
+        }
+    }
+    public override string Text
+    {
+        get
+        {
+            System.Text.StringBuilder sb = new System.Text.StringBuilder();
+            foreach (Line l in _lines) sb.Append(l.Text).Append("\n");
+            return sb.ToString();
+        }
+        set
+        {
+            Reset();
+            if (value == null) return;
+            string[] ls = value.Replace("\r\n", "\n").Split('\n');
+            foreach (string s in ls) AppendStyledLine(s, Theme.Fg, false, Theme.Card);
+        }
+    }
+
+    public UiReadOnlyText()
+    {
+        AutoScroll = true;
+        BackColor = Theme.Card;
+        ForeColor = Theme.Fg;
+        Font = Theme.M(9.5f);
+        BorderStyle = BorderStyle.None;
+        ReadOnly = true;
+        Multiline = true;
+        ScrollBars = ScrollBars.None;
+    }
+
+    public void Reset()
+    {
+        SuspendLayout();
+        Controls.Clear();
+        _lines.Clear();
+        _selStart = 0;
+        AutoScrollPosition = new Point(0, 0);
+        ResumeLayout();
+        Invalidate();
+    }
+
+    public void AppendStyledLine(string s, Color fg, bool bold, Color bg)
+    {
+        Line l = new Line();
+        l.Text = s ?? "";
+        l.Fg = fg;
+        l.Bg = bg;
+        l.Bold = bold;
+        _lines.Add(l);
+
+        Label lb = new Label();
+        lb.AutoSize = false;
+        lb.AutoEllipsis = true;
+        lb.UseMnemonic = false;
+        lb.Text = l.Text;
+        lb.ForeColor = l.Fg;
+        lb.BackColor = l.Bg;
+        lb.Font = l.Bold ? Theme.MB(9.8f) : Font;
+        lb.Height = Font.Height + Theme.Px(2);
+        lb.Width = Math.Max(20, ClientSize.Width - (VerticalScroll.Visible ? SystemInformation.VerticalScrollBarWidth : 0));
+        lb.Left = 0;
+        lb.Top = _lines.Count == 1 ? 0 : (Controls.Count == 0 ? 0 : Controls[Controls.Count - 1].Bottom);
+        Controls.Add(lb);
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        int w = Math.Max(20, ClientSize.Width - (VerticalScroll.Visible ? SystemInformation.VerticalScrollBarWidth : 0));
+        foreach (Control c in Controls) c.Width = w;
+    }
+
+    public void ScrollToCaret()
+    {
+        AutoScrollPosition = new Point(0, Math.Max(0, DisplayRectangle.Height));
+    }
+
+    public void ScrollTop() { AutoScrollPosition = new Point(0, 0); }
+
+    public Color ForeAt(int pos)
+    {
+        int n = 0;
+        foreach (Line l in _lines)
+        {
+            if (pos <= n + l.Text.Length) return l.Fg;
+            n += l.Text.Length + 1;
+        }
+        return Theme.Fg;
+    }
+
+    public Color BackAt(int pos)
+    {
+        int n = 0;
+        foreach (Line l in _lines)
+        {
+            if (pos <= n + l.Text.Length) return l.Bg;
+            n += l.Text.Length + 1;
+        }
+        return Theme.Card;
+    }
+}
+// 「查看变更」的代码视图：.NET 10 用 Scintilla；旧栈用自绘只读文本，不再用 RichTextBox。
+#if NET10_0_OR_GREATER
+class UiDiff : ScintillaNET.Scintilla
+{
+    public new BorderStyle BorderStyle { get; set; }
+
+    public UiDiff()
+    {
+        base.BorderStyle = ScintillaNET.BorderStyle.None;
+        ReadOnly = true;
+        WrapMode = ScintillaNET.WrapMode.Word;
+        BackColor = Theme.Card;
+        ForeColor = Theme.Fg;
+        StyleResetDefault();
+        Styles[ScintillaNET.Style.Default].Font = "Consolas";
+        Styles[ScintillaNET.Style.Default].Size = 10;
+        Styles[ScintillaNET.Style.Default].ForeColor = Theme.Fg;
+        Styles[ScintillaNET.Style.Default].BackColor = Theme.Card;
+        Styles[1].Font = "Consolas"; Styles[1].Size = 10;
+        Styles[1].ForeColor = Theme.Ok; Styles[1].BackColor = Theme.OkSoft;
+        Styles[2].Font = "Consolas"; Styles[2].Size = 10;
+        Styles[2].ForeColor = Theme.Err; Styles[2].BackColor = Theme.ErrSoft;
+        Styles[3].Font = "Consolas"; Styles[3].Size = 10; Styles[3].Bold = true;
+        Styles[3].ForeColor = Theme.Fg; Styles[3].BackColor = Theme.LineSoft;
+        StyleClearAll();
+    }
+
+    public void Reset()
+    {
+        ReadOnly = false;
+        ClearAll();
+        ReadOnly = true;
+    }
+
+    public void AppendStyledLine(string s, Color fg, bool bold, Color bg)
+    {
+        int start = TextLength;
+        AppendText((s ?? "") + "\n");
+        int st = 0;
+        if (bg == Theme.OkSoft) st = 1;
+        else if (bg == Theme.ErrSoft) st = 2;
+        else if (bold) st = 3;
+        int len = TextLength - start;
+        if (len > 0)
+        {
+            StartStyling(start);
+            SetStyling(len, st);
+        }
+    }
+
+    public bool Multiline { get; set; }
+    public ScrollBars ScrollBars { get; set; }
+    public bool WordWrap
+    {
+        get { return WrapMode != ScintillaNET.WrapMode.None; }
+        set { WrapMode = value ? ScintillaNET.WrapMode.Word : ScintillaNET.WrapMode.None; }
+    }
+    public void ScrollToCaret() { ScrollCaret(); }
+
+    public void ScrollTop()
+    {
+        SelectionStart = 0;
+        SelectionEnd = 0;
+        ScrollCaret();
+    }
+
+    public Color ForeAt(int pos)
+    {
+        try { return Styles[GetStyleAt(pos)].ForeColor; } catch { return Theme.Fg; }
+    }
+
+    public Color BackAt(int pos)
+    {
+        try { return Styles[GetStyleAt(pos)].BackColor; } catch { return Theme.Card; }
+    }
+}
+#else
+class UiDiff : UiReadOnlyText
+{
+}
+#endif
+
 // 「查看变更」窗口：左边选文件，右边看带颜色的 diff
 class ChangesForm : Form
 {
     private ListBox _list;
-    private RichTextBox _diff;
+    private UiDiff _diff;
     private List<FileChange> _files;
 
     public ChangesForm(List<FileChange> files, int start)
@@ -8296,6 +11143,8 @@ class ChangesForm : Form
         ForeColor = Theme.Fg;
         Font = Theme.F(9.5f);
         ShowInTaskbar = false;
+        FormBorderStyle = FormBorderStyle.None;
+        Padding = new Padding(0, Theme.Px(40), 0, 0);
 
         Panel head = new Panel();
         head.Dock = DockStyle.Top;
@@ -8303,7 +11152,7 @@ class ChangesForm : Form
         head.BackColor = Theme.Bg;
         Label t = new Label();
         t.Text = "这一轮改了 " + files.Count + " 个文件";
-        t.Font = Theme.FB(11f);
+        t.Font = Theme.FB(10.5f);
         t.ForeColor = Theme.Fg;
         t.AutoSize = true;
         t.Location = new Point(Theme.Px(20), Theme.Px(14));
@@ -8319,7 +11168,7 @@ class ChangesForm : Form
         close.FillColor = Theme.Accent;
         close.HoverColor = Theme.AccentHover;
         close.TextColor = Color.White;
-        close.Radius = 9;
+        close.Radius = Theme.RadRow;
         close.Font = Theme.F(9.5f);
         close.Size = new Size(Theme.Px(88), Theme.Px(34));
         close.Click += delegate { Close(); };
@@ -8329,7 +11178,7 @@ class ChangesForm : Form
         copy.FillColor = Color.White;
         copy.BorderColor = Theme.Line;
         copy.HoverColor = Theme.Hover;
-        copy.Radius = 9;
+        copy.Radius = Theme.RadRow;
         copy.Font = Theme.F(9.5f);
         copy.Size = new Size(Theme.Px(126), Theme.Px(34));
         copy.Click += delegate
@@ -8353,23 +11202,16 @@ class ChangesForm : Form
         Controls.Add(body);
         body.BringToFront();
 
-        _list = new ListBox();
+        _list = new UiList();
         _list.BorderStyle = BorderStyle.None;
-        _list.BackColor = Color.White;
+        _list.BackColor = Theme.Card;
         _list.ForeColor = Theme.Fg;
         _list.Font = Theme.F(9.5f);
         _list.IntegralHeight = false;
         _list.SelectedIndexChanged += delegate { ShowDiff(_list.SelectedIndex); };
         body.Controls.Add(_list);
 
-        _diff = new RichTextBox();
-        _diff.ReadOnly = true;
-        _diff.WordWrap = false;
-        _diff.BorderStyle = BorderStyle.None;
-        _diff.BackColor = Color.White;
-        _diff.ForeColor = Theme.Fg;
-        _diff.Font = Theme.M(9.5f);
-        _diff.ScrollBars = RichTextBoxScrollBars.Both;
+        _diff = new UiDiff();
         body.Controls.Add(_diff);
         body.Resize += delegate { LayoutBody(); };
 
@@ -8380,6 +11222,13 @@ class ChangesForm : Form
         }
         _list.SelectedIndex = (start >= 0 && start < files.Count) ? start : 0;
         LayoutBody();
+        ChromeBar bar = new ChromeBar(Text);
+        bar.Bounds = new Rectangle(0, 0, ClientSize.Width, Theme.Px(40));
+        bar.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+        bar.Closed += delegate { Close(); };
+        Controls.Add(bar);
+        bar.BringToFront();
+        Height += Theme.Px(40);
         ActiveControl = _list;
     }
 
@@ -8406,54 +11255,328 @@ class ChangesForm : Form
         if (i < 0 || i >= _files.Count) return;
         FileChange c = _files[i];
         Changes.EnsureDiff(c);
-        _diff.Clear();
+        _diff.Reset();
         AppendLine(c.Rel + "   +" + c.Added + " −" + c.Removed + "   （下面 + 绿 = 新增，− 红 = 删除）",
             Theme.Fg, true, Theme.LineSoft);
-        AppendLine("", Theme.Fg, false, Color.White);
+        AppendLine("", Theme.Fg, false, Theme.Card);
         string[] lines = c.DiffText.Replace("\r\n", "\n").Split('\n');
         for (int k = 0; k < lines.Length; k++)
         {
             string ln = lines[k];
-            Color col = Theme.FgMid, bg = Color.White;
+            Color col = Theme.FgMid, bg = Theme.Card;
             if (ln.StartsWith("+ ")) { col = Theme.Ok; bg = Theme.OkSoft; }
             else if (ln.StartsWith("- ")) { col = Theme.Err; bg = Theme.ErrSoft; }
             AppendLine(ln, col, false, bg);
         }
-        _diff.SelectionStart = 0;
-        _diff.ScrollToCaret();
+        _diff.ScrollTop();
     }
 
     void AppendLine(string s, Color c, bool bold, Color bg)
     {
-        _diff.SelectionStart = _diff.TextLength;
-        _diff.SelectionLength = 0;
-        _diff.SelectionColor = c;
-        _diff.SelectionBackColor = bg;
-        _diff.SelectionFont = bold ? Theme.MB(9.8f) : Theme.M(9.5f);
-        _diff.AppendText(s + "\n");
+        _diff.AppendStyledLine(s, c, bold, bg);
     }
 }
 
-class HintTextBox : TextBox
+// 输入条：直接用 Scintilla（双栈），不再保留 HintTextBox 回退。
+// 外观/事件保持原样：Hint/Multiline/ScrollBars/Text/TextLength/SelectionStart/Clear/Focus。
+class UiEditor : ScintillaNET.Scintilla
 {
-    public string Hint = "";
+    Label _hint;
+    string _hintText = "";
+    bool _multi;
+    public bool Multiline
+    {
+        get { return _multi; }
+        set
+        {
+            _multi = value;
+            WrapMode = value ? ScintillaNET.WrapMode.Word : ScintillaNET.WrapMode.None;
+        }
+    }
+    public bool AcceptsReturn { get; set; }
+    public bool WordWrap
+    {
+        get { return WrapMode != ScintillaNET.WrapMode.None; }
+        set { WrapMode = value ? ScintillaNET.WrapMode.Word : ScintillaNET.WrapMode.None; }
+    }
+    public int PreferredHeight { get { return Math.Max(Theme.Px(22), Height); } }
+    public void ScrollToCaret() { ScrollCaret(); }
+    public ScrollBars ScrollBars { get; set; }
+    public new BorderStyle BorderStyle { get; set; }
+    // Scintilla 自己注册了 IDropTarget，再设 WinForms AllowDrop 会抛“DragDrop 注册失败”；
+    // 图片拖入改走 WM_DROPFILES，再转成原来的 DragDrop 事件。
+    public new bool AllowDrop { get { return true; } set { } }
 
-    protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); Invalidate(); }
-    protected override void OnTextChanged(EventArgs e) { base.OnTextChanged(e); Invalidate(); }
-    protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
-    protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+    const int WM_DROPFILES = 0x0233;
+    [DllImport("shell32.dll")] static extern void DragAcceptFiles(IntPtr hWnd, bool accept);
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern uint DragQueryFile(IntPtr hDrop, uint i, StringBuilder file, uint cch);
+    [DllImport("shell32.dll")] static extern void DragFinish(IntPtr hDrop);
+
+    public UiEditor()
+    {
+        base.BorderStyle = ScintillaNET.BorderStyle.None;
+        BackColor = Theme.Card;
+        ForeColor = Theme.Fg;
+        StyleResetDefault();
+        Styles[ScintillaNET.Style.Default].Font = "Microsoft YaHei UI";
+        Styles[ScintillaNET.Style.Default].Size = 10;
+        Styles[ScintillaNET.Style.Default].ForeColor = Theme.Fg;
+        Styles[ScintillaNET.Style.Default].BackColor = Theme.Card;
+        StyleClearAll();
+        WrapMode = ScintillaNET.WrapMode.Word;
+        Margins[0].Width = 0;
+        HScrollBar = false;
+        VScrollBar = false;
+        _hint = new Label();
+        _hint.AutoSize = false;
+        _hint.BackColor = Theme.Card;
+        _hint.ForeColor = Theme.FgFaint;
+        _hint.Font = Theme.F(10f);
+        _hint.TextAlign = ContentAlignment.MiddleLeft;
+        _hint.Enabled = false;
+        _hint.MouseDown += delegate { _hint.Visible = false; Focus(); };
+        Controls.Add(_hint);
+    }
+
+    public string Hint
+    {
+        get { return _hintText; }
+        set { _hintText = value ?? ""; _hint.Text = _hintText; SyncHint(); }
+    }
+
+    void SyncHint()
+    {
+        if (_hint == null) return;
+        _hint.Visible = TextLength == 0 && _hintText.Length > 0;
+        if (_hint.Visible) _hint.BringToFront();
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        DragAcceptFiles(Handle, true);
+    }
 
     protected override void WndProc(ref Message m)
     {
-        base.WndProc(ref m);
-        if (m.Msg == 0x000F && TextLength == 0 && Hint != null && Hint.Length > 0)   // WM_PAINT
+        if (m.Msg == WM_DROPFILES)
         {
-            using (Graphics g = CreateGraphics())
+            try
             {
-                g.SmoothingMode = SmoothingMode.AntiAlias;
-                TextRenderer.DrawText(g, Hint, Font, new Point(1, 1), Theme.FgFaint,
-                    TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+                uint n = DragQueryFile(m.WParam, uint.MaxValue, null, 0);
+                string[] files = new string[(int)n];
+                for (uint i = 0; i < n; i++)
+                {
+                    uint len = DragQueryFile(m.WParam, i, null, 0);
+                    StringBuilder sb = new StringBuilder((int)len + 1);
+                    DragQueryFile(m.WParam, i, sb, (uint)sb.Capacity);
+                    files[i] = sb.ToString();
+                }
+                if (files.Length > 0)
+                    OnDragDrop(new DragEventArgs(new DataObject(DataFormats.FileDrop, files), 0, 0, 0,
+                        DragDropEffects.Copy, DragDropEffects.Copy));
             }
+            catch { }
+            finally { DragFinish(m.WParam); }
+            return;
+        }
+        base.WndProc(ref m);
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        if (_hint != null) _hint.SetBounds(4, 3, Math.Max(1, Width - 8), Math.Max(1, Height - 6));
+    }
+
+    protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); SyncHint(); }
+    protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); SyncHint(); }
+    protected override void OnTextChanged(EventArgs e) { base.OnTextChanged(e); SyncHint(); }
+
+    public new void Clear() { Text = ""; }
+}
+
+// 自绘密码框：API Key 不再用原生 TextBox，也不依赖 UseSystemPasswordChar。
+// 只支持 ASCII Key 编辑（粘贴/退格/输入），显示时按需打码；比系统密码框少 IME/选区。
+class UiPasswordBox : Control
+{
+    string _text = "";
+    bool _mask = true;
+    bool _readOnly;
+    int _caret;
+    int _selStart = -1, _selEnd = -1;
+    bool _drag;
+
+    public UiPasswordBox()
+    {
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
+            | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        BackColor = Theme.Card;
+        ForeColor = Theme.Fg;
+        Font = Theme.F(9.5f);
+        TabStop = true;
+        Cursor = Cursors.IBeam;
+    }
+
+    public override string Text
+    {
+        get { return _text; }
+        set { _text = value ?? ""; _caret = _text.Length; _selStart = _selEnd = -1; OnTextChanged(EventArgs.Empty); Invalidate(); }
+    }
+    public bool ReadOnly { get { return _readOnly; } set { _readOnly = value; } }
+    public bool UseSystemPasswordChar { get { return _mask; } set { _mask = value; Invalidate(); } }
+
+    protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+    protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+
+    int SelA { get { return _selStart < 0 ? _caret : Math.Min(_selStart, _selEnd); } }
+    int SelB { get { return _selStart < 0 ? _caret : Math.Max(_selStart, _selEnd); } }
+    bool HasSel { get { return _selStart >= 0 && _selStart != _selEnd; } }
+
+    void ReplaceSelection(string s)
+    {
+        int a = SelA, b = SelB;
+        _text = _text.Substring(0, a) + s + _text.Substring(b);
+        _caret = a + s.Length;
+        _selStart = _selEnd = -1;
+        OnTextChanged(EventArgs.Empty);
+        Invalidate();
+    }
+
+    int CaretX(int pos)
+    {
+        string disp = _mask ? new string('●', Math.Min(pos, _text.Length)) : _text.Substring(0, Math.Min(pos, _text.Length));
+        return Theme.Px(2) + TextRenderer.MeasureText(disp, Font, Size.Empty,
+            TextFormatFlags.NoPadding | TextFormatFlags.SingleLine).Width;
+    }
+
+    int CaretFromX(int x)
+    {
+        int best = 0, bestD = int.MaxValue;
+        for (int i = 0; i <= _text.Length; i++)
+        {
+            int d = Math.Abs(CaretX(i) - x);
+            if (d < bestD) { bestD = d; best = i; }
+        }
+        return best;
+    }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        Focus();
+        _caret = CaretFromX(e.X);
+        _selStart = _selEnd = _caret;
+        _drag = true;
+        Invalidate();
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        base.OnMouseMove(e);
+        if (!_drag) return;
+        _selEnd = CaretFromX(e.X);
+        Invalidate();
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        base.OnMouseUp(e);
+        _drag = false;
+        if (_selStart == _selEnd) _selStart = _selEnd = -1;
+    }
+
+    protected override void OnKeyPress(KeyPressEventArgs e)
+    {
+        if (_readOnly) return;
+        if (e.KeyChar == '\b')
+        {
+            if (HasSel) ReplaceSelection("");
+            else if (_caret > 0)
+            {
+                _text = _text.Remove(_caret - 1, 1);
+                _caret--;
+                OnTextChanged(EventArgs.Empty); Invalidate();
+            }
+            e.Handled = true;
+            return;
+        }
+        if (e.KeyChar >= ' ' && e.KeyChar != 127)
+        {
+            ReplaceSelection(e.KeyChar.ToString());
+            e.Handled = true;
+        }
+    }
+
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        base.OnKeyDown(e);
+        if (_readOnly) return;
+        bool shift = e.Shift;
+        int old = _caret;
+        if (e.KeyCode == Keys.Left) _caret = Math.Max(0, _caret - 1);
+        else if (e.KeyCode == Keys.Right) _caret = Math.Min(_text.Length, _caret + 1);
+        else if (e.KeyCode == Keys.Home) _caret = 0;
+        else if (e.KeyCode == Keys.End) _caret = _text.Length;
+        else if (e.KeyCode == Keys.Delete)
+        {
+            if (HasSel) ReplaceSelection("");
+            else if (_caret < _text.Length)
+            {
+                _text = _text.Remove(_caret, 1);
+                OnTextChanged(EventArgs.Empty); Invalidate();
+            }
+            e.SuppressKeyPress = true; return;
+        }
+        else if (e.Control && e.KeyCode == Keys.A)
+        {
+            _selStart = 0; _selEnd = _text.Length; _caret = _text.Length;
+            Invalidate(); e.SuppressKeyPress = true; return;
+        }
+        else if (e.Control && e.KeyCode == Keys.V)
+        {
+            try
+            {
+                if (Clipboard.ContainsText())
+                {
+                    string s = Clipboard.GetText().Replace("\r", "").Replace("\n", "").Trim();
+                    if (s.Length > 0) ReplaceSelection(s);
+                }
+            }
+            catch { }
+            e.SuppressKeyPress = true; return;
+        }
+        else return;
+
+        if (shift)
+        {
+            if (_selStart < 0) _selStart = old;
+            _selEnd = _caret;
+        }
+        else _selStart = _selEnd = -1;
+        Invalidate();
+        e.SuppressKeyPress = true;
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        using (SolidBrush b = new SolidBrush(BackColor)) g.FillRectangle(b, ClientRectangle);
+        string disp = _mask ? new string('●', _text.Length) : _text;
+        Rectangle r = new Rectangle(Theme.Px(2), 0, Math.Max(1, Width - Theme.Px(4)), Height);
+        if (HasSel)
+        {
+            int x1 = CaretX(SelA), x2 = CaretX(SelB);
+            using (SolidBrush sb = new SolidBrush(Theme.Sel))
+                g.FillRectangle(sb, x1, Theme.Px(4), Math.Max(1, x2 - x1), Height - Theme.Px(8));
+        }
+        TextRenderer.DrawText(g, disp, Font, r, ForeColor,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding
+            | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+        if (Focused)
+        {
+            int x = Math.Min(Math.Max(Theme.Px(2), CaretX(_caret)), Width - Theme.Px(2));
+            using (Pen p = new Pen(Theme.Fg, Theme.Pxf(1f))) g.DrawLine(p, x, Theme.Px(4), x, Height - Theme.Px(4));
         }
     }
 }
@@ -8464,34 +11587,31 @@ class FieldBox : RoundedPanel
     public Control Inner;
     private bool _multi;
 
-    public FieldBox(bool multiline)
+    public FieldBox(bool multiline) : this(multiline, false) { }
+
+    public FieldBox(bool multiline, bool password)
     {
         _multi = multiline;
         Radius = 10;
-        Fill = Color.White;
+        Fill = Theme.Card;
         BorderColor = Theme.Line;
         BackColor = Theme.Bg;
         Padding = new Padding(11, 2, 11, 2);
-        if (multiline)
+        if (password)
         {
-            TextBox rt = new TextBox();
-            rt.BorderStyle = BorderStyle.None;
-            rt.BackColor = Color.White;
-            rt.ForeColor = Theme.Fg;
-            rt.Multiline = true;
-            rt.AcceptsReturn = true;
-            rt.Font = Theme.F(9.5f);
-            rt.ScrollBars = ScrollBars.Vertical;
-            rt.WordWrap = false;
+            UiPasswordBox rt = new UiPasswordBox();
+            rt.Height = Theme.Px(22);
             Inner = rt;
         }
         else
         {
-            TextBox t = new TextBox();
-            t.BorderStyle = BorderStyle.None;
-            t.BackColor = Color.White;
-            t.ForeColor = Theme.Fg;
+            UiEditor t = new UiEditor();
+            t.Multiline = multiline;
+            t.AcceptsReturn = multiline;
+            t.ScrollBars = ScrollBars.None;
+            t.WordWrap = multiline;
             t.Font = Theme.F(9.5f);
+            t.Height = Theme.Px(22);
             Inner = t;
         }
         Controls.Add(Inner);
@@ -8535,6 +11655,368 @@ class FieldBox : RoundedPanel
         Place();
     }
 
+}
+
+// 自绘消息框：替换系统 MessageBox（系统标题栏/系统图标/系统按钮和自绘 UI 不一致）。
+static class UiMsg
+{
+    public static DialogResult Show(IWin32Window owner, string text, string caption,
+        MessageBoxButtons buttons, MessageBoxIcon icon)
+    {
+        using (UiMsgForm f = new UiMsgForm(text, caption, buttons, icon))
+            return owner == null ? f.ShowDialog() : f.ShowDialog(owner);
+    }
+    public static DialogResult Show(IWin32Window owner, string text, string caption, MessageBoxButtons buttons)
+    { return Show(owner, text, caption, buttons, MessageBoxIcon.None); }
+    public static DialogResult Show(IWin32Window owner, string text, string caption)
+    { return Show(owner, text, caption, MessageBoxButtons.OK, MessageBoxIcon.None); }
+    public static DialogResult Show(IWin32Window owner, string text)
+    { return Show(owner, text, "Ahz Scribe", MessageBoxButtons.OK, MessageBoxIcon.None); }
+    public static DialogResult Show(string text, string caption, MessageBoxButtons buttons, MessageBoxIcon icon)
+    { return Show(null, text, caption, buttons, icon); }
+    public static DialogResult Show(string text, string caption, MessageBoxButtons buttons)
+    { return Show(null, text, caption, buttons, MessageBoxIcon.None); }
+    public static DialogResult Show(string text, string caption)
+    { return Show(null, text, caption, MessageBoxButtons.OK, MessageBoxIcon.None); }
+}
+
+class UiMsgForm : Form
+{
+    readonly string _text, _caption;
+    readonly MessageBoxButtons _buttons;
+    readonly MessageBoxIcon _icon;
+    int _headerH, _closeW, _bodyTop;
+    Rectangle _closeRect;
+    UiButton _ok, _cancel, _yes, _no;
+    bool _closeHot;
+
+    [DllImport("user32.dll")]
+    static extern bool ReleaseCapture();
+    [DllImport("user32.dll")]
+    static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+    public UiMsgForm(string text, string caption, MessageBoxButtons buttons, MessageBoxIcon icon)
+    {
+        _text = text ?? "";
+        _caption = string.IsNullOrEmpty(caption) ? "Ahz Scribe" : caption;
+        _buttons = buttons;
+        _icon = icon;
+        Text = _caption;
+        FormBorderStyle = FormBorderStyle.None;
+        StartPosition = FormStartPosition.CenterParent;
+        ShowInTaskbar = false;
+        MinimizeBox = false;
+        MaximizeBox = false;
+        KeyPreview = true;
+        BackColor = Theme.Bg;
+        Font = Theme.F(9.5f);
+        DoubleBuffered = true;
+        AccessibleRole = AccessibleRole.Dialog;
+        AccessibleName = _caption;
+        _headerH = Theme.Px(42);
+        _closeW = Theme.Px(38);
+        int w = Theme.Px(520);
+        int textW = w - Theme.Px(92);
+        Size sz = TextRenderer.MeasureText(_text, Font, new Size(textW, Theme.Px(520)),
+            TextFormatFlags.WordBreak | TextFormatFlags.NoPadding);
+        int bodyH = Math.Max(Theme.Px(38), sz.Height);
+        Width = w;
+        Height = _headerH + bodyH + Theme.Px(88);
+        _bodyTop = _headerH + Theme.Px(22);
+        BuildButtons();
+        AcceptButton = _ok ?? _yes;
+        CancelButton = _cancel ?? _no;
+        KeyDown += delegate(object s, KeyEventArgs e)
+        {
+            if (e.KeyCode != Keys.Escape) return;
+            DialogResult = (_buttons == MessageBoxButtons.YesNo) ? DialogResult.No : DialogResult.Cancel;
+            Close();
+        };
+        Resize += delegate { SetRounded(); };
+        SetRounded();
+    }
+
+    void SetRounded()
+    {
+        try
+        {
+            if (Region != null) Region.Dispose();
+            Region = new Region(Ui.Round(ClientRectangle, Theme.Px(12)));
+        }
+        catch { }
+    }
+
+    UiButton Btn(string text, bool primary)
+    {
+        UiButton b = new UiButton();
+        b.Text = text;
+        b.Font = Theme.F(9.5f);
+        b.Radius = Theme.RadRow;
+        b.Height = Theme.Px(32);
+        b.Width = Ui.TextWidth(text, b.Font) + Theme.Px(36);
+        b.FillColor = primary ? Theme.Accent : Color.White;
+        b.HoverColor = primary ? Theme.AccentHover : Theme.Hover;
+        b.BorderColor = primary ? Theme.Accent : Theme.Line;
+        b.TextColor = primary ? Color.White : Theme.Fg;
+        Controls.Add(b);
+        return b;
+    }
+
+    void BuildButtons()
+    {
+        bool yesNo = _buttons == MessageBoxButtons.YesNo || _buttons == MessageBoxButtons.YesNoCancel;
+        bool cancel = _buttons == MessageBoxButtons.OKCancel || _buttons == MessageBoxButtons.YesNoCancel;
+        if (yesNo)
+        {
+            _yes = Btn("是", true);
+            _yes.Click += delegate { DialogResult = DialogResult.Yes; Close(); };
+        }
+        if (cancel)
+        {
+            _cancel = Btn("取消", false);
+            _cancel.Click += delegate { DialogResult = DialogResult.Cancel; Close(); };
+        }
+        if (!yesNo)
+        {
+            _ok = Btn("确定", true);
+            _ok.Click += delegate { DialogResult = DialogResult.OK; Close(); };
+        }
+        if (yesNo)
+        {
+            _no = Btn("否", false);
+            _no.Click += delegate { DialogResult = DialogResult.No; Close(); };
+        }
+        UiButton[] arr = new UiButton[] { _ok, _yes, _no, _cancel };
+        int x = Width - Theme.Px(22);
+        for (int i = 0; i < arr.Length; i++)
+        {
+            UiButton b = arr[i];
+            if (b == null) continue;
+            x -= b.Width;
+            b.SetBounds(x, Height - Theme.Px(52), b.Width, b.Height);
+            x -= Theme.Px(10);
+        }
+        _closeRect = new Rectangle(Width - _closeW, 0, _closeW, _headerH);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        using (SolidBrush b = new SolidBrush(Theme.Bg)) g.FillRectangle(b, ClientRectangle);
+        using (SolidBrush b = new SolidBrush(Theme.Card)) g.FillRectangle(b, 0, 0, Width, _headerH);
+        using (Pen p = new Pen(Theme.Line, Theme.Pxf(1f))) g.DrawLine(p, 0, _headerH - 1, Width, _headerH - 1);
+        TextRenderer.DrawText(g, _caption, Theme.FB(9.5f),
+            new Rectangle(Theme.Px(18), 0, Width - Theme.Px(70), _headerH), Theme.Fg,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding
+            | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+        TextRenderer.DrawText(g, "×", Theme.F(12f), _closeRect,
+            _closeHot ? Theme.Fg : Theme.FgFaint,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+        int ic = Theme.Px(28);
+        Rectangle ir = new Rectangle(Theme.Px(24), _headerH + Theme.Px(22), ic, ic);
+        Color icc = _icon == MessageBoxIcon.Error ? Theme.Err
+            : (_icon == MessageBoxIcon.Warning ? Theme.Warn : Theme.Accent);
+        using (SolidBrush b = new SolidBrush(icc)) g.FillEllipse(b, ir);
+        string mark = _icon == MessageBoxIcon.Error ? "!" : (_icon == MessageBoxIcon.Warning ? "!" : "i");
+        TextRenderer.DrawText(g, mark, Theme.FB(11f), ir, Color.White,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+        Rectangle tr = new Rectangle(Theme.Px(66), _bodyTop, Width - Theme.Px(92), Height - _bodyTop - Theme.Px(66));
+        TextRenderer.DrawText(g, _text, Font, tr, Theme.Fg,
+            TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.WordBreak
+            | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        bool hot = _closeRect.Contains(e.Location);
+        if (hot != _closeHot) { _closeHot = hot; Invalidate(); }
+        base.OnMouseMove(e);
+    }
+    protected override void OnMouseLeave(EventArgs e) { _closeHot = false; Invalidate(); base.OnMouseLeave(e); }
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        if (e.Button != MouseButtons.Left) return;
+        if (_closeRect.Contains(e.Location))
+        {
+            DialogResult = (_buttons == MessageBoxButtons.YesNo) ? DialogResult.No : DialogResult.Cancel;
+            Close();
+            return;
+        }
+        if (e.Y < _headerH)
+        {
+            ReleaseCapture();
+            SendMessage(Handle, 0xA1, (IntPtr)2, IntPtr.Zero);
+        }
+    }
+}
+
+// 无边框弹窗的圆角：和主窗口的 Win11 圆角/自绘卡片保持同一视觉。
+static class WindowRound
+{
+    public static void Apply(Form f)
+    {
+        if (f == null) return;
+        f.HandleCreated += delegate { Round(f); };
+        f.Resize += delegate { Round(f); };
+        if (f.IsHandleCreated) Round(f);
+    }
+
+    static void Round(Form f)
+    {
+        try
+        {
+            if (f.WindowState != FormWindowState.Normal || f.ClientSize.Width < 2) return;
+            using (GraphicsPath p = Ui.Round(f.ClientRectangle, Theme.Px(12)))
+            {
+                if (f.Region != null) f.Region.Dispose();
+                f.Region = new Region(p);
+            }
+        }
+        catch { }
+    }
+}
+
+// 自绘弹窗标题栏：标题 + 关闭；拖拽走 WM_NCLBUTTONDOWN/HTCAPTION。
+class ChromeBar : Control
+{
+    string _caption;
+    Rectangle _closeRect;
+    bool _closeHot;
+    public event EventHandler Closed;
+
+    [DllImport("user32.dll")]
+    static extern bool ReleaseCapture();
+    [DllImport("user32.dll")]
+    static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+    public ChromeBar(string caption)
+    {
+        _caption = caption ?? "";
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
+            | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        Height = Theme.Px(40);
+        BackColor = Theme.Card;
+        AccessibleRole = AccessibleRole.TitleBar;
+        AccessibleName = _caption;
+        TabStop = false;
+        ParentChanged += delegate
+        {
+            Form f = FindForm();
+            if (f != null) WindowRound.Apply(f);
+        };
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        Form f = FindForm();
+        if (f != null) WindowRound.Apply(f);
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        _closeRect = new Rectangle(Math.Max(0, Width - Theme.Px(44)), 0, Theme.Px(44), Height);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        using (SolidBrush b = new SolidBrush(Theme.Card)) g.FillRectangle(b, ClientRectangle);
+        using (Pen p = new Pen(Theme.Line, Theme.Pxf(1f))) g.DrawLine(p, 0, Height - 1, Width, Height - 1);
+        TextRenderer.DrawText(g, _caption, Theme.FB(9.5f),
+            new Rectangle(Theme.Px(16), 0, Math.Max(1, Width - Theme.Px(70)), Height), Theme.Fg,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding
+            | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+        TextRenderer.DrawText(g, "×", Theme.F(12f), _closeRect,
+            _closeHot ? Theme.Fg : Theme.FgFaint,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        bool hot = _closeRect.Contains(e.Location);
+        if (hot != _closeHot) { _closeHot = hot; Invalidate(); }
+        base.OnMouseMove(e);
+    }
+    protected override void OnMouseLeave(EventArgs e) { _closeHot = false; Invalidate(); base.OnMouseLeave(e); }
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        if (e.Button != MouseButtons.Left) return;
+        if (_closeRect.Contains(e.Location))
+        {
+            if (Closed != null) Closed(this, EventArgs.Empty);
+            Form f = FindForm();
+            if (f != null) f.Close();
+            return;
+        }
+        ReleaseCapture();
+        SendMessage(Handle, 0xA1, (IntPtr)2, IntPtr.Zero);
+    }
+}
+
+// 无边框可缩放窗口的右下角拖拽柄（换掉系统标题栏后，至少要保留缩放能力）。
+class SizeGrip : Control
+{
+    readonly Form _form;
+    bool _drag;
+    Point _start;
+    Size _startSize;
+
+    public SizeGrip(Form form)
+    {
+        _form = form;
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
+            | ControlStyles.UserPaint | ControlStyles.SupportsTransparentBackColor, true);
+        BackColor = Color.Transparent;
+        Size = new Size(Theme.Px(18), Theme.Px(18));
+        Cursor = Cursors.SizeNWSE;
+        Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
+        AccessibleRole = AccessibleRole.Grip;
+        AccessibleName = "调整窗口大小";
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        using (Pen p = new Pen(Theme.FgFaint, Theme.Pxf(1f)))
+        {
+            for (int i = 0; i < 3; i++)
+            {
+                int d = Theme.Px(5 + i * 4);
+                e.Graphics.DrawLine(p, Width - d, Height - 2, Width - 2, Height - d);
+            }
+        }
+    }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        if (e.Button != MouseButtons.Left) return;
+        _drag = true;
+        _start = Cursor.Position;
+        _startSize = _form.Size;
+        Capture = true;
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        base.OnMouseMove(e);
+        if (!_drag) return;
+        Point p = Cursor.Position;
+        int w = Math.Max(_form.MinimumSize.Width, _startSize.Width + p.X - _start.X);
+        int h = Math.Max(_form.MinimumSize.Height, _startSize.Height + p.Y - _start.Y);
+        _form.Size = new Size(w, h);
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        base.OnMouseUp(e);
+        _drag = false;
+        Capture = false;
+    }
 }
 
 static class Native
@@ -8597,6 +12079,8 @@ class ApprovalForm : Form
         Icon = Theme.AppIcon();
         Size = new Size(760, 520);
         MinimumSize = new Size(600, 400);
+        FormBorderStyle = FormBorderStyle.None;
+        Padding = new Padding(0, Theme.Px(40), 0, 0);
         StartPosition = FormStartPosition.CenterParent;
         BackColor = Theme.Bg;
         ForeColor = Theme.Fg;
@@ -8632,28 +12116,21 @@ class ApprovalForm : Form
 
         RoundedPanel box = new RoundedPanel();
         box.Dock = DockStyle.Fill;
-        box.Radius = 12;
+        box.Radius = Theme.RadInput;
         box.Fill = Theme.Card;
         box.BorderColor = Theme.Line;
         box.BackColor = Theme.Bg;
-        box.Padding = new Padding(14, 12, 14, 12);
+        box.Padding = new Padding(Theme.Sp16, Theme.Sp12, Theme.Sp16, Theme.Sp12);
 
-        RichTextBox body = new RichTextBox();
+        UiDiff body = new UiDiff();
         body.Dock = DockStyle.Fill;
-        body.BorderStyle = BorderStyle.None;
-        body.ReadOnly = true;
-        body.WordWrap = false;
-        body.ScrollBars = RichTextBoxScrollBars.Both;
-        body.BackColor = Theme.Card;
-        body.ForeColor = Theme.Fg;
-        body.Font = Theme.M(10f);
         body.Text = string.Join("\n", preview);
         box.Controls.Add(body);
 
         Panel bodyWrap = new Panel();
         bodyWrap.Dock = DockStyle.Fill;
         bodyWrap.BackColor = Theme.Bg;
-        bodyWrap.Padding = new Padding(20, 0, 20, 0);
+        bodyWrap.Padding = new Padding(Theme.Sp24, 0, Theme.Sp24, 0);
         bodyWrap.Controls.Add(box);
 
         Panel buttons = new Panel();
@@ -8666,14 +12143,14 @@ class ApprovalForm : Form
         yes.FillColor = Theme.Accent;
         yes.HoverColor = Theme.AccentHover;
         yes.TextColor = Color.White;
-        yes.Radius = 10;
+        yes.Radius = Theme.RadCard;
         yes.Font = Theme.F(9.5f);
         yes.Size = new Size(104, 36);
         yes.Click += delegate { Decision = 1; Close(); };
 
         UiButton always = new UiButton();
         always.Text = "本会话总是允许";
-        always.Radius = 10;
+        always.Radius = Theme.RadCard;
         always.BorderColor = Theme.Line;
         always.FillColor = Color.White;
         always.HoverColor = Theme.Hover;
@@ -8683,7 +12160,7 @@ class ApprovalForm : Form
 
         UiButton no = new UiButton();
         no.Text = "拒绝";
-        no.Radius = 10;
+        no.Radius = Theme.RadCard;
         no.BorderColor = Theme.Line;
         no.FillColor = Color.White;
         no.HoverColor = Theme.Hover;
@@ -8696,22 +12173,38 @@ class ApprovalForm : Form
         buttons.Controls.Add(no);
         buttons.Layout += delegate
         {
-            int right = buttons.ClientSize.Width - 20;
-            no.Location = new Point(right - no.Width, 14);
-            yes.Location = new Point(no.Left - 10 - yes.Width, 14);
-            always.Location = new Point(yes.Left - 10 - always.Width, 14);
+            int right = buttons.ClientSize.Width - Theme.Px(20);
+            no.Location = new Point(right - no.Width, Theme.Px(14));
+            yes.Location = new Point(no.Left - Theme.Px(10) - yes.Width, Theme.Px(14));
+            always.Location = new Point(yes.Left - Theme.Px(10) - always.Width, Theme.Px(14));
         };
 
         Label hint = new Label();
         hint.Text = safeDefault ? "Enter 拒绝 · 要放行请点「允许」或「本会话总是允许」" : "Enter 允许 · Esc 拒绝";
         hint.ForeColor = Theme.FgFaint;
-        hint.AutoSize = true;
-        hint.Location = new Point(24, 24);
+        // 不再 AutoSize：最小宽度 900 时，AutoSize 的提示会一路画到按钮底下
+        // （2026-10-18 验收：提示宽 481，按钮从 331 开始，重叠 186px）。
+        hint.AutoSize = false;
+        hint.AutoEllipsis = true;
+        hint.TextAlign = ContentAlignment.MiddleLeft;
+        hint.Location = new Point(Theme.Px(24), Theme.Px(22));
         buttons.Controls.Add(hint);
+        // 按钮排完后再按 always.Left 收一次提示宽度；两个 Layout 按订阅顺序执行。
+        buttons.Layout += delegate
+        {
+            int hintW = Math.Max(Theme.Px(100), always.Left - Theme.Px(36));
+            hint.SetBounds(Theme.Px(24), Theme.Px(22), hintW, Math.Max(Theme.Px(24), buttons.Height - Theme.Px(28)));
+        };
 
         Controls.Add(bodyWrap);
         Controls.Add(buttons);
         Controls.Add(head);
+        ChromeBar bar = new ChromeBar("需要确认");
+        bar.Bounds = new Rectangle(0, 0, ClientSize.Width, Theme.Px(40));
+        bar.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+        bar.Closed += delegate { Decision = 0; Close(); };
+        Controls.Add(bar);
+        bar.BringToFront();
 
         AcceptButton = safeDefault ? no : yes;
         KeyPreview = true;
@@ -8725,6 +12218,7 @@ class ApprovalForm : Form
             Size = new Size(Theme.Px(760), Theme.Px(520));
             MinimumSize = new Size(Theme.Px(600), Theme.Px(400));
         }
+        Height += Theme.Px(40);
     }
 
     protected override void OnHandleCreated(EventArgs e)
@@ -8736,6 +12230,1836 @@ class ApprovalForm : Form
 
 // ============================ 主窗口 ============================
 
+// ============================ 智能意图澄清（2026-10-16） ============================
+// 用户在 GUI 提交指令后、进 AgentRunner 之前，先用轻量模型跑一次歧义检测：
+//   ambiguous=false        → 原指令直接下发（和以前完全一样）
+//   ambiguous=true         → 弹确认框渲染选项，选中项的 command 原样下发（不再二次拼接）
+// 纯逻辑都抽成静态成员（Parse / PickProvider / DefaultOption / ShouldAsk / Count），
+// 这样 rules-unittest.cs 能直接断言，不用起窗口（弹窗那部分在 ClarifyForm 里）。
+static class Clarify
+{
+    // 系统提示词：原文照抄需求（不要改字、不要精简）。
+    // 末尾那段 Schema 里的 { } 是给模型看的，不是 C# 的占位符 —— 用逐字字符串 + 拼接装进来。
+    const string Schema =
+        "{\n" +
+        "  \"ambiguous\": boolean,\n" +
+        "  \"title\": \"string // 确认弹窗标题，仅ambiguous为true时返回\",\n" +
+        "  \"options\": [\n" +
+        "    {\n" +
+        "      \"id\": number,\n" +
+        "      \"label\": \"string // 选项短标题\",\n" +
+        "      \"desc\": \"string // 选项详细说明，讲清执行范围和内容\",\n" +
+        "      \"command\": \"string // 精准执行指令，用户选中后直接下发执行引擎\",\n" +
+        "      \"recommended\": boolean // 是否为推荐选项，第一个选项设为true\n" +
+        "    }\n" +
+        "  ]\n" +
+        "}";
+
+    public const string Prompt =
+        "# 角色：AhzScribe指令歧义检测专家\n" +
+        "# 任务：在用户指令进入执行引擎前，判断指令是否存在多种解读可能、执行范围不明确、操作对象模糊。若存在歧义，生成2-4个互斥的具体执行选项供用户确认；若指令明确，则直接放行。\n" +
+        "\n" +
+        "## 歧义判定标准（满足任意一条即判定为有歧义）\n" +
+        "1.  使用泛化动词，无明确对象与范围：如“更新一下”“优化一下”“修一下”“改改”“整理一下”“处理一下”等，未说明具体操作对象、深度和边界。\n" +
+        "2.  操作对象存在多种可能：如“更新deepseek”可对应刷新模型清单、切换模型版本、更新相关文档、升级接口配置等多个方向。\n" +
+        "3.  执行范围与深度不明确：如“优化界面”可对应样式微调、交互重构、全局重设计；“修bug”可对应修复单问题、全量排查等。\n" +
+        "4.  风险边界不清晰：如“修改代码”可对应仅编辑文件、修改并编译验证、修改并重启全流程测试。\n" +
+        "5.  使用简称、代称，可能对应多个功能模块，无法唯一确认意图。\n" +
+        "\n" +
+        "## 输出要求（强制遵守）\n" +
+        "1.  **仅输出纯JSON字符串**，无任何前后缀文字、无markdown格式、无代码块包裹、无解释性内容，确保可直接被JSON.parse解析。\n" +
+        "2.  严格遵循下方字段定义，禁止新增字段、禁止缺失必填字段。\n" +
+        "3.  有歧义时选项数量控制在2-4个，按优先级排序，第一个为最推荐的高频场景。\n" +
+        "4.  选项必须互斥，覆盖主要执行方向，描述具体可执行，不能再次模糊。\n" +
+        "5.  贴合AhzScribe的功能范围：模型配置、界面UI、代码文件、插件管理、性能优化、运行日志、系统设置等场景。\n" +
+        "\n" +
+        "## 输出JSON Schema\n" + Schema;
+
+    public const int MaxTokens = 500;      // 轻量：只要一小段 JSON，500 token 足够
+    public const int TimeoutMs = 12000;    // 12 秒（不能用默认的 15 分钟：那会把工作线程拖死）
+    public const int AskLimit = 2;         // 同一条原始输入问过 2 次之后，第 3 次不再问，直接用推荐项
+
+    // ---------- 结果对象 ----------
+
+    public class Option
+    {
+        public int id;
+        public string label = "";
+        public string desc = "";
+        public string command = "";
+        public bool recommended;
+    }
+
+    public class Result
+    {
+        public bool ambiguous;
+        public string title = "";
+        public List<Option> options = new List<Option>();
+
+        public Option First()
+        {
+            return (options != null && options.Count > 0) ? options[0] : null;
+        }
+    }
+
+    // ---------- 纯逻辑（可离线断言） ----------
+
+    // 只把开头一段送去检测：判断"要不要问"看开头就够了，一次长粘贴不该把 token 打爆
+    // （需求写明单轮开销要极低）。真正下发给执行引擎的仍是完整原文。
+    public const int ProbeChars = 800;
+
+    // 网络层失败后的冷却：断网/接口挂掉时，别让"每一轮都白等一次 12 秒超时"拖垮体验。
+    public const int FailCooldownMs = 5 * 60 * 1000;
+    static int _cooldownUntil;
+
+    public static bool InCooldown()
+    {
+        if (_cooldownUntil == 0) return false;
+        return unchecked(Environment.TickCount - _cooldownUntil) < 0;
+    }
+
+    public static void MarkFailed() { _cooldownUntil = unchecked(Environment.TickCount + FailCooldownMs); }
+    public static void ResetCooldown() { _cooldownUntil = 0; }
+
+    // 结构化指令不问：以 / 开头的是精确命令（如「/计划 开」），再问一遍纯属浪费一次调用，还多一次误弹窗的机会。
+    public static bool LooksStructured(string text)
+    {
+        if (text == null) return false;
+        return text.TrimStart().StartsWith("/");
+    }
+
+    // 送检测的正文（截断到 ProbeChars）
+    public static string Probe(string text)
+    {
+        if (text == null) return "";
+        string t = text.Trim();
+        return t.Length <= ProbeChars ? t : t.Substring(0, ProbeChars);
+    }
+
+    // 该不该把选项摆到用户面前：
+    //   · 开关关掉 → 不问
+    //   · 没有可用的检测提供商（名字/id 含 deepseek 的 openai + 有 Key + 有模型）→ 静默跳过
+    //   · 模型说"不歧义" → 不问（原指令直接下发）
+    //   · options 为空或只有 1 项 → 算不上"多个解读"，按无歧义处理
+    public static bool ShouldAsk(AgentConfig config, Result r)
+    {
+        if (config == null || !config.clarify) return false;
+        string model;
+        if (PickProvider(config, out model) == null) return false;
+        if (r == null || !r.ambiguous) return false;
+        return r.options != null && r.options.Count >= 2;
+    }
+
+    // 检测模型：名字或 id 含 deepseek、type=openai、api_key 非空、模型列表非空。
+    // 模型取列表里含 flash 的那个（deepseek-flash 快），找不到就取第一个。
+    public static Provider PickProvider(AgentConfig config, out string model)
+    {
+        model = null;
+        if (config == null || config.providers == null) return null;
+        foreach (Provider p in config.providers)
+        {
+            if (p == null) continue;
+            if (p.type != "openai") continue;
+            if (string.IsNullOrEmpty(p.api_key) || p.api_key.Trim().Length == 0) continue;
+            if (p.models == null || p.models.Count == 0) continue;
+            string name = (p.name == null ? "" : p.name.ToLowerInvariant());
+            string id = (p.id == null ? "" : p.id.ToLowerInvariant());
+            if (name.IndexOf("deepseek", StringComparison.Ordinal) < 0
+                && id.IndexOf("deepseek", StringComparison.Ordinal) < 0) continue;
+            string pick = null;
+            foreach (string m in p.models)
+            {
+                if (m == null || m.Trim().Length == 0) continue;
+                if (pick == null) pick = m.Trim();
+                if (m.ToLowerInvariant().IndexOf("flash", StringComparison.Ordinal) >= 0) { pick = m.Trim(); break; }
+            }
+            if (pick == null) continue;
+            model = pick;
+            return p;
+        }
+        return null;
+    }
+
+    // 推荐项 = 第一个选项（提示词里要求第一个就是最推荐的高频场景）
+    public static Option DefaultOption(Result r)
+    {
+        return r == null ? null : r.First();
+    }
+
+    // 用户选中项的 command：原样返回，不做任何拼接
+    public static string CommandOf(Result r, int index)
+    {
+        if (r == null || r.options == null) return null;
+        if (index < 0 || index >= r.options.Count) return null;
+        string c = r.options[index].command;
+        return (c == null || c.Trim().Length == 0) ? null : c;
+    }
+
+    // ---------- 同一指令去重（只算内存，不落盘） ----------
+
+    static readonly Dictionary<string, int> Asked = new Dictionary<string, int>(StringComparer.Ordinal);
+
+    public static string KeyOf(string text) { return text == null ? "" : text.Trim(); }
+
+    public static int Count(string text)
+    {
+        int n;
+        return Asked.TryGetValue(KeyOf(text), out n) ? n : 0;
+    }
+
+    public static void Bump(string text)
+    {
+        string k = KeyOf(text);
+        Asked[k] = Count(text) + 1;
+    }
+
+    public static void Reset() { Asked.Clear(); ResetCooldown(); }
+
+    // ---------- JSON 解析 ----------
+
+    // 先严格解析；失败再剥掉 ```json 围栏重试一次；仍失败返回 null（上层当"跳过澄清"处理）。
+    public static Result Parse(string content)
+    {
+        if (content == null) return null;
+        Result r = ParseOnce(content);
+        if (r != null) return r;
+        string inner = StripFence(content);
+        if (inner != null) r = ParseOnce(inner);
+        return r;
+    }
+
+    static Result ParseOnce(string text)
+    {
+        try
+        {
+            string json = ExtractObject(text);
+            if (json == null) return null;
+            Dictionary<string, object> o = Json.Obj(json);
+            if (o == null) return null;
+            Result r = new Result();
+            r.ambiguous = Json.Bool(o, "ambiguous", false);
+            string t = Json.Str(o, "title", null);
+            r.title = t == null ? "" : t.Trim();
+            object[] arr = Json.Arr(Json.Get(o, "options"));
+            if (arr != null)
+            {
+                foreach (object it in arr)
+                {
+                    Dictionary<string, object> m = Json.Map(it);
+                    if (m == null) continue;
+                    Option op = new Option();
+                    op.id = Json.Int(m, "id", r.options.Count + 1);
+                    string s = Json.Str(m, "label", null); op.label = s == null ? "" : s.Trim();
+                    s = Json.Str(m, "desc", null); op.desc = s == null ? "" : s.Trim();
+                    s = Json.Str(m, "command", null); op.command = s == null ? "" : s.Trim();
+                    op.recommended = Json.Bool(m, "recommended", false);
+                    r.options.Add(op);
+                }
+            }
+            return r;
+        }
+        catch { return null; }
+    }
+
+    // 把 ```json ... ``` 那层围栏剥掉（模型偶尔不听话会套代码块）。没有围栏就返回 null。
+    static string StripFence(string s)
+    {
+        int i = s.IndexOf("```", StringComparison.Ordinal);
+        if (i < 0) return null;
+        int j = s.IndexOf("```", i + 3, StringComparison.Ordinal);
+        if (j < 0) return null;
+        string body = s.Substring(i + 3, j - i - 3);
+        if (body.StartsWith("json", StringComparison.OrdinalIgnoreCase)) body = body.Substring(4);
+        return body.Trim();
+    }
+
+    // 取第一个配平的 { ... }（模型可能在 JSON 前后带一句话）。字符串里的括号不算，转义也不误判。
+    static string ExtractObject(string s)
+    {
+        if (s == null) return null;
+        int start = s.IndexOf('{');
+        if (start < 0) return null;
+        int depth = 0;
+        bool inStr = false;
+        for (int i = start; i < s.Length; i++)
+        {
+            char c = s[i];
+            if (inStr)
+            {
+                if (c == '\\') { i++; continue; }
+                if (c == '"') inStr = false;
+                continue;
+            }
+            if (c == '"') { inStr = true; continue; }
+            if (c == '{') depth++;
+            else if (c == '}')
+            {
+                depth--;
+                if (depth == 0) return s.Substring(start, i - start + 1);
+            }
+        }
+        return null;
+    }
+
+    // ---------- 网络（只在回合工作线程上调用，绝不进 UI 线程） ----------
+
+    // 探一次歧义：返回 null = 跳过澄清（超时 / 非 200 / 解析失败 / 任何异常），按原指令执行。
+    public static Result Ask(AgentConfig config, string text)
+    {
+        try
+        {
+            if (config == null || text == null || text.Trim().Length == 0) return null;
+            if (InCooldown()) return null;                     // 刚失败过（多半是断网）：这段时间不再尝试，别每轮白等超时
+            string probe = Probe(text);                        // 长粘贴只送开头一段
+            string model;
+            Provider p = PickProvider(config, out model);
+            if (p == null) return null;
+            Program.EnsureTls();
+            string url = (p.base_url == null ? "" : p.base_url.Trim().TrimEnd('/'));
+            if (url.Length == 0) url = "https://api.openai.com/v1";
+            url += "/chat/completions";
+
+            Dictionary<string, object> sys = new Dictionary<string, object>();
+            sys["role"] = "system";
+            sys["content"] = Prompt;
+            Dictionary<string, object> usr = new Dictionary<string, object>();
+            usr["role"] = "user";
+            usr["content"] = "用户指令：" + probe;
+            List<object> msgs = new List<object>();
+            msgs.Add(sys);
+            msgs.Add(usr);
+            Dictionary<string, object> payload = new Dictionary<string, object>();
+            payload["model"] = model;
+            payload["messages"] = msgs;
+            payload["temperature"] = 0;
+            payload["max_tokens"] = MaxTokens;
+            payload["stream"] = false;
+            Dictionary<string, object> fmt = new Dictionary<string, object>();
+            fmt["type"] = "json_object";
+            payload["response_format"] = fmt;
+
+            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+            req.Method = "POST";
+            req.Proxy = null;                      // 和 OpenAiLlm 同一套约定：不走系统代理
+            req.Timeout = TimeoutMs;               // 必须短超时：默认 900000 会把这一轮卡一刻钟
+            req.ReadWriteTimeout = TimeoutMs;
+            req.KeepAlive = false;
+            req.Accept = "application/json";
+            if (!string.IsNullOrEmpty(p.api_key)) req.Headers["Authorization"] = "Bearer " + p.api_key.Trim();
+            byte[] data = Encoding.UTF8.GetBytes(Json.Dump(payload));
+            req.ContentType = "application/json";
+            req.ContentLength = data.Length;
+            using (Stream s = req.GetRequestStream()) s.Write(data, 0, data.Length);
+
+            string body;
+            using (WebResponse resp = req.GetResponse())
+            using (Stream rs = resp.GetResponseStream())
+            using (StreamReader rd = new StreamReader(rs, Encoding.UTF8))
+                body = rd.ReadToEnd();
+
+            Dictionary<string, object> o = Json.Obj(body);
+            object[] choices = Json.Arr(Json.Get(o, "choices"));
+            if (choices == null || choices.Length == 0) return null;
+            Dictionary<string, object> ch = Json.Map(choices[0]);
+            if (ch == null) return null;
+            Dictionary<string, object> msg = Json.Map(Json.Get(ch, "message"));
+            if (msg == null) return null;
+            string content = Json.Str(msg, "content", null);
+            return Parse(content);
+        }
+        catch (Exception ex) { Log.Swallow(ex, "意图澄清检测"); MarkFailed(); return null; }
+    }
+}
+
+// 「这条指令有几种理解，你要哪一种」确认框。风格照 ProposalForm（同一套 Theme / 栅格令牌 / 自绘按钮）。
+// SelectedIndex：点「执行」= 选中项下标；点「跳过」/ESC/点 X = -1（跳过 = 用原指令执行）。
+// ShownTitle = 模型返回的 title（用来摆在框里当主标题；没给 title 时用兜底文案）。
+class ClarifyForm : Form
+{
+    public int SelectedIndex = -1;
+    public string ShownTitle = "";
+
+    ClarifyRow[] _rows;
+    int _sel;
+    // 用户已经明确表过态（点执行 / 点跳过 / 按 ESC）：OnDeactivate 不许再把它改成"跳过"。
+    // 原因：Close() 会先触发 OnDeactivate（此时 IsDisposed 还是 false），再真正 Dispose ——
+    // 只靠 IsDisposed 判断的话，"点执行"的结果会被 OnDeactivate 抹成 -1。
+    bool _decided;
+
+    public ClarifyForm(string title, List<Clarify.Option> options)
+    {
+        Theme.EnsureDpi();
+        AutoScaleMode = AutoScaleMode.None;
+        Text = "确认执行意图";      // 窗口标题栏（自绘外壳之外的那一圈）
+        ShownTitle = (title == null || title.Trim().Length == 0) ? "这条指令有几种理解，选一个" : title.Trim();
+        Icon = Theme.AppIcon();
+        Size = new Size(Theme.Px(720), Theme.Px(520));
+        MinimumSize = new Size(Theme.Px(560), Theme.Px(400));
+        FormBorderStyle = FormBorderStyle.None;
+        Padding = new Padding(0, Theme.Px(40), 0, 0);
+        StartPosition = FormStartPosition.CenterParent;
+        BackColor = Theme.Bg;
+        ForeColor = Theme.Fg;
+        Font = Theme.F(9.5f);
+        MinimizeBox = false;
+        MaximizeBox = false;
+        ShowInTaskbar = false;
+
+        Panel head = new Panel();
+        head.Dock = DockStyle.Top;
+        head.Height = Theme.Px(78);
+        head.BackColor = Theme.Bg;
+        LogoMark mark = new LogoMark();
+        mark.BackColor = Theme.Bg;
+        mark.SetBounds(Theme.Px(24), Theme.Px(24), Theme.Px(26), Theme.Px(26));
+        head.Controls.Add(mark);
+        Label t = new Label();
+        t.Text = ShownTitle;
+        t.Font = Theme.FB(13f);
+        t.ForeColor = Theme.Fg;
+        t.BackColor = Theme.Bg;
+        t.AutoSize = true;
+        t.Location = new Point(Theme.Px(60), Theme.Px(20));
+        t.MaximumSize = new Size(Theme.Px(600), 0);
+        head.Controls.Add(t);
+        Label sub = new Label();
+        sub.Text = "指令有歧义，先确认你要哪一种；选中后按它的说法直接执行。";
+        sub.ForeColor = Theme.FgDim;
+        sub.BackColor = Theme.Bg;
+        sub.AutoSize = true;
+        sub.Location = new Point(Theme.Px(62), Theme.Px(50));
+        head.Controls.Add(sub);
+        Controls.Add(head);
+
+        Panel bottom = new Panel();
+        bottom.Dock = DockStyle.Bottom;
+        bottom.Height = Theme.Px(64);
+        bottom.BackColor = Theme.Bg;
+        UiButton ok = new UiButton();
+        ok.Text = "执行";
+        ok.FillColor = Theme.Accent;
+        ok.HoverColor = Theme.AccentHover;
+        ok.TextColor = Color.White;
+        ok.Radius = Theme.RadCard;
+        ok.Font = Theme.F(9.5f);
+        ok.Size = new Size(Theme.Px(104), Theme.Px(36));
+        ok.Click += delegate { _decided = true; SelectedIndex = _sel; Close(); };
+        bottom.Controls.Add(ok);
+        UiButton skip = new UiButton();
+        skip.Text = "跳过";
+        skip.FillColor = Color.White;
+        skip.BorderColor = Theme.Line;
+        skip.HoverColor = Theme.Hover;
+        skip.Radius = Theme.RadCard;
+        skip.Font = Theme.F(9.5f);
+        skip.Size = new Size(Theme.Px(88), Theme.Px(36));
+        skip.Click += delegate { _decided = true; SelectedIndex = -1; Close(); };
+        bottom.Controls.Add(skip);
+        Label hint = new Label();
+        hint.Text = "Enter 执行选中项 · Esc 跳过（跳过 = 按原话执行）";
+        hint.ForeColor = Theme.FgFaint;
+        hint.BackColor = Theme.Bg;
+        hint.AutoSize = true;
+        hint.Location = new Point(Theme.Px(24), Theme.Px(24));
+        bottom.Controls.Add(hint);
+        bottom.Layout += delegate
+        {
+            skip.Location = new Point(bottom.ClientSize.Width - Theme.Px(20) - skip.Width, Theme.Px(14));
+            ok.Location = new Point(skip.Left - Theme.Px(10) - ok.Width, Theme.Px(14));
+        };
+        Controls.Add(bottom);
+
+        Panel wrap = new Panel();
+        wrap.Dock = DockStyle.Fill;
+        wrap.BackColor = Theme.Bg;
+        wrap.AutoScroll = true;
+        List<Clarify.Option> opts = options == null ? new List<Clarify.Option>() : options;
+        _rows = new ClarifyRow[opts.Count];
+        int idx = 0;
+        bool hasRec = false;
+        foreach (Clarify.Option op in opts) if (op.recommended) hasRec = true;
+        _sel = hasRec ? -1 : 0;
+        foreach (Clarify.Option op in opts)
+        {
+            if (op.recommended && _sel < 0) _sel = idx;
+            ClarifyRow row = new ClarifyRow();
+            row.Index = idx;
+            row.OptionRef = op;
+            row.Left = Theme.Sp16;
+            row.Width = Math.Max(Theme.Px(200), wrap.ClientSize.Width - Theme.Sp32);
+            row.Top = Theme.Sp8 + idx * Theme.Px(90);
+            int my = idx;
+            // 按下即选中（OnPick），Click 只当兜底：两条都走同一个 SelectRow，不会各说各话
+            row.OnPick = delegate(ClarifyRow r) { SelectRow(r.Index); };
+            row.Click += delegate { SelectRow(my); };
+            _rows[idx] = row;
+            wrap.Controls.Add(row);
+            idx++;
+        }
+        if (_sel < 0 && _rows.Length > 0) _sel = 0;
+        wrap.Layout += delegate
+        {
+            int y = Theme.Sp8;
+            for (int i = 0; i < _rows.Length; i++)
+            {
+                if (_rows[i] == null) continue;
+                _rows[i].SetBounds(Theme.Sp16, y, Math.Max(Theme.Px(200), wrap.ClientSize.Width - Theme.Sp32), Theme.Px(88));
+                y += Theme.Px(90);
+            }
+        };
+        Controls.Add(wrap);
+        wrap.BringToFront();
+        SyncRows();
+        ChromeBar bar = new ChromeBar("确认执行意图");
+        bar.Bounds = new Rectangle(0, 0, ClientSize.Width, Theme.Px(40));
+        bar.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+        bar.Closed += delegate { _decided = true; SelectedIndex = -1; Close(); };
+        Controls.Add(bar);
+        bar.BringToFront();
+        Height += Theme.Px(40);
+
+        AcceptButton = ok;
+        KeyPreview = true;
+        KeyDown += delegate(object s, KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Escape) { _decided = true; SelectedIndex = -1; Close(); return; }
+            // 上下键也能换选项（以前只能点，点了还可能被吞）
+            if (e.KeyCode == Keys.Up) { SelectRow(Math.Max(0, _sel - 1)); e.Handled = true; }
+            else if (e.KeyCode == Keys.Down) { SelectRow(Math.Min(_rows.Length - 1, _sel + 1)); e.Handled = true; }
+        };
+    }
+
+    // 弹出来就抢焦点：否则用户的第一下点击只是"激活窗口"，会被系统吞掉
+    protected override void OnShown(EventArgs e)
+    {
+        base.OnShown(e);
+        try { Activate(); } catch { }
+    }
+
+    void SyncRows()
+    {
+        if (_rows == null) return;
+        for (int i = 0; i < _rows.Length; i++)
+        {
+            if (_rows[i] == null) continue;
+            _rows[i].Selected = (i == _sel);
+        }
+    }
+
+    // 选中第 i 行：唯一的入口（鼠标按下 / 键盘上下 / 初始化都走它）
+    public void SelectRow(int i)
+    {
+        if (_rows == null || i < 0 || i >= _rows.Length) return;
+        if (_sel == i) { SyncRows(); return; }   // 已经是它也要同步一次（防状态错位）
+        _sel = i;
+        SyncRows();
+    }
+
+    // Blur / 点关闭 = 跳过（用原指令执行），绝不把用户卡在这一步。
+    // 已经表过态的（点执行 / 点跳过 / ESC）不再改写结论 —— Close() 会先走这里再 Dispose。
+    protected override void OnDeactivate(EventArgs e)
+    {
+        base.OnDeactivate(e);
+        if (!_decided) SelectedIndex = -1;
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        Native.RoundWindow(Handle);
+    }
+}
+
+// 一行选项：单选圈 + label（主文）+ desc（灰色小字）+ 推荐项右上角「推荐」角标
+class ClarifyRow : Control
+{
+    public int Index;
+    public Clarify.Option OptionRef;
+    private bool _selected;
+
+    // 选中态：改了就重画（以前是公开字段，SyncRows 只赋值不重画 —— 改了也看不出来）
+    public bool Selected
+    {
+        get { return _selected; }
+        set
+        {
+            if (_selected == value) return;
+            _selected = value;
+            Invalidate();
+        }
+    }
+
+    // 点一下就选中，不等 MouseUp —— 以前只挂 Click，而 Click 要求"按下和抬起落在同一控件、
+    // 且中途没丢鼠标捕获"，对话框刚弹出/焦点切换/鼠标微动都会把这次点击吞掉，用户看到的就是
+    // "点第二个、第三个选项没反应"（devtools\bench\_probe_clicks.cs 复现过：_sel 一直是 0）。
+    public Action<ClarifyRow> OnPick;
+
+    public ClarifyRow()
+    {
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
+            | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        BackColor = Theme.Bg;
+        AccessibleRole = AccessibleRole.RadioButton;
+        AccessibleName = "澄清选项";
+        Cursor = Cursors.Hand;
+    }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        if (e.Button != MouseButtons.Left) return;
+        if (OnPick != null) OnPick(this);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        using (SolidBrush bg = new SolidBrush(BackColor)) g.FillRectangle(bg, ClientRectangle);
+        Rectangle r = new Rectangle(0, 0, Width - 1, Height - 1);
+        using (GraphicsPath path = Ui.Round(r, Theme.Px(Theme.RadCard)))
+        {
+            Color fill = Selected ? Theme.AccentSoft : Color.White;
+            using (SolidBrush b = new SolidBrush(fill)) g.FillPath(b, path);
+            using (Pen p = new Pen(Selected ? Theme.Accent : Theme.Line, Theme.Pxf(1f))) g.DrawPath(p, path);
+        }
+        string label = OptionRef == null ? "" : OptionRef.label;
+        string desc = OptionRef == null ? "" : OptionRef.desc;
+        int x = Theme.Sp16;
+        int cy = Height / 2;
+        int d = Theme.Px(16);
+        Rectangle circle = new Rectangle(x, cy - d / 2, d - 1, d - 1);
+        using (Pen p = new Pen(Selected ? Theme.Accent : Theme.FgFaint, Theme.Pxf(1.4f))) g.DrawEllipse(p, circle);
+        if (Selected)
+            using (SolidBrush b = new SolidBrush(Theme.Accent))
+                g.FillEllipse(b, new Rectangle(circle.X + Theme.Px(4), circle.Y + Theme.Px(4),
+                    circle.Width - Theme.Px(8), circle.Height - Theme.Px(8)));
+        int tx = x + d + Theme.Sp8;
+        int tw = Width - tx - Theme.Sp16;
+        TextRenderer.DrawText(g, label, Theme.FB(10.5f),
+            new Rectangle(tx, Theme.Sp12, tw, Theme.Px(22)), Theme.Fg,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        if (!string.IsNullOrEmpty(desc))
+            TextRenderer.DrawText(g, desc, Theme.F(9f),
+                new Rectangle(tx, Theme.Sp12 + Theme.Px(24), tw, Theme.Px(40)), Theme.FgDim,
+                TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.WordBreak | TextFormatFlags.EndEllipsis
+                | TextFormatFlags.NoPrefix);
+        if (OptionRef != null && OptionRef.recommended)
+        {
+            string badge = "推荐";
+            int bw = Ui.TextWidth(badge, Theme.F(9f)) + Theme.Sp12;
+            Rectangle br = new Rectangle(Width - Theme.Sp12 - bw, Theme.Sp12, bw, Theme.Px(20));
+            using (GraphicsPath bp = Ui.Round(br, Theme.Px(Theme.RadMenu)))
+            {
+                using (SolidBrush b = new SolidBrush(Theme.AccentSoft)) g.FillPath(b, bp);
+                using (Pen p = new Pen(Theme.Accent, Theme.Pxf(1f))) g.DrawPath(p, bp);
+            }
+            TextRenderer.DrawText(g, badge, Theme.F(9f), br, Theme.Accent,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+        }
+    }
+}
+
+// ============================ 内置浏览器（给人看的那一半，Chromium 内核） ============================
+// 引擎：CefSharp（自带一份 Chromium，和 Claude / Codex / DSH 同一个路子）。
+// 换掉 IE 的原因：IE 内核跑不动现代前端，chat.deepseek.com 这类站点直接白屏。
+// 代价：程序目录多一个 cef\（约 300MB，libcef.dll 一个就 205MB）；exe 本身还是 0.5MB。
+// 外壳照 Edge 排：标签页条（40）→ 工具条（44）→ 书签栏（32）→ 内容区 → 状态栏（22）。
+class BrowserTab
+{
+    public CefSharp.WinForms.ChromiumWebBrowser Web;
+    public string Title = "新标签页";
+    public string Url = "";
+    public volatile bool Loaded;
+    public string Pending = "";      // 浏览器还没初始化完时要导航过去的地址
+    public List<string> Hist = new List<string>();   // 自己维护的浏览历史
+    public int HistPos = -1;
+}
+
+class AhzBrowser : Panel
+{
+    public Action<string> AskAgent;
+    public Action<string> SendToInput;
+    public ToolTip tipsRef;
+    public UiEditor Addr;
+
+    List<BrowserTab> _tabs = new List<BrowserTab>();
+    int _active = -1;
+    bool _reading;
+    string _readingUrl = "";
+    string _lastText = "";              // 最近一次读到的正文（UI 线程只读缓存，绝不阻塞）
+    public bool AgentDriving;
+    internal Rectangle AddrBox;
+
+    Label _status, _hint;
+    UiButton _back, _fwd, _reload, _home, _read, _star, _ask, _edge;
+    string _siteMark = "•";
+    Color _siteColor = Theme.FgFaint;
+    List<string[]> _marks = new List<string[]>();
+    int _hotTab = -1, _hotClose = -1, _hotMark = -1;
+    System.Windows.Forms.Timer _blankTimer;
+    long _placedLogged;
+
+    const int StripH = 40, ToolH = 44, MarkH = 32;
+    int StripHP { get { return Theme.Px(StripH); } }
+    int ToolHP { get { return Theme.Px(ToolH); } }
+    int MarkHP { get { return Theme.Px(MarkH); } }
+
+    const string BodyTextJs = "document.body ? document.body.innerText : ''";
+
+    // ---------- Chromium 生命周期 ----------
+    static bool _cefReady, _cefFailed;
+
+    // 必须和 exe 同目录：CefSharp.Core.Runtime.dll 是混合模式程序集，它的原生依赖（libcef.dll）
+    // 只会在 exe 所在目录被找到 —— 放 cef\ 子目录会报"找不到指定的模块"（实测）。
+    static string CefDir { get { return AppDomain.CurrentDomain.BaseDirectory; } }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool SetDllDirectory(string path);
+
+    // libcef.dll 在 cef\ 里（不在 exe 旁边），所以先把它加进 DLL 搜索路径再 Initialize
+    public static bool EnsureCef(out string err)
+    {
+        err = null;
+        if (_cefReady) return true;
+        if (_cefFailed) { err = "Chromium 之前初始化失败过（详见 Ahz错误日志）"; return false; }
+        string dir = CefDir;
+        try
+        {
+            if (!File.Exists(Path.Combine(dir, "libcef.dll")))
+            {
+                _cefFailed = true;
+                err = "缺 libcef.dll（内置浏览器的 Chromium 内核文件不全）";
+                return false;
+            }
+            CefSharp.WinForms.CefSettings st = new CefSharp.WinForms.CefSettings();
+            st.BrowserSubprocessPath = Path.Combine(dir, "CefSharp.BrowserSubprocess.exe");
+            st.ResourcesDirPath = dir;
+            st.LocalesDirPath = Path.Combine(dir, "locales");
+            st.CachePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "AhzScribe", "cef-cache");
+            st.LogSeverity = CefSharp.LogSeverity.Disable;
+            st.CefCommandLineArgs.Add("disable-gpu", "1");
+            st.CefCommandLineArgs.Add("disable-gpu-compositing", "1");
+            if (Theme.Dark)
+            {
+                st.CefCommandLineArgs.Add("force-dark-mode", "1");
+                st.CefCommandLineArgs.Add("enable-features", "WebContentsForceDark");
+            }
+            CefSharp.Cef.Initialize(st, true, (CefSharp.IBrowserProcessHandler)null);
+            _cefReady = true;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _cefFailed = true;
+            err = ex.GetType().Name + ": " + ex.Message;
+            try { Log.Audit("内置浏览器 · Chromium 初始化失败：" + err); } catch { }
+            return false;
+        }
+    }
+
+    public static void ShutdownCef()
+    {
+        try { if (_cefReady) CefSharp.Cef.Shutdown(); } catch { }
+        _cefReady = false;
+    }
+
+    // ---------- 构造 ----------
+
+    public AhzBrowser()
+    {
+        BackColor = Theme.Bg;
+        DoubleBuffered = true;
+
+        _back = Nav("←", "后退");
+        _back.Click += delegate { NavBack(); };
+        _fwd = Nav("→", "前进");
+        _fwd.Click += delegate { NavForward(); };
+        _reload = Nav("↻", "刷新");
+        _reload.Click += delegate
+        {
+            try { BrowserTab t = Active(); if (t != null && t.Web != null) { t.Loaded = false; _lastText = ""; t.Web.Reload(); } }
+            catch { }
+        };
+        _home = Nav("⌂", "新标签页");
+        _home.Click += delegate { NewTab(StartPage()); };
+
+        Addr = new UiEditor();
+        Addr.BorderStyle = BorderStyle.None;
+        Addr.Font = Theme.F(9.5f);
+        Addr.BackColor = Theme.Card;
+        Addr.ForeColor = Theme.Fg;
+        Addr.KeyDown += delegate(object s, KeyEventArgs e)
+        {
+            if (e.KeyCode != Keys.Enter) return;
+            e.SuppressKeyPress = true;
+            Go(Addr.Text);
+        };
+        Addr.TextChanged += delegate { UpdateSiteMark(Addr.Text); Invalidate(); };
+        Controls.Add(Addr);
+
+        _read = Chip("阅读模式", "把页面剥成只有正文的纯文本页");
+        _read.Click += delegate { ToggleRead(); };
+
+        _star = Chip("☆", "收藏这一页（存进书签栏）");
+        _star.Click += delegate { AddBookmark(); };
+
+        _ask = Chip("交给 AS", "把当前地址填进输入框，让助手用 web_open 读一遍");
+        _ask.Click += delegate
+        {
+            string u = CurrentUrl;
+            if (u.Length == 0) { Say("还没打开任何页面"); return; }
+            if (AskAgent != null) AskAgent(u);
+        };
+
+        // 出口：站点拒绝嵌入 / 加载失败时，一键交给系统 Edge
+        _edge = Chip("用 Edge 打开", "这个站点在窗口里打不开时，用系统的 Edge 打开同一个地址");
+        _edge.FillColor = Color.White;
+        _edge.HoverColor = Theme.AccentSoft;
+        _edge.BorderColor = Theme.Accent;
+        _edge.TextColor = Theme.Accent;
+        _edge.Font = Theme.F(9.5f);
+        _edge.Visible = false;
+        _edge.Click += delegate { OpenInEdge(); };
+
+        _hint = new Label();
+        _hint.Font = Theme.F(10f);
+        _hint.ForeColor = Theme.FgMid;
+        _hint.BackColor = Theme.Bg;
+        _hint.TextAlign = ContentAlignment.MiddleCenter;
+        _hint.Visible = false;
+        Controls.Add(_hint);
+
+        _status = new Label();
+        _status.Font = Theme.F(8.5f);
+        _status.ForeColor = Theme.FgFaint;
+        _status.BackColor = Theme.Bg;
+        _status.Text = "输入网址或本地 html 路径，回车打开 · Ctrl+Shift+B 开关";
+        Controls.Add(_status);
+
+        // 加载失败时兜底判一次（现代站点偶尔连加载完成事件都不给）
+        _blankTimer = new System.Windows.Forms.Timer();
+        _blankTimer.Interval = 5000;
+        _blankTimer.Tick += delegate { _blankTimer.Stop(); try { HintIfBlank(); } catch { } };
+
+        LoadBookmarks();
+        // 不在构造里建标签页：Chromium 首次初始化很重，推迟到"第一次打开浏览器"
+    }
+
+    // ---------- 小控件 ----------
+
+    UiButton Nav(string text, string tip)
+    {
+        UiButton b = Chip(text, tip);
+        b.Font = Theme.F(12f);
+        return b;
+    }
+
+    UiButton Chip(string text, string tip)
+    {
+        UiButton b = new UiButton();
+        b.Text = text;
+        b.Font = Theme.F(9f);
+        b.FillColor = Theme.Clear;
+        b.HoverColor = Theme.Hover;
+        b.BorderColor = Theme.Clear;
+        b.TextColor = Theme.FgDim;
+        b.Radius = Theme.Px(Theme.RadRow);
+        if (tipsRef != null) tipsRef.SetToolTip(b, tip);
+        Controls.Add(b);
+        return b;
+    }
+
+    // ---------- 标签页 ----------
+
+    public BrowserTab Active() { return (_active >= 0 && _active < _tabs.Count) ? _tabs[_active] : null; }
+
+    public object Web { get { BrowserTab t = Active(); return t == null ? null : (object)t.Web; } }
+    public bool Loaded { get { BrowserTab t = Active(); return t != null && t.Loaded; } }
+
+    public string CurrentUrl
+    {
+        get
+        {
+            BrowserTab t = Active();
+            if (t == null) return "";
+            try { if (t.Web != null && !string.IsNullOrEmpty(t.Web.Address)) return t.Web.Address; } catch { }
+            return t.Url;
+        }
+    }
+
+    public BrowserTab NewTab(string url)
+    {
+        string err;
+        if (!EnsureCef(out err)) { Say("Chromium 起不来：" + err); return null; }
+
+        BrowserTab t = new BrowserTab();
+        try { t.Web = new CefSharp.WinForms.ChromiumWebBrowser("about:blank"); }
+        catch (Exception ex) { Say("建浏览器失败：" + Txt.FirstLine(ex.Message)); return null; }
+        // 关键：ChromiumWebBrowser 自带停靠，放任它就会 Dock=Fill 摊满整块面板，
+        // 于是把自绘的页签条 / 书签栏 / 地址框边框全盖住（用户截图里就是这样）。
+        // 我们是用 Place() 手工摆位的，必须把停靠和锚点都关掉。
+        t.Web.Dock = DockStyle.None;
+        t.Web.Anchor = AnchorStyles.None;
+        t.Web.Visible = false;
+        BrowserTab cap = t;
+
+        // Chromium 初始化是异步的：初始化完之前 LoadUrl 会被丢掉，所以先存"待发地址"
+        t.Web.IsBrowserInitializedChanged += delegate
+        {
+            try
+            {
+                if (!cap.Web.IsBrowserInitialized) return;
+                if (cap.Pending == null || cap.Pending.Length == 0) return;
+                string u = cap.Pending;
+                cap.Pending = "";
+                try { Log.Audit("内置浏览器 · 初始化完成，导航到 " + u); } catch { }
+                cap.Web.LoadUrl(u);
+            }
+            catch { }
+        };
+
+        t.Web.LoadingStateChanged += delegate(object s, CefSharp.LoadingStateChangedEventArgs e)
+        {
+            if (e.IsLoading) { cap.Loaded = false; return; }
+            cap.Loaded = true;
+            try { cap.Url = cap.Web.Address == null ? "" : cap.Web.Address; } catch { }
+            try
+            {
+                if (cap.Url.Length > 0 && (cap.HistPos < 0 || cap.Hist[cap.HistPos] != cap.Url))
+                {
+                    while (cap.Hist.Count > cap.HistPos + 1) cap.Hist.RemoveAt(cap.Hist.Count - 1);
+                    cap.Hist.Add(cap.Url);
+                    cap.HistPos = cap.Hist.Count - 1;
+                }
+            }
+            catch { }
+            try { if (cap == Active()) { Addr.Text = cap.Url; } } catch { }
+            try { if (cap == Active()) { _blankTimer.Stop(); KickTextCache(); } } catch { }
+            Invalidate();
+        };
+        t.Web.TitleChanged += delegate(object s, CefSharp.TitleChangedEventArgs e)
+        {
+            cap.Title = string.IsNullOrEmpty(e.Title) ? "新标签页" : e.Title;
+            Invalidate();
+        };
+
+        Controls.Add(t.Web);
+        _tabs.Add(t);
+        SetActive(_tabs.Count - 1);
+        if (url != null && url.Length > 0) Go(url);
+        Place();
+        Invalidate();
+        return t;
+    }
+
+    void SetActive(int i)
+    {
+        if (i < 0 || i >= _tabs.Count) return;
+        _active = i;
+        for (int k = 0; k < _tabs.Count; k++)
+        {
+            try { if (_tabs[k].Web != null) _tabs[k].Web.Visible = (k == i); } catch { }
+        }
+        try { Addr.Text = _tabs[i].Url; } catch { }
+        try { UpdateSiteMark(Addr.Text); } catch { }
+        _lastText = "";
+        Place();
+        try { _blankTimer.Stop(); _blankTimer.Start(); } catch { }
+        Invalidate();
+    }
+
+    void CloseTab(int i)
+    {
+        if (i < 0 || i >= _tabs.Count) return;
+        BrowserTab t = _tabs[i];
+        _tabs.RemoveAt(i);
+        try { Controls.Remove(t.Web); t.Web.Dispose(); } catch { }
+        if (_tabs.Count == 0) { _active = -1; NewTab(StartPage()); return; }
+        if (_active >= _tabs.Count) _active = _tabs.Count - 1;
+        SetActive(_active);
+    }
+
+    Rectangle TabRect(int i)
+    {
+        int w = Math.Min(Theme.Px(210), Math.Max(Theme.Px(90), (Width - Theme.Px(44)) / Math.Max(1, _tabs.Count)));
+        return new Rectangle(Theme.Px(6) + i * w, Theme.Px(6), Math.Max(Theme.Px(60), w - Theme.Px(4)), Theme.Px(30));
+    }
+
+    Rectangle PlusRect()
+    {
+        int w = Math.Min(Theme.Px(210), Math.Max(Theme.Px(90), (Width - Theme.Px(44)) / Math.Max(1, _tabs.Count)));
+        return new Rectangle(Theme.Px(6) + _tabs.Count * w + Theme.Px(2), Theme.Px(8), Theme.Px(24), Theme.Px(24));
+    }
+
+    Rectangle CloseRect(Rectangle tab) { return new Rectangle(tab.Right - Theme.Px(24), tab.Y + Theme.Px(7), Theme.Px(16), Theme.Px(16)); }
+
+    // ---------- 导航 ----------
+
+    public string StartPage()
+    {
+        string p = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "browser-home.html");
+        try
+        {
+            if (!File.Exists(p))
+            {
+                File.WriteAllText(p,
+                    "<!doctype html><meta charset=\"utf-8\"><title>Ahz Scribe · 新标签页</title>"
+                    + "<body style=\"font:15px/1.8 'Microsoft YaHei',sans-serif;color:#1f2023;margin:64px auto;max-width:660px\">"
+                    + "<h1 style=\"font-size:26px;margin-bottom:4px\">新标签页</h1>"
+                    + "<p style=\"color:#8a8f98;margin-top:0\">Ahz Scribe 内置浏览器 · Chromium 内核</p>"
+                    + "<p>① 地址栏输入网址或本地 html 路径，回车打开；页签条上 + 开新标签。</p>"
+                    + "<p>② 交给 AS：把当前地址丢给助手，它会读一遍再讲给你。</p>"
+                    + "<p>③ 阅读模式：把页面剥成只有正文的纯文本页。</p>"
+                    + "<p>④ 助手动页面时，顶上会亮一条强调色，状态栏写它在干什么。</p>"
+                    + "</body>", new UTF8Encoding(false));
+            }
+        }
+        catch { }
+        string uri = new Uri(p).AbsoluteUri;
+        if (Theme.Dark) uri += "?dark=1";
+        return uri;
+    }
+
+    public void Go(string target)
+    {
+        string t = target == null ? "" : target.Trim();
+        if (t.Length == 0) return;
+        if (!Regex.IsMatch(t, "^[a-zA-Z][a-zA-Z0-9+.\\-]*://") && !t.StartsWith("about:"))
+        {
+            try
+            {
+                if (File.Exists(t)) t = new Uri(Path.GetFullPath(t)).AbsoluteUri;
+                else if (Regex.IsMatch(t, "^(localhost|127\\.|10\\.|192\\.168\\.)")) t = "http://" + t;
+                else t = "https://" + t;
+            }
+            catch { return; }
+        }
+        BrowserTab tab = Active();
+        if (tab == null) { NewTab(t); return; }
+        _reading = false;
+        _lastText = "";
+        tab.Loaded = false;
+        try { _blankTimer.Stop(); _blankTimer.Start(); } catch { }
+        try
+        {
+            bool ready = false;
+            try { ready = tab.Web != null && tab.Web.IsBrowserInitialized; } catch { }
+            if (ready) { tab.Pending = ""; tab.Web.LoadUrl(t); }
+            else { tab.Pending = t; }          // 初始化完成事件里再发
+            try { Log.Audit("内置浏览器 · 导航 " + t + (ready ? "（立即）" : "（排队等初始化）")); } catch { }
+        }
+        catch (Exception ex) { tab.Loaded = true; Say("打不开：" + Txt.FirstLine(ex.Message)); }
+    }
+
+    // ---------- 读页面（工具用；工作线程上可以阻塞等，UI 线程只给缓存） ----------
+
+    public string EvalJs(string script, int timeoutMs)
+    {
+        BrowserTab t = Active();
+        if (t == null || t.Web == null) return null;
+        try
+        {
+            System.Threading.Tasks.Task<CefSharp.JavascriptResponse> task =
+                t.Web.GetBrowser().MainFrame.EvaluateScriptAsync(script);
+            if (!task.Wait(timeoutMs)) return null;
+            CefSharp.JavascriptResponse r = task.Result;
+            if (r == null || !r.Success) return null;
+            return r.Result == null ? "" : Convert.ToString(r.Result);
+        }
+        catch { return null; }
+    }
+
+    // 加载完成后把正文异步缓存一份（UI 线程上不能阻塞等 JS，CEF 的结果要靠 UI 线程回填）
+    void KickTextCache()
+    {
+        BrowserTab t = Active();
+        if (t == null || t.Web == null) return;
+        BrowserTab cap = t;
+        try
+        {
+            cap.Web.GetBrowser().MainFrame.EvaluateScriptAsync(BodyTextJs).ContinueWith(
+                delegate(System.Threading.Tasks.Task<CefSharp.JavascriptResponse> tr)
+                {
+                    try
+                    {
+                        CefSharp.JavascriptResponse r = tr.Result;
+                        if (r != null && r.Success) _lastText = r.Result == null ? "" : Convert.ToString(r.Result);
+                    }
+                    catch { }
+                    try
+                    {
+                        if (Active() == cap) BeginInvoke(new MethodInvoker(delegate { try { HintIfBlank(); } catch { } }));
+                    }
+                    catch { }
+                });
+        }
+        catch { }
+    }
+
+    public string ReadText()
+    {
+        BrowserTab t = Active();
+        if (t == null) return "";
+        if (!InvokeRequired) return _lastText;          // UI 线程：只给缓存，绝不阻塞
+        string r = EvalJs(BodyTextJs, 8000);
+        if (r != null) _lastText = r;
+        return _lastText;
+    }
+
+    public string ReadCache { get { return _lastText; } }
+
+    string ReadTextNow()
+    {
+        string r = EvalJs(BodyTextJs, 8000);
+        if (r != null) _lastText = r;
+        return _lastText;
+    }
+
+    void ToggleRead()
+    {
+        BrowserTab t = Active();
+        if (t == null || t.Web == null) return;
+        if (!_reading)
+        {
+            _readingUrl = CurrentUrl;
+            string body = ReadTextNow();
+            if (body == null || body.Trim().Length == 0) { Say("这一页没有可摘的正文（可能要登录或是纯图）"); return; }
+            _reading = true;
+            string html = "<!doctype html><meta charset=\"utf-8\"><title>阅读模式</title>"
+                + "<body style=\"font:16px/1.9 'Microsoft YaHei',serif;color:#24262b;margin:48px auto;max-width:680px\">"
+                + "<div style=\"font-size:12px;color:#8a8f98;letter-spacing:.08em;margin-bottom:20px\">阅读模式 · 只留正文</div>"
+                + "<pre style=\"white-space:pre-wrap;font:inherit;margin:0\">" + HtmlEsc(body) + "</pre></body>";
+            try
+            {
+                t.Loaded = false;
+                t.Web.LoadUrl("data:text/html;charset=utf-8," + Uri.EscapeDataString(html));
+                Say("阅读模式 · 已剥掉导航/广告/侧栏");
+            }
+            catch { _reading = false; }
+            return;
+        }
+        _reading = false;
+        Go(_readingUrl);
+    }
+
+    static string HtmlEsc(string s)
+    {
+        return s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
+    }
+
+    void HintIfBlank()
+    {
+        string u = CurrentUrl;
+        bool http = u.StartsWith("http");
+        bool bare = http && _lastText.Trim().Length < 40 && !_reading;
+        // 不再画那个大白框：它会盖住页面本身（豆包那张就是这么被糊住的）。
+        // 只在状态栏说一句，并把「用 Edge 打开」常驻在右下角。
+        _hint.Visible = false;
+        _edge.Visible = true;
+        if (bare) Say("这一页没读到正文（可能要登录/拒绝嵌入）· 可用「用 Edge 打开」");
+        Place();
+    }
+
+    // 后退 / 前进：用自己记的历史（成功返回目标地址，失败返回一句原因）
+    public string NavBack()
+    {
+        BrowserTab t = Active();
+        if (t == null) return "没有打开的页面。";
+        if (t.HistPos <= 0) return "已经是第一页了，没有可后退的。";
+        t.HistPos--;
+        string target = t.Hist[t.HistPos];
+        t.Loaded = false;
+        try { t.Web.LoadUrl(target); } catch (Exception ex) { return "后退失败：" + ex.Message; }
+        return target;
+    }
+
+    public string NavForward()
+    {
+        BrowserTab t = Active();
+        if (t == null) return "没有打开的页面。";
+        if (t.HistPos >= t.Hist.Count - 1) return "已经在最后一页了，没有可前进的。";
+        t.HistPos++;
+        string target = t.Hist[t.HistPos];
+        t.Loaded = false;
+        try { t.Web.LoadUrl(target); } catch (Exception ex) { return "前进失败：" + ex.Message; }
+        return target;
+    }
+
+    public void OpenInEdge()
+    {
+        string u = CurrentUrl;
+        if (u.Length == 0) { Say("还没打开任何页面"); return; }
+        try
+        {
+            System.Diagnostics.Process.Start("msedge.exe", u);
+            Say("已交给系统 Edge 打开");
+        }
+        catch
+        {
+            try { System.Diagnostics.Process.Start(u); Say("已交给默认浏览器打开"); }
+            catch { Say("叫不起浏览器，请手动复制地址"); }
+        }
+    }
+
+    // ---------- 书签栏 ----------
+
+    void LoadBookmarks()
+    {
+        string p = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "browser-bookmarks.txt");
+        try
+        {
+            if (!File.Exists(p))
+                File.WriteAllText(p,
+                    "有道翻译|https://fanyi.youdao.com\n"
+                    + "GitHub|https://github.com\n"
+                    + "DeepSeek|https://chat.deepseek.com\n"
+                    + "豆包|https://www.doubao.com\n"
+                    + "文心一言|https://yiyan.baidu.com\n"
+                    + "千问|https://tongyi.aliyun.com\n", new UTF8Encoding(false));
+            foreach (string ln in File.ReadAllLines(p, Encoding.UTF8))
+            {
+                string s = ln.Trim();
+                if (s.Length == 0 || s.StartsWith("#")) continue;
+                int bar = s.IndexOf('|');
+                if (bar <= 0) continue;
+                _marks.Add(new string[] { s.Substring(0, bar).Trim(), s.Substring(bar + 1).Trim() });
+            }
+        }
+        catch { }
+    }
+
+    void AddBookmark()
+    {
+        string u = CurrentUrl;
+        if (u.Length == 0) { Say("这一页还没地址，收藏不了"); return; }
+        string name = u;
+        BrowserTab t = Active();
+        if (t != null && t.Title.Length > 0) name = t.Title;
+        if (name.Length > 16) name = name.Substring(0, 16);
+        for (int i = 0; i < _marks.Count; i++)
+            if (_marks[i][1] == u) { Say("这一页已经在书签栏里了"); return; }
+        _marks.Add(new string[] { name, u });
+        try
+        {
+            string p = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "browser-bookmarks.txt");
+            File.WriteAllText(p, string.Join("\n", MarkLines()) + "\n", new UTF8Encoding(false));
+        }
+        catch { }
+        Say("已收藏到书签栏：" + name);
+        Invalidate();
+    }
+
+    string[] MarkLines()
+    {
+        string[] r = new string[_marks.Count];
+        for (int i = 0; i < _marks.Count; i++) r[i] = _marks[i][0] + "|" + _marks[i][1];
+        return r;
+    }
+
+    Rectangle MarkRect(int i, int x)
+    {
+        int w = Ui.TextWidth(_marks[i][0], Theme.F(9f)) + Theme.Px(20);
+        return new Rectangle(x, StripHP + ToolHP + Theme.Px(6), w, Theme.Px(21));
+    }
+
+    // 地址栏左侧的站点身份：https 锁 / http 警告 / 本地文件 / 未知。
+    // 只提示当前地址的协议，证书校验仍由 Chromium 负责。
+    void UpdateSiteMark(string url)
+    {
+        string u = (url ?? "").Trim();
+        if (u.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            _siteMark = "🔒";
+            _siteColor = Theme.Ok;
+            if (tipsRef != null) tipsRef.SetToolTip(Addr, "HTTPS 加密连接（证书由 Chromium 校验）");
+        }
+        else if (u.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+        {
+            _siteMark = "⚠";
+            _siteColor = Theme.Warn;
+            if (tipsRef != null) tipsRef.SetToolTip(Addr, "HTTP 明文连接：不要在这个页面输入密码或密钥");
+        }
+        else if (u.StartsWith("file://", StringComparison.OrdinalIgnoreCase))
+        {
+            _siteMark = "▤";
+            _siteColor = Theme.FgFaint;
+            if (tipsRef != null) tipsRef.SetToolTip(Addr, "本地 HTML 文件");
+        }
+        else
+        {
+            _siteMark = "•";
+            _siteColor = Theme.FgFaint;
+            if (tipsRef != null) tipsRef.SetToolTip(Addr, "输入网址或本地 html 路径，回车打开");
+        }
+    }
+
+    public void Say(string s) { try { _status.Text = s; _status.ForeColor = Theme.FgFaint; Invalidate(); } catch { } }
+    public void AgentSay(string s) { try { _status.Text = s; _status.ForeColor = Theme.Accent; Invalidate(); } catch { } }
+    public void AgentDone(string s) { Say(s); }
+    public void FocusAddress() { try { Addr.Focus(); Addr.SelectAll(); } catch { } }
+
+    // ---------- 排版 ----------
+
+    void Place()
+    {
+        if (Addr == null) return;
+        int boxH = Theme.Px(28);
+        int boxY = StripHP + Theme.Px(8);
+        int midY = boxY + boxH / 2;
+
+        int btn = Theme.Px(26);
+        int btnY = midY - btn / 2;
+        int x = Theme.Px(8);
+        UiButton[] navs = new UiButton[] { _back, _fwd, _reload, _home };
+        for (int i = 0; i < navs.Length; i++)
+        {
+            navs[i].SetBounds(x, btnY, btn, btn);
+            x += btn + Theme.Px(2);
+        }
+        x += Theme.Px(8);
+
+        int rw = Theme.Px(74);
+        int gap = Theme.Px(6);
+        int right = Theme.Px(8);
+        _ask.SetBounds(Width - right - rw, btnY, rw, btn);
+        right += rw + gap;
+        _read.SetBounds(Width - right - rw, btnY, rw, btn);
+        right += rw + gap;
+        int sw = Theme.Px(32);
+        _star.SetBounds(Width - right - sw, btnY, sw, btn);
+        right += sw + gap;
+
+        int addrW = Math.Max(Theme.Px(120), Width - x - right - Theme.Px(8));
+        AddrBox = new Rectangle(x, boxY, addrW, boxH);
+        int pad = Theme.Px(12);
+        int siteW = Theme.Px(22);
+        Addr.SetBounds(AddrBox.Left + pad + siteW, AddrBox.Top,
+            Math.Max(Theme.Px(60), AddrBox.Width - pad * 2 - siteW), Addr.Height);
+        Addr.Top = AddrBox.Top + (AddrBox.Height - Addr.Height) / 2;
+
+        int top = StripHP + ToolHP + (_marks.Count > 0 ? MarkHP : 0);
+        int statusH = Theme.Px(22);
+        for (int i = 0; i < _tabs.Count; i++)
+        {
+            BrowserTab tb = _tabs[i];
+            if (tb == null || tb.Web == null) continue;
+            tb.Web.SetBounds(0, top + Theme.Px(2), Width, Math.Max(Theme.Px(40), Height - top - statusH - Theme.Px(4)));
+            if (i == _active)
+            {
+                long now = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalSeconds;
+                if (now - _placedLogged > 2)
+                {
+                    _placedLogged = now;
+                    try
+                    {
+                        Log.Audit("浏览器布局 · 面板=" + Width + "x" + Height + " top=" + top
+                            + " web=" + tb.Web.Bounds + " dock=" + tb.Web.Dock
+                            + " 书签=" + _marks.Count + " tabs=" + _tabs.Count);
+                    }
+                    catch { }
+                }
+            }
+        }
+        bool edgeOn = _edge != null && _edge.Visible;
+        _status.SetBounds(Theme.Px(12), Height - statusH,
+            Math.Max(Theme.Px(60), Width - Theme.Px(24) - (edgeOn ? Theme.Px(136) : 0)), statusH - Theme.Px(2));
+        if (_hint != null)
+            _hint.SetBounds(Theme.Px(40), top + Theme.Px(40), Math.Max(Theme.Px(120), Width - Theme.Px(80)),
+                Math.Max(Theme.Px(40), (Height - top - statusH) / 2));
+        // 出口按钮放在底栏，不再压住网页右下角的内容（原来会盖住首页第 7 个快捷入口）。
+        if (edgeOn)
+            _edge.SetBounds(Width - Theme.Px(136), Height - statusH + Theme.Px(1),
+                Theme.Px(128), Math.Max(Theme.Px(18), statusH - Theme.Px(2)));
+        Invalidate();
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        Place();
+    }
+
+    // ---------- 自绘外壳 ----------
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        base.OnPaint(e);
+        Graphics g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        using (SolidBrush b = new SolidBrush(Theme.ChipHover)) g.FillRectangle(b, 0, 0, Width, StripHP);
+        for (int i = 0; i < _tabs.Count; i++)
+        {
+            Rectangle r = TabRect(i);
+            bool on = (i == _active);
+            int tabH = on ? Math.Max(r.Height, StripHP - r.Y) : r.Height;
+            using (GraphicsPath p = Ui.Round(new Rectangle(r.X, r.Y, r.Width, tabH), Theme.Px(8)))
+            {
+                using (SolidBrush b = new SolidBrush(on ? Theme.Bg : (_hotTab == i ? Theme.Hover : Theme.Clear))) g.FillPath(b, p);
+            }
+            Rectangle ic = new Rectangle(r.X + Theme.Px(9), r.Y + Theme.Px(9), Theme.Px(14), Theme.Px(14));
+            using (GraphicsPath ip = Ui.Round(ic, Theme.Px(4)))
+            using (SolidBrush ib = new SolidBrush(on ? Theme.AccentSoft : Theme.Card)) g.FillPath(ib, ip);
+            string mono = _tabs[i].Title.Length > 0 ? _tabs[i].Title.Substring(0, 1) : "·";
+            TextRenderer.DrawText(g, mono, Theme.F(7.5f), ic, Theme.Accent,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+            int tw = r.Width - Theme.Px(52);
+            TextRenderer.DrawText(g, _tabs[i].Title, Theme.F(9f),
+                new Rectangle(ic.Right + Theme.Px(7), r.Y, Math.Max(Theme.Px(20), tw), r.Height),
+                on ? Theme.Fg : Theme.FgMid,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+            Rectangle cr = CloseRect(r);
+            if (_hotClose == i)
+                using (GraphicsPath cp = Ui.Round(cr, Theme.Px(4)))
+                using (SolidBrush cb = new SolidBrush(Theme.Hover)) g.FillPath(cb, cp);
+            TextRenderer.DrawText(g, "×", Theme.F(9f), cr, Theme.FgFaint,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+        }
+        Rectangle pr = PlusRect();
+        if (_hotTab == -2)
+            using (GraphicsPath pp = Ui.Round(pr, Theme.Px(6)))
+            using (SolidBrush pb = new SolidBrush(Theme.Hover)) g.FillPath(pb, pp);
+        TextRenderer.DrawText(g, "+", Theme.F(13f), pr, Theme.FgMid,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+
+        int toolY = StripHP;
+        using (SolidBrush b = new SolidBrush(Theme.Bg)) g.FillRectangle(b, 0, toolY, Width, ToolHP + (_marks.Count > 0 ? MarkHP : 0));
+        Rectangle box = AddrBox;
+        if (box.Width > Theme.Px(20))
+        {
+            using (GraphicsPath bp = Ui.Round(box, Theme.Px(box.Height / 2)))
+            {
+                using (SolidBrush b = new SolidBrush(Color.White)) g.FillPath(b, bp);
+                using (Pen p = new Pen(Theme.Line, Theme.Pxf(1f))) g.DrawPath(p, bp);
+            }
+            TextRenderer.DrawText(g, _siteMark, Theme.F(10f),
+                new Rectangle(box.Left + Theme.Px(8), box.Top, Theme.Px(22), box.Height),
+                _siteColor, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+        }
+        if (_marks.Count > 0)
+        {
+            int mx = Theme.Px(10), my = toolY + ToolHP;
+            for (int i = 0; i < _marks.Count; i++)
+            {
+                Rectangle mr = MarkRect(i, mx);
+                if (mr.Right > Width - Theme.Px(8)) break;
+                if (_hotMark == i)
+                    using (GraphicsPath mp = Ui.Round(mr, Theme.Px(6)))
+                    using (SolidBrush mb = new SolidBrush(Theme.Hover)) g.FillPath(mb, mp);
+                TextRenderer.DrawText(g, _marks[i][0], Theme.F(9f), mr, Theme.FgMid,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                mx = mr.Right + Theme.Px(4);
+            }
+        }
+        if (AgentDriving)
+            using (SolidBrush b = new SolidBrush(Theme.Accent))
+                g.FillRectangle(b, 0, 0, Width, Theme.Px(3));
+    }
+
+    // ---------- 鼠标 ----------
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        base.OnMouseMove(e);
+        int hotTab = PlusRect().Contains(e.Location) ? -2 : -1;
+        int hotClose = -1, hotMark = -1;
+        for (int i = 0; i < _tabs.Count; i++)
+        {
+            Rectangle r = TabRect(i);
+            if (!r.Contains(e.Location)) continue;
+            hotTab = i;
+            if (CloseRect(r).Contains(e.Location)) hotClose = i;
+            break;
+        }
+        int mx = Theme.Px(10), my = StripHP + ToolHP;
+        for (int i = 0; i < _marks.Count; i++)
+        {
+            Rectangle mr = MarkRect(i, mx);
+            mx = mr.Right + Theme.Px(4);
+            if (e.Y >= my && mr.Contains(e.Location)) { hotMark = i; break; }
+        }
+        if (hotTab != _hotTab || hotClose != _hotClose || hotMark != _hotMark)
+        {
+            _hotTab = hotTab; _hotClose = hotClose; _hotMark = hotMark;
+            Cursor = (hotTab >= 0 || hotClose >= 0 || hotMark >= 0) ? Cursors.Hand : Cursors.Default;
+            Invalidate();
+        }
+    }
+
+    protected override void OnMouseLeave(EventArgs e)
+    {
+        base.OnMouseLeave(e);
+        _hotTab = -1; _hotClose = -1; _hotMark = -1;
+        Cursor = Cursors.Default;
+        Invalidate();
+    }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        if (e.Button != MouseButtons.Left) return;
+        if (_marks.Count > 0 && e.Y >= StripHP + ToolHP)
+        {
+            int mx = Theme.Px(10);
+            for (int i = 0; i < _marks.Count; i++)
+            {
+                Rectangle mr = MarkRect(i, mx);
+                if (mr.Contains(e.Location)) { Go(_marks[i][1]); return; }
+                mx = mr.Right + Theme.Px(4);
+            }
+        }
+        for (int i = 0; i < _tabs.Count; i++)
+        {
+            Rectangle r = TabRect(i);
+            if (!r.Contains(e.Location)) continue;
+            if (CloseRect(r).Contains(e.Location)) CloseTab(i);
+            else SetActive(i);
+            return;
+        }
+        if (PlusRect().Contains(e.Location)) { NewTab(StartPage()); return; }
+    }
+
+    // ---------- 截图（UI 线程只发起，等工作线程去等结果，别在 UI 线程上阻塞） ----------
+
+    public System.Threading.Tasks.Task<byte[]> BeginScreenshot()
+    {
+        BrowserTab t = Active();
+        if (t == null || t.Web == null) return null;
+        try { return t.Web.CaptureScreenshotAsync(); }
+        catch { return null; }
+    }
+}
+
+// ============================ 助手那半边：它自己开页、读 DOM、点链接 ============================
+// 和"人手动点"的根本区别（Claude / Codex 那种浏览器）：面板只有一个。
+// 助手操作它就等于用户眼前那个页面在动 —— 不是两套管道、不是无头另开一份。
+static class BrowserHub
+{
+    public static AhzBrowser Panel;
+    public static Action ShowPanel;
+
+    static Control Marshal { get { return Panel == null ? null : (Panel.FindForm() as Control); } }
+
+    // 回到 UI 线程（句柄用主窗口的：面板自己还没句柄时 InvokeRequired 会骗人）
+    static string CallOn(Control c, Func<string> fn, int timeoutMs)
+    {
+        if (c == null) return "内置浏览器不可用（找不到主窗口）。";
+        if (!c.InvokeRequired)
+        {
+            try { return fn(); }
+            catch (Exception ex) { return "内置浏览器操作失败：" + ex.Message; }
+        }
+        string result = null;
+        Exception err = null;
+        IAsyncResult ar = c.BeginInvoke((MethodInvoker)delegate
+        {
+            try { result = fn(); }
+            catch (Exception ex) { err = ex; }
+        });
+        if (!ar.AsyncWaitHandle.WaitOne(timeoutMs)) return "__TIMEOUT__";
+        if (err != null) return "内置浏览器操作失败：" + err.Message;
+        return result == null ? "" : result;
+    }
+
+    static void Ui(Control c, MethodInvoker act)
+    {
+        try { if (c == null || c.IsDisposed) return; if (c.InvokeRequired) c.BeginInvoke(act); else act(); }
+        catch { }
+    }
+
+    static string OnUi(string busy, string done, Func<string> fn, int timeoutMs)
+    {
+        AhzBrowser p = Panel;
+        if (p == null) return "内置浏览器还没建起来（主窗口没初始化完）。";
+        Control m = Marshal;
+        if (m == null) m = p;
+        Ui(m, delegate { if (ShowPanel != null) ShowPanel(); });
+        Ui(m, delegate { p.AgentDriving = true; p.AgentSay(busy); });
+        try
+        {
+            string r = CallOn(m, fn, timeoutMs);
+            if (r == "__TIMEOUT__") return "内置浏览器操作超时（" + (timeoutMs / 1000) + " 秒没做完）。";
+            return r;
+        }
+        finally
+        {
+            Ui(m, delegate { p.AgentDriving = false; p.AgentDone(done); });
+        }
+    }
+
+    static bool WaitLoaded(AhzBrowser p, int seconds)
+    {
+        if (p.InvokeRequired == false) return p.Loaded;
+        DateTime end = DateTime.Now.AddSeconds(Math.Min(seconds, 20));
+        while (DateTime.Now < end)
+        {
+            if (p.Loaded) return true;
+            System.Threading.Thread.Sleep(80);
+        }
+        return false;
+    }
+
+    static string Title(AhzBrowser p)
+    {
+        BrowserTab t = p.Active();
+        return t == null ? "" : (t.Title == null ? "" : t.Title);
+    }
+
+    public static string Open(string target)
+    {
+        string t = target == null ? "" : target.Trim();
+        if (t.Length == 0) return "缺参数：url 是空的。";
+        string url = t;
+        string nav = OnUi("正在打开 " + t, "已打开 " + t, delegate
+        {
+            AhzBrowser p = Panel;
+            if (p.Active() == null) p.NewTab(url);      // 第一次打开：这里才建 Chromium
+            else p.Go(url);
+            return "";
+        }, 20000);
+        if (nav.StartsWith("内置浏览器")) return nav;
+        WaitLoaded(Panel, 20);
+        string text = Panel.ReadText();
+        if (text.Length > 600) text = text.Substring(0, 600) + "…";
+        return "已在内置浏览器打开（用户也能看到）。\n标题：" + Title(Panel)
+            + "\n地址：" + Panel.CurrentUrl + (text.Length > 0 ? "\n正文开头：\n" + text : "\n（正文是空的：可能要登录、是纯图，或站点拒绝被嵌入）");
+    }
+
+    public static string Read(int max)
+    {
+        AhzBrowser p = Panel;
+        if (p == null) return "内置浏览器还没建起来。";
+        if (ShowPanel != null) { try { ShowPanel(); } catch { } }
+        Ui(Marshal, delegate { p.AgentDriving = true; p.AgentSay("正在读页面正文"); });
+        try
+        {
+            string t = p.ReadText();
+            if (t == null || t.Length == 0) return "这一页没有可读的正文（可能要登录、是纯图，或还没加载完）。";
+            if (max <= 0) max = 3000;
+            if (t.Length > max) t = t.Substring(0, max) + "\n…（还有 " + (t.Length - max) + " 字没显示）";
+            return "标题：" + Title(p) + "\n地址：" + p.CurrentUrl + "\n正文：\n" + t;
+        }
+        finally { Ui(Marshal, delegate { p.AgentDriving = false; p.AgentDone("已读取"); }); }
+    }
+
+    public static string Links(int max)
+    {
+        if (max <= 0) max = 40;
+        AhzBrowser p = Panel;
+        if (p == null) return "内置浏览器还没建起来。";
+        if (ShowPanel != null) { try { ShowPanel(); } catch { } }
+        string js = "(function(){var out=[];var as=document.querySelectorAll('a');"
+            + "for(var i=0;i<as.length&&out.length<" + max + ";i++){var a=as[i];"
+            + "var t=(a.innerText||'').replace(/\\s+/g,' ').trim();var h=a.href||'';"
+            + "if(!t&&!h)continue;out.push(t+'|||'+h);}return out.join('\\n');})()";
+        string r = p.EvalJs(js, 10000);
+        if (r == null) return "拿不到页面链接（页面没加载完，或这个页面没有可读的 DOM）。";
+        if (r.Trim().Length == 0) return "这一页没有链接。";
+        StringBuilder sb = new StringBuilder();
+        string[] lines = r.Split('\n');
+        int n = 0;
+        for (int i = 0; i < lines.Length && n < max; i++)
+        {
+            string ln = lines[i].Trim();
+            if (ln.Length == 0) continue;
+            string[] parts = ln.Split(new string[] { "|||" }, StringSplitOptions.None);
+            string txt = parts.Length > 0 ? parts[0] : "";
+            string href = parts.Length > 1 ? parts[1] : "";
+            if (txt.Length > 60) txt = txt.Substring(0, 60) + "…";
+            sb.Append("  [" + (n + 1) + "] " + (txt.Length > 0 ? txt : "(无文字)") + "  →  " + href + "\n");
+            n++;
+        }
+        return "列了 " + n + " 条链接：\n" + sb;
+    }
+
+    static string JsStr(string s)
+    {
+        if (s == null) return "''";
+        StringBuilder b = new StringBuilder("'");
+        for (int i = 0; i < s.Length; i++)
+        {
+            char c = s[i];
+            if (c == '\\') b.Append("\\\\");
+            else if (c == '\'') b.Append("\\'");
+            else if (c == '\n') b.Append("\\n");
+            else if (c == '\r') b.Append("\\r");
+            else b.Append(c);
+        }
+        b.Append("'");
+        return b.ToString();
+    }
+
+    public static string Click(string text)
+    {
+        string want = text == null ? "" : text.Trim();
+        if (want.Length == 0) return "缺参数：text 是空的。先 browse_links 看清有哪些链接。";
+        AhzBrowser p = Panel;
+        if (p == null) return "内置浏览器还没建起来。";
+        if (ShowPanel != null) { try { ShowPanel(); } catch { } }
+        Ui(Marshal, delegate { p.AgentDriving = true; p.AgentSay("正在点「" + want + "」"); });
+        try
+        {
+            string js = "(function(){var want=" + JsStr(want) + ".toLowerCase();"
+                + "var as=document.querySelectorAll('a,button,input[type=button],input[type=submit]');"
+                + "for(var i=0;i<as.length;i++){var a=as[i];"
+                + "var t=((a.innerText||a.value||'')+'').replace(/\\s+/g,' ').trim();"
+                + "if(t&&t.toLowerCase().indexOf(want)>=0){a.click();return 'OK:'+a.tagName;}"
+                + "}return 'NF';})()";
+            string r = p.EvalJs(js, 10000);
+            if (r == null) return "点不动（页面没加载完，或这个页面不允许脚本操作）。";
+            if (r == "NF") return "页面上没找到写着「" + want + "」的链接或按钮。先用 browse_links 看看能点哪些。";
+            if (!r.StartsWith("OK:")) return "点击返回了意外结果：" + r;
+            WaitLoaded(p, 15);
+            string body = p.ReadText();
+            if (body.Length > 400) body = body.Substring(0, 400) + "…";
+            return "已点击 <" + r.Substring(3) + ">「" + want + "」。\n现在页面：" + Title(p)
+                + "\n地址：" + p.CurrentUrl + "\n正文开头：\n" + body;
+        }
+        finally { Ui(Marshal, delegate { p.AgentDriving = false; p.AgentDone("已点击「" + want + "」"); }); }
+    }
+
+    public static string Back()
+    {
+        AhzBrowser pp = Panel;
+        if (pp == null) return "内置浏览器还没建起来。";
+        string r = OnUi("正在后退", "已后退", delegate { return pp.NavBack(); }, 15000);
+        if (r == null || r.Length == 0) return "后退失败：没有返回目标地址。";
+        if (r.StartsWith("已经") || r.StartsWith("没有") || r.StartsWith("后退失败")) return r;
+        string target = r;
+        if (pp.InvokeRequired)
+        {
+            DateTime end = DateTime.Now.AddSeconds(12);
+            while (DateTime.Now < end)
+            {
+                string cur = pp.EvalJs("location.href", 4000);
+                if (cur != null && (cur == target || cur.StartsWith(target))) break;
+                System.Threading.Thread.Sleep(150);
+            }
+        }
+        WaitLoaded(pp, 8);
+        return "已后退。现在页面：" + Title(pp) + "\n地址：" + pp.CurrentUrl;
+    }
+
+    public static string Shot(string path)
+    {
+        string target = path == null ? "" : path.Trim();
+        if (target.Length == 0)
+            target = Path.Combine(Environment.CurrentDirectory,
+                "browser-shot-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".png");
+        AhzBrowser p = Panel;
+        if (p == null) return "内置浏览器还没建起来。";
+        if (ShowPanel != null) { try { ShowPanel(); } catch { } }
+
+        // 截图任务必须在 UI 线程发起，但"等结果"要在工作线程上等（UI 线程上一等就死锁）
+        System.Threading.Tasks.Task<byte[]> task = null;
+        string start = CallOn(Marshal, delegate { task = p.BeginScreenshot(); return task == null ? "NULL" : "OK"; }, 10000);
+        if (start != "OK") return start == "NULL" ? "截图失败：没有可截的页面。" : start;
+        try
+        {
+            if (!task.Wait(20000)) return "截图超时（20 秒没拿到图）。";
+            byte[] bytes = task.Result;
+            if (bytes == null || bytes.Length < 100) return "截图失败：Chromium 没给图。";
+            File.WriteAllBytes(target, bytes);      // CefSharp 直接给 PNG 字节
+        }
+        catch (Exception ex) { return "截图失败：" + ex.Message; }
+        return "已截图（Chromium CaptureScreenshot）：" + target;
+    }
+
+    public static void ReportLoaded()
+    {
+        AhzBrowser p = Panel;
+        if (p == null) return;
+        Ui(Marshal, delegate { try { p.Say("已加载 · " + Title(p)); } catch { } });
+    }
+}
+
+// ============================ 界面看门狗 ============================
+// 卡死是"偶发、现场一关就没了"的 bug，光靠复现永远抓不到。这个线程每 2 秒问 UI 线程一次
+// "还活着吗"：4 秒没回应就把时间点、卡了多久、当时浏览器开没开写进 Ahz错误日志.txt。
+static class UiWatchdog
+{
+    static Control _host;
+    static long _lastBeat;
+
+    public static void Start(Control host)
+    {
+        if (_host != null) return;
+        _host = host;
+        System.Threading.Thread t = new System.Threading.Thread(Loop);
+        t.IsBackground = true;
+        t.Name = "ui-watchdog";
+        t.Start();
+    }
+
+    static void Loop()
+    {
+        while (true)
+        {
+            System.Threading.Thread.Sleep(2000);
+            try
+            {
+                Control h = _host;
+                if (h == null || h.IsDisposed) return;
+                System.Threading.ManualResetEvent done = new System.Threading.ManualResetEvent(false);
+                DateTime t0 = DateTime.Now;
+                h.BeginInvoke(new MethodInvoker(delegate { try { done.Set(); } catch { } }));
+                if (!done.WaitOne(4000))
+                {
+                    double sec = (DateTime.Now - t0).TotalSeconds;
+                    long now = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalSeconds;
+                    if (now - _lastBeat > 30)
+                    {
+                        _lastBeat = now;
+                        bool br = BrowserHub.Panel != null && BrowserHub.Panel.Visible;
+                        Log.Audit("⚠ 界面卡顿 " + sec.ToString("0.0") + "s（看门狗）· 浏览器=" + (br ? "开" : "关")
+                            + " · 检查: Chromium 初始化/页面加载/读DOM/截图");
+                    }
+                }
+            }
+            catch { }
+        }
+    }
+}
+
+// 把这六件事挂成工具：名字都用 browse_ 开头，和插件的 web_open（无头）分开，
+// 一眼能看出"这个会开真窗口、用户看得见"
+static class BrowserTools
+{
+    public static List<ToolDef> All()
+    {
+        List<ToolDef> list = new List<ToolDef>();
+        list.Add(new ToolDef("browse_open",
+            "在内置浏览器（Chromium 内核）里打开网址，会弹出可见窗口，用户和你看到的是同一个页面。本地 html 路径也行。",
+            false, delegate(ToolContext c, Dictionary<string, object> a) { return BrowserHub.Open(A.Str(a, "url", "")); })
+            .Prop("url", "string", "网址或本地 html 路径", true));
+
+        list.Add(new ToolDef("browse_read",
+            "读内置浏览器当前页面的正文（纯文本）。想读细节用它，不要整页倒进上下文。",
+            false, delegate(ToolContext c, Dictionary<string, object> a) { return BrowserHub.Read(A.Int(a, "max_chars", 3000)); })
+            .Prop("max_chars", "integer", "最多返回多少字，默认 3000", false));
+
+        list.Add(new ToolDef("browse_links",
+            "列出内置浏览器当前页面上的链接（序号 + 文字 + 地址）。要进下一页前先用它看清入口。",
+            false, delegate(ToolContext c, Dictionary<string, object> a) { return BrowserHub.Links(A.Int(a, "max_items", 40)); })
+            .Prop("max_items", "integer", "最多列多少条，默认 40", false));
+
+        list.Add(new ToolDef("browse_click",
+            "按文字点击内置浏览器当前页面上的链接/按钮（用户同时看得见）。先 browse_links 看清再点。",
+            false, delegate(ToolContext c, Dictionary<string, object> a) { return BrowserHub.Click(A.Str(a, "text", "")); })
+            .Prop("text", "string", "链接或按钮上的文字，可只给一部分", true));
+
+        list.Add(new ToolDef("browse_back", "内置浏览器后退一页。", false,
+            delegate(ToolContext c, Dictionary<string, object> a) { return BrowserHub.Back(); }));
+
+        list.Add(new ToolDef("browse_shot",
+            "把内置浏览器当前画面截成 png（给用户看，也给你自己看）。不填路径就自动命名。",
+            false, delegate(ToolContext c, Dictionary<string, object> a) { return BrowserHub.Shot(A.Str(a, "path", "")); })
+            .Prop("path", "string", "png 保存路径，不填自动命名", false));
+        return list;
+    }
+}
+
 // ============================ 自我迭代「改造申请单」（GUI 用） ============================
 // 智能体发现自己能力不够时，用它把方案摆到用户面前：改造内容 / 影响范围 / 风险 / 预期效果 / 怎么验证。
 // 用户点「批准执行」或「驳回」；批准后框架要求它按固定四步走（改代码 → build → 自测 → 升级重启），
@@ -8743,6 +14067,7 @@ class ApprovalForm : Form
 class ProposalForm : Form
 {
     public int Decision = 0;      // 1 = 批准执行 / 0 = 驳回
+    private UiDiff _body;          // 只读正文（自测/取证用）
 
     public ProposalForm(string title, string body)
     {
@@ -8750,8 +14075,10 @@ class ProposalForm : Form
         AutoScaleMode = AutoScaleMode.None;
         Text = "自我迭代改造申请";
         Icon = Theme.AppIcon();
-        Size = new Size(Theme.Px(860), Theme.Px(640));
-        MinimumSize = new Size(Theme.Px(660), Theme.Px(480));
+        Size = new Size(Theme.Px(860), Theme.Px(640) + Theme.Px(40));
+        MinimumSize = new Size(Theme.Px(660), Theme.Px(480) + Theme.Px(40));
+        FormBorderStyle = FormBorderStyle.None;
+        Padding = new Padding(0, Theme.Px(40), 0, 0);
         StartPosition = FormStartPosition.CenterParent;
         BackColor = Theme.Bg;
         ForeColor = Theme.Fg;
@@ -8788,7 +14115,7 @@ class ProposalForm : Form
         ok.FillColor = Theme.Accent;
         ok.HoverColor = Theme.AccentHover;
         ok.TextColor = Color.White;
-        ok.Radius = 9;
+        ok.Radius = Theme.RadCard;
         ok.Font = Theme.F(9.5f);
         ok.Size = new Size(Theme.Px(118), Theme.Px(36));
         ok.Click += delegate { Decision = 1; Close(); };
@@ -8798,7 +14125,7 @@ class ProposalForm : Form
         no.FillColor = Color.White;
         no.BorderColor = Theme.Line;
         no.HoverColor = Theme.Hover;
-        no.Radius = 9;
+        no.Radius = Theme.RadCard;
         no.Font = Theme.F(9.5f);
         no.Size = new Size(Theme.Px(88), Theme.Px(36));
         no.Click += delegate { Decision = 0; Close(); };
@@ -8806,38 +14133,46 @@ class ProposalForm : Form
         Label hint = new Label();
         hint.Text = "Enter 驳回 · 批准后：① 改代码 ② build ③ 跑自测 ④ 自动升级重启；任一步失败自动回滚";
         hint.ForeColor = Theme.FgFaint;
-        hint.AutoSize = true;
-        hint.Location = new Point(Theme.Px(22), Theme.Px(24));
+        hint.AutoSize = false;
+        hint.AutoEllipsis = true;
+        hint.TextAlign = ContentAlignment.MiddleLeft;
+        hint.Location = new Point(Theme.Px(22), Theme.Px(22));
         bottom.Controls.Add(hint);
         bottom.Layout += delegate
         {
             no.Location = new Point(bottom.ClientSize.Width - Theme.Px(20) - no.Width, Theme.Px(14));
             ok.Location = new Point(no.Left - Theme.Px(10) - ok.Width, Theme.Px(14));
+            int hintW = Math.Max(Theme.Px(100), ok.Left - Theme.Px(33));
+            hint.SetBounds(Theme.Px(22), Theme.Px(22), hintW, Math.Max(Theme.Px(24), bottom.Height - Theme.Px(28)));
         };
         Controls.Add(bottom);
 
         Panel wrap = new Panel();
         wrap.Dock = DockStyle.Fill;
         wrap.BackColor = Theme.Bg;
-        TextBox tb = new TextBox();
-        tb.Multiline = true;
-        tb.ReadOnly = true;
-        tb.ScrollBars = ScrollBars.Vertical;
-        tb.WordWrap = true;
-        tb.BorderStyle = BorderStyle.FixedSingle;
-        tb.BackColor = Color.White;
-        tb.ForeColor = Theme.Fg;
-        tb.Font = Theme.F(9.5f);
-        tb.Text = body;
-        wrap.Controls.Add(tb);
-        wrap.Layout += delegate
-        {
-            tb.SetBounds(Theme.Px(22), Theme.Px(6),
-                Math.Max(Theme.Px(160), wrap.ClientSize.Width - Theme.Px(44)),
-                Math.Max(Theme.Px(120), wrap.ClientSize.Height - Theme.Px(20)));
-        };
+        // 正文用圆角卡片装：原来直接一个 FixedSingle 的直角 TextBox，和审批/澄清不是一套。
+        RoundedPanel box = new RoundedPanel();
+        box.Dock = DockStyle.Fill;
+        box.Radius = Theme.RadInput;
+        box.Fill = Theme.Card;
+        box.BorderColor = Theme.Line;
+        box.BackColor = Theme.Bg;
+        box.Padding = new Padding(Theme.Sp16, Theme.Sp12, Theme.Sp16, Theme.Sp12);
+        UiDiff tb = new UiDiff();
+        tb.Dock = DockStyle.Fill;
+        tb.Text = (body == null ? "" : body).Replace("\r\n", "\n").Replace("\n", "\r\n");
+        _body = tb;
+        box.Controls.Add(tb);
+        wrap.Controls.Add(box);
         Controls.Add(wrap);
         wrap.BringToFront();
+
+        ChromeBar bar = new ChromeBar("自我迭代改造申请");
+        bar.Bounds = new Rectangle(0, 0, ClientSize.Width, Theme.Px(40));
+        bar.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+        bar.Closed += delegate { Decision = 0; Close(); };
+        Controls.Add(bar);
+        bar.BringToFront();
 
         AcceptButton = no;                       // 默认按钮是「驳回」：按 Enter 不会批准自我改造
         KeyPreview = true;
@@ -8872,6 +14207,8 @@ class Session
 
 class SessionStore
 {
+    public static string LastLoadError = "";
+    public static string LastSaveError = "";
     public List<Session> sessions { get; set; }
 
     public SessionStore() { sessions = new List<Session>(); }
@@ -8883,6 +14220,7 @@ class SessionStore
 
     public static SessionStore Load()
     {
+        LastLoadError = "";
         try
         {
             if (File.Exists(FilePath))
@@ -8891,14 +14229,36 @@ class SessionStore
                 if (s != null && s.sessions != null) return s;
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            LastLoadError = "会话读取失败：" + ex.Message;
+            Log.Swallow(ex, "读取会话");
+        }
         return new SessionStore();
     }
 
     public void Save()
     {
-        try { File.WriteAllText(FilePath, Json.Ser.Serialize(this), new UTF8Encoding(false)); }
-        catch { }
+        // 先写 .tmp，再替换正式文件；中途崩溃/断电不会把 1.8MB 的会话库写成半截。
+        // 旧版直接 File.WriteAllText，写一半就是全丢（2026-10-18 验收 P1-7）。
+        string tmp = FilePath + ".tmp";
+        try
+        {
+            File.WriteAllText(tmp, Json.Ser.Serialize(this), new UTF8Encoding(false));
+            if (File.Exists(FilePath))
+            {
+                try { File.Copy(FilePath, FilePath + ".bak", true); } catch { }
+                try { File.Replace(tmp, FilePath, null); }
+                catch { File.Copy(tmp, FilePath, true); try { File.Delete(tmp); } catch { } }
+            }
+            else File.Move(tmp, FilePath);
+            LastSaveError = "";
+        }
+        catch (Exception ex)
+        {
+            LastSaveError = "会话保存失败：" + ex.Message;
+            Log.Swallow(ex, "保存会话");
+        }
     }
 }
 // ---------- 统一错误日志：出问题时有据可查（以前 50 处 catch{} 把异常吞了，什么都看不见）----------
@@ -8938,6 +14298,39 @@ static class Log
             if (!File.Exists(FilePath)) return "（暂无日志：没有审批记录、没有异常）";
             string s = File.ReadAllText(FilePath, Encoding.UTF8);
             return s.Length > 0 ? s : "（日志为空）";
+        }
+        catch (Exception ex) { return "（读取日志失败：" + ex.Message + "）"; }
+    }
+
+    // 只读日志末尾若干字节（设置页"运行日志"用，2026-10-16）。
+    // 为什么不全读：日志可以很大，整文件塞进 TextBox 再整块替换 = 整屏重排，
+    // 而且每次都把用户的滚动位置顶到底部（用户报的"日志刷新频繁重绘、还带着闪烁"）。
+    public static string ReadTail(int maxBytes)
+    {
+        try
+        {
+            if (!File.Exists(FilePath)) return "（暂无日志：没有审批记录、没有异常）";
+            using (FileStream fs = new FileStream(FilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                long len = fs.Length;
+                if (len <= 0) return "（日志为空）";
+                long start = len > maxBytes ? len - maxBytes : 0;
+                fs.Seek(start, SeekOrigin.Begin);
+                byte[] buf = new byte[len - start];
+                int read = fs.Read(buf, 0, buf.Length);
+                string s = Encoding.UTF8.GetString(buf, 0, read);
+                // 日志是带 BOM 的 UTF-8（File.AppendAllText 新建时写的），而 ReadAllText 会剥掉；
+                // 从字节流读时必须自己剥，否则设置页会多一个不可见的 U+FEFF，长度断言也会差 1。
+                if (s.Length > 0 && s[0] == '\uFEFF') s = s.Substring(1);
+                if (start > 0)
+                {
+                    // 从中间切进去可能落在半个字符/半行上：丢掉第一个不完整行
+                    int nl = s.IndexOf('\n');
+                    if (nl >= 0) s = s.Substring(nl + 1);
+                    s = "…（只显示最后 " + (maxBytes / 1024) + " KB）\n" + s;
+                }
+                return s.Length > 0 ? s : "（日志为空）";
+            }
         }
         catch (Exception ex) { return "（读取日志失败：" + ex.Message + "）"; }
     }
@@ -9537,8 +14930,10 @@ static class Jobs
         for (int i = all.Count - 1; i >= 0; i--)
         {
             BgJob j = all[i];
-            sb.Append("  · ").Append(j.id).Append("  ").Append(StateOf(j)).Append("  ")
-              .Append(Txt.Clip(j.name, 60)).Append('\n');
+            sb.Append("  · ").Append(j.id).Append("  ").Append(StateOf(j));
+            int kids = LiveChildCount(j);
+            if (kids > 0) sb.Append("  [子孙进程 ").Append(kids).Append(" 个]");
+            sb.Append("  ").Append(Txt.Clip(j.name, 60)).Append('\n');
         }
         return sb.ToString();
     }
@@ -9558,13 +14953,126 @@ static class Jobs
             if (!j.proc.HasExited)
             {
                 j.killed = true;
-                j.proc.Kill();
+                int pid = j.proc.Id;
+                // 必须杀整棵进程树：只 Kill 外壳的话，它派生的子进程（node/python…）会残留下来继续跑
+                Tools.KillTree(j.proc);
                 Log.Audit("后台任务·终止 · " + j.id + " · " + Txt.Clip(j.command, 120));
-                return "已结束后台任务 " + j.id + "（" + j.name + "）";
+                List<int> left = SurvivedChildren(pid);
+                if (left.Count > 0)
+                    return "已结束后台任务 " + j.id + "（" + j.name + "），但仍有 " + left.Count
+                         + " 个子孙进程未退出：" + string.Join(", ", left.ConvertAll(x => x.ToString()).ToArray());
+                return "已结束后台任务 " + j.id + "（" + j.name + "），进程树已清空";
             }
         }
         catch (Exception ex) { return "结束失败：" + ex.Message; }
         return "任务 " + j.id + " 早就结束了（" + StateOf(j) + "）";
+    }
+
+    // 还活着的子孙进程数（不看外壳自己是否已退出）
+    static int LiveChildCount(BgJob j)
+    {
+        try { return SurvivedChildren(j.proc.Id).Count; }
+        catch { return 0; }
+    }
+
+    // 兜底核对：taskkill 之后还有哪些子孙进程活着（按父进程关系遍历）
+    static List<int> SurvivedChildren(int rootPid)
+    {
+        List<int> alive = new List<int>();
+        try
+        {
+            Dictionary<int, List<int>> kids = new Dictionary<int, List<int>>();
+            foreach (Process p in Process.GetProcesses())
+            {
+                try
+                {
+                    int pid = p.Id;
+                    if (pid == rootPid) continue;
+                    int ppid = ParentPidOf(p);
+                    if (ppid <= 0) continue;
+                    if (!kids.ContainsKey(ppid)) kids[ppid] = new List<int>();
+                    kids[ppid].Add(pid);
+                }
+                catch { }
+            }
+            Queue<int> q = new Queue<int>();
+            q.Enqueue(rootPid);
+            while (q.Count > 0)
+            {
+                int cur = q.Dequeue();
+                if (!kids.ContainsKey(cur)) continue;
+                foreach (int k in kids[cur]) { alive.Add(k); q.Enqueue(k); }
+            }
+        }
+        catch { }
+        return alive;
+    }
+
+    // 取父进程 PID：走 kernel32 的 Toolhelp32 快照（build.cmd 没引用 System.Management，用不了 WMI）
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    static extern bool Process32First(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    static extern bool Process32Next(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool CloseHandle(IntPtr hObject);
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+    struct PROCESSENTRY32
+    {
+        public uint dwSize;
+        public uint cntUsage;
+        public uint th32ProcessID;
+        public IntPtr th32DefaultHeapID;
+        public uint th32ModuleID;
+        public uint cntThreads;
+        public uint th32ParentProcessID;
+        public int pcPriClassBase;
+        public uint dwFlags;
+        [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string szExeFile;
+    }
+
+    // 懒加载的 pid → ppid 映射，避免每个进程都做一次快照
+    static Dictionary<int, int> _ppidCache = null;
+    static DateTime _ppidCacheAt = DateTime.MinValue;
+
+    static Dictionary<int, int> PpidMap()
+    {
+        if (_ppidCache != null && (DateTime.Now - _ppidCacheAt).TotalSeconds < 2) return _ppidCache;
+        Dictionary<int, int> map = new Dictionary<int, int>();
+        IntPtr snap = CreateToolhelp32Snapshot(0x00000002, 0); // TH32CS_SNAPPROCESS
+        if (snap == IntPtr.Zero || snap == new IntPtr(-1)) return map;
+        try
+        {
+            PROCESSENTRY32 pe = new PROCESSENTRY32();
+            pe.dwSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(PROCESSENTRY32));
+            if (Process32First(snap, ref pe))
+            {
+                do
+                {
+                    if (pe.th32ProcessID != 0) map[(int)pe.th32ProcessID] = (int)pe.th32ParentProcessID;
+                    pe.dwSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(PROCESSENTRY32));
+                } while (Process32Next(snap, ref pe));
+            }
+        }
+        catch { }
+        finally { try { CloseHandle(snap); } catch { } }
+        _ppidCache = map; _ppidCacheAt = DateTime.Now;
+        return map;
+    }
+
+    static int ParentPidOf(Process p)
+    {
+        try
+        {
+            Dictionary<int, int> map = PpidMap();
+            int ppid;
+            if (map.TryGetValue(p.Id, out ppid)) return ppid;
+        }
+        catch { }
+        return 0;
     }
 
     static string StateOf(BgJob j)
@@ -10045,6 +15553,26 @@ static class Upgrader
         }
     }
 }
+// 浮层的"点窗口别处就收"不能只靠 MainForm.OnMouseDown：鼠标点在 MsgBlock/TextBox/侧栏
+// 这些子控件上时，事件不会冒泡到 Form。用消息过滤器在点击落到主窗口任意子控件时收浮层，
+// 但排除 chip 自己（否则点一下先收再 toggle，看起来没反应）。
+class PopoverDismissFilter : IMessageFilter
+{
+    private readonly MainForm _f;
+    public PopoverDismissFilter(MainForm f) { _f = f; }
+
+    public bool PreFilterMessage(ref Message m)
+    {
+        if (m.Msg != 0x0201 && m.Msg != 0x0204) return false;
+        Control c = Control.FromHandle(m.HWnd);
+        if (c == null) return false;
+        if (c.FindForm() != _f) return false;          // 点在浮层/其它窗口上：不关
+        if (_f.IsPopoverAnchor(c)) return false;        // 点在 chip 上：交给 chip 自己 toggle
+        _f.ClosePopoversFromFilter();
+        return false;                                   // 放行这次点击
+    }
+}
+
 class MainForm : Form, IAgentUI
 {
     // ---------- 数据 ----------
@@ -10057,24 +15585,53 @@ class MainForm : Form, IAgentUI
     private bool sortDesc = true;
     private string filter = "";
     private float _dpi = 1f;
+    private PopoverDismissFilter _popFilter;
     private int stepNo = 0;
+
+    // 图片路径 ⇄ 气泡短标记。真路径留在 runner.Messages 里给模型看，
+    // 界面上只显示 [图片 xxx.png]；历史渲染和实时写入共用这一套。
+    public static class Attach
+    {
+        public static class Show
+        {
+            public static List<string> ImagePaths(string text)
+            {
+                return Vision.PathsIn(text);
+            }
+
+            public static string Text(string text)
+            {
+                if (string.IsNullOrEmpty(text)) return text;
+                foreach (string p in Vision.PathsIn(text))
+                    text = text.Replace(p, "[图片 " + Path.GetFileName(p) + "]");
+                return text;
+            }
+        }
+    }
     private int turnNo = 0;
     private readonly bool _openSettingsOnStart;
     private readonly ToolTip tips = new ToolTip();
 
     // ---------- 控件 ----------
-    private Panel side, main, contentHost, composerHost, statusBar, heroPanel;
-    private UiDrop mApp, mEdit, mView, mHelp;
-    private LogoMark mark, heroMark, avatar;
-    private Label lblLogo, lblUser, lblSec, lblTitle, lblBadge, lblStatus, lblStats;
-    private Label lblFoot, heroTitle, heroSub;
-    private PillLabel pill;
-    private UiButton btnNew, btnPlugins, hNew, hRefresh, hDir, hSettings;
+    private Panel side, main, contentHost, composerHost, heroPanel;
+    private UiDrop mFile, mEdit, mView, mHelp;
+    private Control heroMark;
+    private LogoMark avatar;
+    private Label lblUser, lblSec, lblTitle, lblBadge, lblStatus, lblStats;
+    private UiDrop sideTitle;          // 侧栏顶上那个「Ahz Scribe ⌄」（Codex 的「Codex ⌄」）
+    private Label heroTitle;
+    // 输入卡上面那三个药丸（项目 / 本地·云端 / 分支）——Codex 输入框上方那行
+    private UiButton pillProj, pillEnv, pillBranch;
+    private UiButton navNew, navPlugins, navExplore, navSettings, hNew, hRefresh, hDir, hSettings;
     private UiButton btnMin, btnMax, btnClose;
-    private UiIconButton btnSearch, btnSort, btnNewWs, btnUserDir;
-    private Dot dot, dotStatus;
+    private UiIconButton btnBack, btnFwd, btnSide, btnBell, btnSearch, btnUserDir;
+    private Dot dotStatus;
+    private bool sideOpen = true;            // 侧栏展开/收起（标题栏最左边那个方框按钮）
+    private readonly List<string> hist = new List<string>();   // 访问过的会话（← → 用）
+    private int histPos = -1;
+    private string gitBranch = "";           // 工作目录的 git 分支（不是仓库就留空）
     private FieldBox searchBox;
-    private TextBox txtSearch;
+    private UiEditor txtSearch;
     private bool searchOpen;
     private SidebarList list;
     private TabsBar tabs;
@@ -10082,10 +15639,17 @@ class MainForm : Form, IAgentUI
     private TranscriptView rtb;
     // 轨迹页用的是同一套渲染：思考正文 + 工具步骤在这里流式输出，同样不会整块重排
     private TranscriptView trace;
+    // 上一条工具调用是谁（下一条工具结果的折叠摘要行要报工具名，Write 里一路带过去）
+    private string lastToolName = "";
     private float zoom = 1f;
     private RoundedPanel inputCard;
-    private HintTextBox txtInput;
-    private const string PlaceholderText = "发消息或创建任务，/ 调用指令，@ 文件或对话";
+    private UiEditor txtInput;
+    // 输入框里显示 [图片 xxx.png] 短标记，发送前再还原成真实路径；否则一粘图就是一长串绝对路径。
+    private readonly Dictionary<string, string> _attachPaths =
+        new Dictionary<string, string>(StringComparer.Ordinal);
+    // 输入框里那行淡淡的提示。Codex 只写「随心输入」，长的那套挪到 tooltip 里去
+    private const string PlaceholderText = "随心输入";
+    private const string HintDetail = "发消息或创建任务，/ 调用指令，@ 文件或对话（Ctrl+V 可直接粘图片）";
     private UiButton btnSend;
     private UiDrop permChip, modeChip, btnPlus, planChip;
     private ModelChip cmbModel;
@@ -10094,12 +15658,9 @@ class MainForm : Form, IAgentUI
 
     // chip 上要显示的档位。第三步接上自绘滑块后改成读 config.effort
     private const string ChipEffort = "medium";
-    private List<UiButton> heroChips = new List<UiButton>();
-    private string[] heroTexts = new string[] { "总结这个项目", "找出所有 TODO", "解释一段代码", "写个批处理脚本" };
-
     // 设置窗口要用到的数据载体（主界面隐藏，只当数据源）
-    private TextBox txtCwd;
-    private CheckBox chkThink, chkAutoYes;
+    private UiEditor txtCwd;
+    private CheckBox chkThink, chkAutoYes, chkRemoteApproval;
     private UiDrop cmbCtx;
 
     // ---------- 字体 ----------
@@ -10109,7 +15670,11 @@ class MainForm : Form, IAgentUI
         _openSettingsOnStart = openSettingsOnStart;
         config = AgentConfig.Load();
         config.Migrate();
+        Theme.Apply(config.dark || Environment.GetEnvironmentVariable("AHZ_DARK") == "1");
         BuildUi();
+        // 点主窗口任意子控件都收浮层（不能只靠 Form.OnMouseDown：子控件不冒泡）
+        _popFilter = new PopoverDismissFilter(this);
+        Application.AddMessageFilter(_popFilter);
         LoadModels();
         ApplyModelInfo();
         LoadSessions();
@@ -10151,6 +15716,8 @@ class MainForm : Form, IAgentUI
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);
+        LoadGitBranch();          // 窗口这时候才有句柄，git 分支读回来才能更新界面
+        AutoFetchModelMeta();     // 顺手把"模型能力标签"补一次（后台线程，失败静默）
         // 启动自检的告警：状态栏放一句，鼠标停上去看全文（全文已经写进 Ahz错误日志.txt）
         if (StartupCheck.Warning.Length > 0)
         {
@@ -10158,8 +15725,45 @@ class MainForm : Form, IAgentUI
             lblStatus.ForeColor = Theme.Warn;
             tips.SetToolTip(lblStatus, StartupCheck.Warning);
         }
+        // 配置/会话读坏了不能只在日志里；状态栏给一句，鼠标停上去看全文。
+        string loadWarn = "";
+        if (!string.IsNullOrEmpty(AgentConfig.LastLoadError)) loadWarn += AgentConfig.LastLoadError;
+        if (!string.IsNullOrEmpty(SessionStore.LastLoadError))
+            loadWarn += (loadWarn.Length > 0 ? "\n" : "") + SessionStore.LastLoadError;
+        if (loadWarn.Length > 0)
+        {
+            if (StartupCheck.Warning.Length > 0) loadWarn = StartupCheck.Warning + "\n" + loadWarn;
+            lblStatus.Text = "⚠ " + Txt.FirstLine(loadWarn);
+            lblStatus.ForeColor = Theme.Warn;
+            tips.SetToolTip(lblStatus, loadWarn);
+        }
+        UiWatchdog.Start(this);        // 卡死取证：下次再卡就留日志
+        foreach (string a in Environment.GetCommandLineArgs())
+        {
+            if (a != "--selftest=browse") continue;
+            BeginInvoke(new MethodInvoker(delegate { RunBrowseSelfTest(); }));
+            break;
+        }
         if (_openSettingsOnStart)
             BeginInvoke(new MethodInvoker(delegate { OpenSettings(); }));
+        // --browser：启动就直接打开内置浏览器（我拿它做可复现的"开浏览器"验证，不用手点）
+        foreach (string a in Environment.GetCommandLineArgs())
+        {
+            if (a != "--browser" && !a.StartsWith("--url=")) continue;
+            string openUrl = a.StartsWith("--url=") ? a.Substring(6) : null;
+            BeginInvoke(new MethodInvoker(delegate
+            {
+                try
+                {
+                    ToggleBrowser();
+                    if (openUrl != null && browser != null) browser.Go(openUrl);
+                }
+                catch (Exception ex) { try { Log.Audit("--browser 打开失败：" + ex.Message); } catch { } }
+            }));
+            if (a == "--browser") break;
+        }
+        // 自绘按钮现在可 Tab，若不给初始焦点，开窗第一下焦点会落在标题栏按钮上（蓝框）。
+        try { txtInput.Focus(); } catch { }
     }
 
     // ============================ 界面搭建 ============================
@@ -10191,27 +15795,39 @@ class MainForm : Form, IAgentUI
         BuildTranscriptFonts();
 
         // 只在设置窗口里出现的控件（主界面逻辑仍然会读写它们）
-        txtCwd = new TextBox();
+        txtCwd = new UiEditor();
         txtCwd.Text = config.cwd;
         chkThink = new CheckBox();
         chkThink.Checked = config.think;
         chkAutoYes = new CheckBox();
         chkAutoYes.Checked = config.auto_yes;
+        chkRemoteApproval = new CheckBox();
+        chkRemoteApproval.Checked = config.remote_approval;
+        chkRemoteApproval.CheckedChanged += delegate
+        {
+            config.remote_approval = chkRemoteApproval.Checked;
+            SaveConfig();
+        };
         cmbCtx = new UiDrop();
         cmbCtx.AddRange(new object[] { "2048", "4096", "8192", "16384", "32768" });
         cmbCtx.SelectedItem = config.num_ctx.ToString();
         cmbCtx.SelectedIndexChanged += delegate
         {
             int v;
-            if (int.TryParse(Convert.ToString(cmbCtx.SelectedItem), out v)) { config.num_ctx = v; config.Save(); }
+            if (int.TryParse(Convert.ToString(cmbCtx.SelectedItem), out v)) { config.num_ctx = v; SaveConfig(); }
         };
 
         SetPermMode(config.auto_yes, false);
 
         runner = new AgentRunner(config, this);
+        UpdatePlacePills();        // 输入卡上面那三颗药丸（项目 / 本地 · 云端 / 分支）
+        LoadGitBranch();
+        UpdateHistoryButtons();
+        UpdatePlanChip();
         LayoutUi();
         SyncWindowButtons();
         Resize += delegate { LayoutUi(); SyncWindowButtons(); };
+        Shown += delegate { Theme.DarkenTree(this); };
     }
 
     static float DpiFactor()
@@ -10243,33 +15859,58 @@ class MainForm : Form, IAgentUI
         // 注意：这一条不能做成子 Panel。窗口拖动靠 WM_NCHITTEST 返回 HTCAPTION，
         // 而鼠标压在子控件上时消息是发给子控件的，父窗口的 WndProc 根本收不到，
         // 结果就是"看起来是标题栏，但拖不动"。所以按钮直接挂在窗体上，条带背景由窗体自己画。
+        //
+        // 左边三个图标照 Codex 标题栏来：← → 是会话来回（就像浏览器前后退），方框是收起/展开侧栏。
 
-        mApp = MenuButton("应用");
-        mApp.Items.Add("新建会话");
-        mApp.Items.Add("选择工作目录…");
-        mApp.Items.Add("插件…");
-        mApp.Items.Add("导出交付记录…");
-        mApp.Items.Add("重启并升级（用 .new）…");
-        mApp.Items.Add("回滚这次改动（用快照）…");
-        mApp.Items.Add("设置…");
-        mApp.Items.Add("退出");
+        btnBack = TitleIcon("arrowLeft");
+        btnBack.Click += delegate { GoHistory(-1); };
+        tips.SetToolTip(btnBack, "回到上一个会话");
+
+        btnFwd = TitleIcon("arrowRight");
+        btnFwd.Click += delegate { GoHistory(1); };
+        tips.SetToolTip(btnFwd, "回到下一个会话");
+
+        btnSide = TitleIcon("panel");
+        btnSide.Click += delegate { ToggleSidebar(); };
+        tips.SetToolTip(btnSide, "收起 / 展开侧栏");
+
+        mFile = MenuButton("文件");
+        mFile.Items.Add(new MenuItem2("新建会话", "Ctrl+N"));
+        mFile.Items.Add(new MenuItem2("选择工作目录…", "Ctrl+O"));
+        mFile.Items.Add(new MenuItem2("插件…", ""));
+        mFile.Items.Add(new MenuItem2("导出交付记录…", ""));
+        mFile.Items.Add(new MenuItem2("重启并升级（用 .new）…", ""));
+        mFile.Items.Add(new MenuItem2("回滚这次改动（用快照）…", ""));
+        mFile.Items.Add(new MenuItem2("关闭窗口", "Ctrl+W"));
 
         mEdit = MenuButton("编辑");
-        mEdit.Items.Add("复制全部对话");
-        mEdit.Items.Add("清空当前对话");
+        mEdit.Items.Add(new MenuItem2("复制全部对话", "Ctrl+Shift+C"));
+        mEdit.Items.Add(new MenuItem2("清空当前对话", ""));
+        mEdit.Items.Add(new MenuItem2("设置…", "Ctrl+,"));
 
         mView = MenuButton("视图");
-        mView.Items.Add("放大字号");
-        mView.Items.Add("缩小字号");
-        mView.Items.Add("重置字号");
-        mView.Items.Add("显示对话");
-        mView.Items.Add("显示轨迹");
+        mView.Items.Add(new MenuItem2("放大字号", "Ctrl+="));
+        mView.Items.Add(new MenuItem2("缩小字号", "Ctrl+-"));
+        mView.Items.Add(new MenuItem2("重置字号", "Ctrl+0"));
+        // 长内容折叠的批量入口（对话区和轨迹页一起处理）
+        mView.Items.Add(new MenuItem2("全部展开长内容", ""));
+        mView.Items.Add(new MenuItem2("全部收起长内容", ""));
+        mView.Items.Add(new MenuItem2("显示对话", "Ctrl+1"));        mView.Items.Add(new MenuItem2("显示轨迹", "Ctrl+2"));
+        mView.Items.Add(new MenuItem2("内置浏览器", "Ctrl+Shift+B"));
+        mView.Items.Add(new MenuItem2("展开 / 收起侧栏", "Ctrl+B"));
+        mView.Items.Add(new MenuItem2("会话：新的在前", ""));
+        mView.Items.Add(new MenuItem2("会话：旧的在前", ""));
+        mView.Items.Add(new MenuItem2(config.dark ? "切换浅色模式" : "切换暗色模式", ""));
 
         mHelp = MenuButton("帮助");
-        mHelp.Items.Add("使用说明");
-        mHelp.Items.Add("关于 Ahz Scribe");
+        mHelp.Items.Add(new MenuItem2("使用说明", ""));
+        mHelp.Items.Add(new MenuItem2("显示键盘快捷键", "Ctrl+/"));
+        mHelp.Items.Add(new MenuItem2("关于 Ahz Scribe", ""));
 
-        Controls.Add(mApp);
+        Controls.Add(btnBack);
+        Controls.Add(btnFwd);
+        Controls.Add(btnSide);
+        Controls.Add(mFile);
         Controls.Add(mEdit);
         Controls.Add(mView);
         Controls.Add(mHelp);
@@ -10295,6 +15936,19 @@ class MainForm : Form, IAgentUI
         Controls.Add(btnClose);
     }
 
+    // 标题栏左边那种「只有图标、没有底色」的小按钮
+    UiIconButton TitleIcon(string icon)
+    {
+        UiIconButton b = new UiIconButton(icon);
+        b.IconSize = 15;
+        b.IconWeight = 1.5f;
+        b.IconColor = Theme.FgMid;
+        b.BackColor = Theme.Chrome;
+        b.HoverColor = Theme.Hover;
+        b.Radius = Theme.RadMenu;
+        return b;
+    }
+
     UiButton WindowButton(string icon, bool close)
     {
         UiButton b = new UiButton();
@@ -10303,6 +15957,7 @@ class MainForm : Form, IAgentUI
         b.IconWeight = 1.3f;
         b.Text = "";
         b.Radius = 0;
+        b.BackColor = Theme.Chrome;      // 标题栏是浅灰的，窗口按钮得跟它同色
         b.FillColor = Theme.Clear;
         b.HoverColor = close ? Color.FromArgb(232, 17, 35) : Theme.Hover;
         b.IconColor = Theme.Clear;
@@ -10318,10 +15973,13 @@ class MainForm : Form, IAgentUI
         b.Text = text;
         b.FillColor = Theme.Clear;
         b.HoverColor = Theme.Hover;
-        b.TextColor = Theme.FgMid;
-        b.Radius = 7;
-        b.Font = Theme.F(9.5f);
-        b.Padding = new Padding(10, 0, 8, 0);
+        b.TextColor = Theme.Fg;
+        b.Radius = Theme.RadMenu;
+        b.BackColor = Theme.Chrome;      // 同上：菜单按钮底就是标题栏那块浅灰
+        // 字号是从用户的 Codex 截图上量出来的：「文件」两个字墨迹宽 40 物理像素 → 9 磅
+        b.Font = Theme.F(9f);
+        b.Padding = new Padding(10, 0, 10, 0);
+        b.ShowCaret = false;              // Codex 的菜单标题后面没有小三角
         b.ItemChosen += delegate(object s, EventArgs e) { MenuAction(Convert.ToString(s)); };
         return b;
     }
@@ -10335,60 +15993,68 @@ class MainForm : Form, IAgentUI
         side.Paint += delegate(object s, PaintEventArgs e)
         {
             using (Pen p = new Pen(Theme.Line, 1f))
+            {
                 e.Graphics.DrawLine(p, side.Width - 1, 0, side.Width - 1, side.Height);
+                // 底部那一行（头像 + 用户名）上面一条细线，Codex 侧栏底也是这样分的
+                using (Pen p2 = new Pen(Theme.LineSoft, Theme.Pxf(1f)))
+                    e.Graphics.DrawLine(p2, 0, side.Height - D(72), side.Width - 1, side.Height - D(72));
+            }
         };
 
-        mark = new LogoMark();
-        mark.BackColor = Theme.Side;
-        side.Controls.Add(mark);
+        // 顶上这一行：产品名 + 小三角 + 通知 / 搜索（Codex 侧栏顶上就是「Codex ⌄ 🔔 🔍」）
+        sideTitle = new UiDrop();
+        sideTitle.KeepText = true;
+        sideTitle.Text = "Ahz Scribe";
+        sideTitle.ShowCaret = true;
+        sideTitle.Align = ContentAlignment.MiddleLeft;
+        sideTitle.FillColor = Theme.Clear;
+        sideTitle.HoverColor = Theme.Hover;      // Codex 那个三角也是悬停才亮
+        sideTitle.TextColor = Theme.Fg;
+        sideTitle.Radius = Theme.RadRow;
+        sideTitle.Font = Theme.FB(11.5f);        // 参考图「Codex」标题的高度换算过来约 11.5 磅
+        sideTitle.Padding = new Padding(Theme.Sp4, 0, Theme.Sp8, 0);
+        sideTitle.BackColor = Theme.Side;
+        sideTitle.Items.Add(new MenuItem2("设置…", "Ctrl+,"));
+        sideTitle.Items.Add(new MenuItem2("使用说明", ""));
+        sideTitle.Items.Add(new MenuItem2("显示键盘快捷键", "Ctrl+/"));
+        sideTitle.Items.Add(new MenuItem2("关于 Ahz Scribe", ""));
+        sideTitle.ItemChosen += delegate(object s, EventArgs e) { MenuAction(Convert.ToString(s)); };
+        tips.SetToolTip(sideTitle, "设置 / 使用说明 / 关于");
+        side.Controls.Add(sideTitle);
 
-        lblLogo = new Label();
-        lblLogo.Text = "Ahz Scribe";
-        lblLogo.Font = Theme.FB(12.5f);
-        lblLogo.ForeColor = Theme.Fg;
-        lblLogo.AutoSize = true;
-        lblLogo.BackColor = Theme.Side;
-        side.Controls.Add(lblLogo);
+        btnBell = new UiIconButton("bell");
+        btnBell.IconSize = 15;
+        btnBell.BackColor = Theme.Side;
+        btnBell.Click += delegate { ShowRecentLog(); };
+        tips.SetToolTip(btnBell, "通知：最近的错误与警告");
+        side.Controls.Add(btnBell);
 
-        pill = new PillLabel();
-        pill.Text = "LOCAL";
-        pill.BackColor = Theme.Side;
-        side.Controls.Add(pill);
-        pill.BringToFront();
+        // 导航（Codex 那一列：新聊天 / 插件 / 探索）
+        navNew = NavRow("newchat", "新聊天");
+        navNew.Click += delegate { NewSession(); };
+        tips.SetToolTip(navNew, "新聊天");
+        side.Controls.Add(navNew);
 
-        btnNew = new UiButton();
-        btnNew.Text = "新会话";
-        btnNew.Icon = "plus";
-        btnNew.IconSize = 15;
-        btnNew.IconGap = 8;
-        btnNew.FillColor = Color.White;
-        btnNew.HoverColor = Theme.Hover;
-        btnNew.BorderColor = Theme.Line;
-        btnNew.Radius = 10;
-        btnNew.Font = Theme.F(10f);
-        btnNew.Click += delegate { NewSession(); };
-        side.Controls.Add(btnNew);
+        navPlugins = NavRow("plug", "插件");
+        navPlugins.Click += delegate { OpenPlugins(); };
+        tips.SetToolTip(navPlugins, "插件：给 agent 加工具");
+        side.Controls.Add(navPlugins);
 
-        // 「插件」：就在新会话下面（原来放设置的位置）
-        btnPlugins = new UiButton();
-        btnPlugins.Text = "插件";
-        btnPlugins.Icon = "plug";
-        btnPlugins.IconSize = 16;
-        btnPlugins.Align = ContentAlignment.MiddleLeft;
-        btnPlugins.Padding = new Padding(12, 0, 0, 0);
-        btnPlugins.FillColor = Theme.Clear;
-        btnPlugins.HoverColor = Theme.Hover;
-        btnPlugins.TextColor = Theme.Fg;
-        btnPlugins.Font = Theme.F(9.5f);
-        btnPlugins.Click += delegate { OpenPlugins(); };
-        tips.SetToolTip(btnPlugins, "插件：给 agent 加工具");
-        side.Controls.Add(btnPlugins);
+        navExplore = NavRow("dots", "探索");
+        navExplore.Click += delegate { OpenPluginMarket(); };
+        tips.SetToolTip(navExplore, "探索：去插件市场看看有什么能装");
+        side.Controls.Add(navExplore);
+
+        navSettings = NavRow("gear", "设置");
+        navSettings.Click += delegate { OpenSettings(); };
+        tips.SetToolTip(navSettings, "设置（模型、权限、外观）");
+        side.Controls.Add(navSettings);
 
         lblSec = new Label();
-        lblSec.Text = "工作区";
+        lblSec.Text = "项目";
         lblSec.ForeColor = Theme.FgDim;
         lblSec.BackColor = Theme.Side;
-        lblSec.Font = Theme.F(9f);
+        lblSec.Font = Theme.F(9.5f);
         lblSec.AutoSize = true;
         side.Controls.Add(lblSec);
 
@@ -10399,23 +16065,9 @@ class MainForm : Form, IAgentUI
         tips.SetToolTip(btnSearch, "搜索会话");
         side.Controls.Add(btnSearch);
 
-        btnSort = new UiIconButton("sort");
-        btnSort.IconSize = 15;
-        btnSort.BackColor = Theme.Side;
-        btnSort.Click += delegate { sortDesc = !sortDesc; RefreshSessionList(); };
-        tips.SetToolTip(btnSort, "切换排序方式");
-        side.Controls.Add(btnSort);
-
-        btnNewWs = new UiIconButton("plus");
-        btnNewWs.IconSize = 15;
-        btnNewWs.BackColor = Theme.Side;
-        btnNewWs.Click += delegate { NewSession(); };
-        tips.SetToolTip(btnNewWs, "新建会话");
-        side.Controls.Add(btnNewWs);
-
         searchBox = new FieldBox(false);
         searchBox.Visible = false;
-        txtSearch = (TextBox)searchBox.Inner;
+        txtSearch = (UiEditor)searchBox.Inner;
         txtSearch.TextChanged += delegate { filter = txtSearch.Text; RefreshSessionList(); };
         txtSearch.KeyDown += delegate(object s, KeyEventArgs e)
         {
@@ -10448,25 +16100,241 @@ class MainForm : Form, IAgentUI
         tips.SetToolTip(btnUserDir, "选择工作目录");
         side.Controls.Add(btnUserDir);
 
-        dot = new Dot();
-        dot.DotColor = Theme.Ok;
-        dot.BackColor = Theme.Side;
-        side.Controls.Add(dot);
-
-        lblFoot = new Label();
-        lblFoot.Text = ProjectName(config.cwd) + "  ·  " + config.cwd;
-        lblFoot.ForeColor = Theme.FgFaint;
-        lblFoot.BackColor = Theme.Side;
-        lblFoot.Font = Theme.F(8.2f);
-        lblFoot.AutoSize = false;
-        lblFoot.TextAlign = ContentAlignment.MiddleLeft;
-        lblFoot.AutoEllipsis = true;
-        lblFoot.Cursor = Cursors.Hand;
-        lblFoot.Click += delegate { PickFolder(); };
-        side.Controls.Add(lblFoot);
+        // 底下一行只留「头像 + 用户名 + 换工作目录」——工作目录本身挪到输入卡上面的药丸里了
+        // （Codex 就是这么摆的：项目名在输入框上方那颗药丸上）
     }
 
     // ---------- 右侧主区 ----------
+
+    // 侧栏里那种「只有悬停才亮」的导航行（Codex 的 新聊天 / 插件 / 探索 就是这德行）
+    UiButton NavRow(string icon, string text)
+    {
+        UiButton b = new UiButton();
+        b.Text = text;
+        b.Icon = icon;
+        b.IconSize = 14;
+        b.IconGap = 10;
+        b.IconColor = Theme.FgMid;
+        b.Align = ContentAlignment.MiddleLeft;
+        b.Padding = new Padding(Theme.Sp8, 0, 0, 0);
+        b.FillColor = Theme.Clear;
+        b.HoverColor = Theme.Hover;
+        b.TextColor = Theme.Fg;
+        b.Radius = 8;
+        b.Font = Theme.F(9.5f);
+        return b;
+    }
+
+    // 收起 / 展开侧栏（标题栏最左边那个方框按钮，或者 Ctrl+B）
+    // 输入卡上面那三颗药丸（项目 / 本地·云端 / 分支）：图标 + 文字，没有底色
+    UiButton PlacePill(string icon)
+    {
+        UiButton b = new UiButton();
+        b.Icon = icon;
+        b.IconSize = 14;
+        b.IconGap = 8;
+        b.IconColor = Theme.FgDim;
+        b.Align = ContentAlignment.MiddleLeft;
+        b.Padding = new Padding(Theme.Sp4, 0, Theme.Sp8, 0);
+        b.FillColor = Theme.Clear;
+        b.HoverColor = Theme.Hover;
+        b.TextColor = Theme.FgMid;
+        b.Radius = Theme.RadRow;
+        b.Font = Theme.F(9.5f);
+        // 药丸是摆在灰底那条上的：底色必须跟"井"一个色，不然自绘的按钮会糊出一个个白方块
+        b.BackColor = Theme.Well;
+        return b;
+    }
+
+    void ToggleSidebar()
+    {
+        sideOpen = !sideOpen;
+        if (side != null) side.Visible = sideOpen;
+        LayoutUi();
+        if (lblStatus != null) lblStatus.Text = sideOpen ? "侧栏已展开" : "侧栏已收起（Ctrl+B 可以再叫出来）";
+    }
+
+    // ← → 两个箭头：在"访问过的会话"里来回走，跟浏览器前后退一个意思
+    void GoHistory(int delta)
+    {
+        int n = histPos + delta;
+        if (n < 0 || n >= hist.Count) return;
+        histPos = n;
+        LoadSessionById(hist[n], false);
+        UpdateHistoryButtons();
+    }
+
+    void PushHistory(string id)
+    {
+        if (id == null || id.Length == 0) return;
+        if (histPos >= 0 && histPos < hist.Count && hist[histPos] == id) return;
+        while (hist.Count > histPos + 1) hist.RemoveAt(hist.Count - 1);   // 往前走了，前面的记录作废
+        hist.Add(id);
+        histPos = hist.Count - 1;
+        UpdateHistoryButtons();
+    }
+
+    void UpdateHistoryButtons()
+    {
+        if (btnBack != null) { btnBack.Enabled = histPos > 0; btnBack.Invalidate(); }
+        if (btnFwd != null)
+        {
+            btnFwd.Enabled = histPos >= 0 && histPos < hist.Count - 1;
+            btnFwd.Invalidate();
+        }
+    }
+
+    // 「探索」= 去插件市场看看有什么能装（插件窗口里的那套安装/市场界面）
+    void OpenPluginMarket()
+    {
+        try
+        {
+            using (PluginInstallForm dlg = new PluginInstallForm(config,
+                delegate(string installedPath)
+                {
+                    if (runner != null) runner.ReloadTools();
+                    lblStatus.Text = "已装插件：" + Path.GetFileName(installedPath);
+                }))
+                dlg.ShowDialog(this);
+            SaveConfig();
+            if (runner != null) runner.ReloadTools();
+        }
+        catch (Exception ex)
+        {
+            Log.Swallow(ex, "打开插件市场");
+            UiMsg.Show(this, "插件市场没打开：" + ex.Message, "探索", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    // 铃铛：把最近的错误/警告拿出来给人看（不是假装有个通知中心）
+    void ShowRecentLog()
+    {
+        string tail = "";
+        int shown = 0;
+        try
+        {
+            if (File.Exists(Log.FilePath))
+            {
+                string[] all = File.ReadAllLines(Log.FilePath, Encoding.UTF8);
+                int n = Math.Min(24, all.Length);
+                shown = n;
+                string[] last = new string[n];
+                Array.Copy(all, all.Length - n, last, 0, n);
+                tail = string.Join("\n", last);
+            }
+        }
+        catch (Exception ex) { Log.Swallow(ex, "读日志尾巴"); }
+
+        string msg = StartupCheck.Warning.Length > 0
+            ? "启动自检：\n" + StartupCheck.Warning + "\n\n"
+            : "";
+        msg += tail.Length > 0
+            ? "最近 " + shown + " 行日志（" + Log.FilePath + "）：\n\n" + tail
+            : "没有错误日志 —— 目前一切正常。";
+        UiMsg.Show(this, msg, "通知", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    // 输入卡上方那三个药丸：项目 / 本地·云端 / 分支
+    void UpdatePlacePills()
+    {
+        if (pillProj == null) return;
+        Provider p = config.Current();
+        string proj = ProjectName(config.cwd);
+        if (pillProj.Text != proj) pillProj.Text = proj;
+        tips.SetToolTip(pillProj, "工作目录：" + config.cwd + "（点一下换一个）");
+
+        string env = (p != null && p.id != null && p.id.IndexOf("ollama", StringComparison.OrdinalIgnoreCase) >= 0)
+            ? "本地" : "云端";
+        if (pillEnv.Text != env) pillEnv.Text = env;
+        tips.SetToolTip(pillEnv, "当前走的是 " + (p == null ? "?" : p.name) + " · " + config.model);
+        if (heroTitle != null) heroTitle.Text = HeroText();     // 首屏那句「…在 <项目名> 中构建什么？」跟着走
+
+        string br = gitBranch == null ? "" : gitBranch;
+        if (pillBranch.Text != br) pillBranch.Text = br;
+        tips.SetToolTip(pillBranch, br.Length == 0 ? "这个工作目录不是 git 仓库" : "git 分支：" + br);
+        pillBranch.Visible = br.Length > 0;
+    }
+
+    // 启动后悄悄补一次"模型能力标签"：接口在 /models 里给的显示名（DeepSeek-V4.1-Flash）、
+    // 能不能看图、支持的档位、上下文长度 —— 只有拉过一次才有。以前全靠用户记得去设置里点按钮，
+    // 结果 chip 一直显示 deepseek-flash 这种生 id（用户 2026-10-15 对比截图时发现的）。
+    // 放在后台线程 + 短超时，失败就静默（设置里那个手动按钮照旧）。
+    void AutoFetchModelMeta()
+    {
+        Provider p = config.Current();
+        if (p == null || p.models == null || p.models.Count == 0) return;
+        if (p.model_meta != null && p.model_meta.Count > 0) return;      // 拉过了就别再打扰接口
+        ThreadPool.QueueUserWorkItem(delegate(object st)
+        {
+            List<ModelMeta> infos = null;
+            try
+            {
+                ILlm llm = LlmFactory.Create(p, "");
+                infos = llm.ListModelInfos();
+                llm.Close();
+            }
+            catch { infos = null; }
+            if (infos == null || infos.Count == 0) return;
+            try
+            {
+                BeginInvoke(new MethodInvoker(delegate
+                {
+                    foreach (ModelMeta mi in infos) p.SetMeta(mi);
+                    SaveConfig();
+                    LoadModels();
+                    UpdatePlacePills();
+                    Write(OutKind.Info, "· 已从接口补上模型能力（显示名 / 看图 / 档位）：共 " + infos.Count + " 个\n");
+                }));
+            }
+            catch { }
+        });
+    }
+
+    // 读一眼工作目录的 git 分支（不是仓库 / 没装 git 就留空，药丸自动藏起来）
+    void LoadGitBranch()
+    {
+        string dir = config.cwd;
+        gitBranch = "";
+        UpdatePlacePills();
+        ThreadPool.QueueUserWorkItem(delegate(object st)
+        {
+            string br = "";
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("git", "rev-parse --abbrev-ref HEAD");
+                psi.WorkingDirectory = dir;
+                psi.UseShellExecute = false;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                psi.CreateNoWindow = true;
+                using (Process p = Process.Start(psi))
+                {
+                    string outp = p.StandardOutput.ReadToEnd();
+                    p.StandardError.ReadToEnd();
+                    if (!p.WaitForExit(4000)) { try { p.Kill(); } catch { } }
+                    if (p.HasExited && p.ExitCode == 0) br = outp.Trim();
+                }
+            }
+            catch { br = ""; }
+            try
+            {
+                // 构造函数里调这一句时窗口句柄还没建出来，BeginInvoke 会抛 —— 那就等 OnShown 再补一次
+                if (!IsHandleCreated) return;
+                BeginInvoke(new MethodInvoker(delegate
+                {
+                    gitBranch = br;
+                    UpdatePlacePills();
+                    LayoutUi();
+                }));
+            }
+            catch { }
+        });
+    }
+
+    // 内置浏览器：盖在对话区上的一层（输入条不遮，边看网页边追问）
+    Panel browserHost;
+    AhzBrowser browser;
+    bool browserOpen;
 
     void BuildMain()
     {
@@ -10475,26 +16343,33 @@ class MainForm : Form, IAgentUI
 
         lblTitle = new Label();
         lblTitle.Text = "新会话";
-        lblTitle.Font = Theme.FB(12.5f);
+        lblTitle.Font = Theme.FB(9.5f);
         lblTitle.ForeColor = Theme.Fg;
-        lblTitle.AutoSize = true;
+        // 不 AutoSize：标题再长也只能占"页签右侧到四个图标之间"这一条，
+        // 否则最小窗口下会压住 TabsBar（2026-10-18 验收：重叠 59px）。
+        lblTitle.AutoSize = false;
+        lblTitle.AutoEllipsis = true;
+        lblTitle.TextAlign = ContentAlignment.MiddleRight;
         lblTitle.BackColor = Theme.Bg;
         main.Controls.Add(lblTitle);
 
         modeChip = new UiDrop();
         modeChip.Icon = "lock";
         modeChip.IconSize = 13;
-        modeChip.IconGap = 6;
+        modeChip.IconGap = Theme.Sp8;
         modeChip.FillColor = Theme.Clear;
         modeChip.HoverColor = Theme.Hover;
         modeChip.TextColor = Theme.FgDim;
-        modeChip.Radius = 8;
-        modeChip.Font = Theme.F(9f);
-        modeChip.Padding = new Padding(8, 0, 10, 0);
+        modeChip.Radius = Theme.RadRow;
+        modeChip.Font = Theme.F(9.5f);
+        modeChip.Padding = new Padding(Theme.Sp8, 0, Theme.Sp12, 0);
         // 顶栏这个也走自绘的三档浮层（和输入条那个同一套）
         modeChip.KeepText = true;
         modeChip.Text = Perm.Label(config.permission);
         modeChip.Click += delegate { TogglePermPopover(modeChip); };
+        // 顶栏这个权限 chip 不再摆了：权限现在只在输入条左下角显示（Codex 就是这样），
+        // 控件留着是因为权限浮层还要用它当锚点（点顶栏那个位置也能弹）。
+        modeChip.Visible = false;
         main.Controls.Add(modeChip);
 
         lblBadge = new Label();
@@ -10504,6 +16379,7 @@ class MainForm : Form, IAgentUI
         lblBadge.BackColor = Theme.Bg;
         lblBadge.AutoSize = true;
         lblBadge.TextChanged += delegate { LayoutUi(); };
+        lblBadge.Visible = false;      // 「模型 · 名称」现在显示在输入条右下角的 chip 上
         main.Controls.Add(lblBadge);
 
         hNew = new UiIconButton("plus");
@@ -10548,46 +16424,59 @@ class MainForm : Form, IAgentUI
         contentHost.Controls.Add(rtb);
 
         trace = new TranscriptView();
+        trace.IsTrace = true;        // 轨迹页：思考默认收起（对话区那套 hide_thinking 逻辑不动）
         trace.Visible = false;
         contentHost.Controls.Add(trace);
 
         BuildHero();
         contentHost.Controls.Add(heroPanel);
+
+        // 内置浏览器（Alt+ 那一层）：默认收起，Ctrl+Shift+B 或菜单「查看」里开
+        browserHost = new Panel();
+        browserHost.BackColor = Theme.Bg;
+        browserHost.Visible = false;
+        main.Controls.Add(browserHost);
+        browser = new AhzBrowser();
+        browser.tipsRef = tips;
+        browser.Dock = DockStyle.Fill;
+        browser.AskAgent = delegate(string url) { AskAgentAboutPage(url); };
+        browser.SendToInput = delegate(string text) { FillInputWith(text); };
+        browserHost.Controls.Add(browser);
+
+        // 把面板交给助手那半边：browse_* 工具就是操作它（同一个人眼前的那份）
+        BrowserHub.Panel = browser;
+        BrowserHub.ShowPanel = delegate
+        {
+            if (browserHost != null && !browserHost.Visible) ToggleBrowser();
+        };
         heroPanel.BringToFront();
 
         BuildComposer();
 
-        statusBar = new Panel();
-        statusBar.BackColor = Theme.Bg;
-        statusBar.Paint += delegate(object s, PaintEventArgs e)
-        {
-            using (Pen p = new Pen(Theme.LineSoft, 1f))
-                e.Graphics.DrawLine(p, 0, 0, statusBar.Width, 0);
-        };
-
+        // 状态不再占底部一整条横带（Codex 底下就是空的，卡片离窗口底 16px）：
+        // 小圆点 + 一句话挪到输入卡上面那行药丸的右边。
         dotStatus = new Dot();
         dotStatus.DotColor = Theme.Ok;
-        dotStatus.BackColor = Theme.Bg;
-        statusBar.Controls.Add(dotStatus);
+        dotStatus.BackColor = Theme.Well;
+        composerHost.Controls.Add(dotStatus);
 
         lblStatus = new Label();
         lblStatus.Text = "就绪";
         lblStatus.ForeColor = Theme.FgDim;
-        lblStatus.BackColor = Theme.Bg;
-        lblStatus.Font = Theme.F(8.6f);
+        lblStatus.BackColor = Theme.Well;
+        lblStatus.Font = Theme.F(9.5f);
         lblStatus.AutoSize = true;
-        statusBar.Controls.Add(lblStatus);
+        composerHost.Controls.Add(lblStatus);
 
         lblStats = new Label();
         lblStats.Text = "";
         lblStats.ForeColor = Theme.FgFaint;
         lblStats.BackColor = Theme.Bg;
-        lblStats.Font = Theme.F(8.6f);
+        lblStats.Font = Theme.F(8.5f);
         lblStats.AutoSize = true;
         lblStats.TextChanged += delegate { LayoutUi(); };
-        statusBar.Controls.Add(lblStats);
-
-        main.Controls.Add(statusBar);
+        lblStats.Visible = false;      // 「Ollama 本地 / qwen3.5:4b · 连接失败」这类信息进模型 chip 的 tooltip
+        composerHost.Controls.Add(lblStats);
     }
 
     void BuildHero()
@@ -10595,82 +16484,108 @@ class MainForm : Form, IAgentUI
         heroPanel = new Panel();
         heroPanel.BackColor = Theme.Bg;
 
-        heroMark = new LogoMark();
+        // Codex 首屏那个云朵标：浅灰描边，不填色、不带方块底
+        heroMark = new CloudMark();
         heroMark.BackColor = Theme.Bg;
         heroPanel.Controls.Add(heroMark);
 
         heroTitle = new Label();
-        heroTitle.Text = "我们应该在 Ahz Scribe 中做些什么？";
-        heroTitle.Font = Theme.F(19f);
+        heroTitle.Text = HeroText();
+        heroTitle.Font = Theme.F(20f);       // 参考图那句大字墨迹 712 物理像素宽 → 20 磅
         heroTitle.ForeColor = Theme.Fg;
         heroTitle.AutoSize = false;
         heroTitle.TextAlign = ContentAlignment.MiddleCenter;
         heroTitle.BackColor = Theme.Bg;
         heroPanel.Controls.Add(heroTitle);
+    }
 
-        heroSub = new Label();
-        heroSub.Text = "输入任务后回车；写文件和执行命令会先征求你的同意";
-        heroSub.Font = Theme.F(9.5f);
-        heroSub.ForeColor = Theme.FgDim;
-        heroSub.AutoSize = false;
-        heroSub.TextAlign = ContentAlignment.MiddleCenter;
-        heroSub.BackColor = Theme.Bg;
-        heroPanel.Controls.Add(heroSub);
-
-        for (int i = 0; i < heroTexts.Length; i++)
-        {
-            string t = heroTexts[i];
-            UiButton b = new UiButton();
-            b.Text = t;
-            b.Radius = 15;
-            b.Font = Theme.F(9f);
-            b.FillColor = Color.White;
-            b.HoverColor = Theme.Side;
-            b.BorderColor = Theme.Line;
-            b.Padding = new Padding(14, 0, 14, 0);
-            b.Click += delegate
-            {
-                txtInput.Text = t;
-                txtInput.SelectionStart = txtInput.TextLength;
-                txtInput.Focus();
-                UpdateSendButton();
-            };
-            heroPanel.Controls.Add(b);
-            heroChips.Add(b);
-        }
+    // 首屏大字：Codex 写的是「你想让我们在 <项目名> 中构建什么?」——项目名跟着工作目录走
+    string HeroText()
+    {
+        return "你想让我们在 " + ProjectName(config.cwd) + " 中构建什么？";
     }
 
     void BuildComposer()
     {
         composerHost = new Panel();
         composerHost.BackColor = Theme.Bg;
+        // 输入卡下面那块浅灰的「井」（Codex 的做法：卡片压在一块灰底上，
+        // 灰底比卡片略窄一点点、往上露出一条，项目/本地/分支三颗药丸就摆在那条上）
+        composerHost.Paint += delegate(object s, PaintEventArgs e)
+        {
+            if (inputCard == null) return;
+            Rectangle w = new Rectangle(
+                inputCard.Left - inputCard.InsetPx - D(1),
+                inputCard.Top - D(36),
+                inputCard.Width + (inputCard.InsetPx + D(1)) * 2,
+                composerHost.Height - inputCard.Top + D(36) + D(8));
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using (GraphicsPath p = Ui.Round(w, D(Theme.RadInput)))
+            using (SolidBrush b = new SolidBrush(Theme.Well)) e.Graphics.FillPath(b, p);
+        };
         main.Controls.Add(composerHost);
 
+        // 药丸：项目 / 本地·云端 / 分支（都是真的，点项目那颗可以换工作目录）
+        pillProj = PlacePill("folder");
+        pillProj.Click += delegate { PickFolder(); };
+        composerHost.Controls.Add(pillProj);
+
+        pillEnv = PlacePill("monitor");
+        pillEnv.Click += delegate { OpenSettings(); };
+        composerHost.Controls.Add(pillEnv);
+
+        pillBranch = PlacePill("branch");
+        pillBranch.Click += delegate { LoadGitBranch(); };
+        composerHost.Controls.Add(pillBranch);
+
         inputCard = new RoundedPanel();
-        inputCard.Radius = 16;
-        inputCard.Shadow = true;
-        inputCard.Inset = 5;
-        inputCard.Fill = Color.White;
+        inputCard.Radius = Theme.RadCard;      // 圆角吸附 RadCard（原 16）
+        // 不要阴影、也不要那圈浅色描边（用户 2026-10-15 指出层次太乱：灰影 → 白框 → 圆角框三层叠着）。
+        // RoundedPanel 的"阴影"其实是叠 5 层半透明圆角矩形，边缘是硬的，看着就是一圈灰框；
+        // 灰底上放一块白圆角已经够分层了。Shadow=false 时 InsetPx 自动变 0，子控件布局跟着铺满。
+        inputCard.Shadow = false;
+        inputCard.DrawBorder = false;
+        inputCard.Inset = 5;               // 留着：万一以后要把阴影加回来，留白还是对的
+        inputCard.Fill = Theme.Card;
         inputCard.BorderColor = Theme.Line;
         inputCard.BackColor = Theme.Bg;
         composerHost.Controls.Add(inputCard);
 
-        txtInput = new HintTextBox();
+        txtInput = new UiEditor();
         txtInput.Hint = PlaceholderText;
         txtInput.Multiline = true;
         txtInput.BorderStyle = BorderStyle.None;
-        txtInput.BackColor = Color.White;
+        txtInput.BackColor = Theme.Card;
         txtInput.ForeColor = Theme.Fg;
-        txtInput.Font = Theme.F(10.5f);
+        txtInput.Font = Theme.F(10f);
         txtInput.ScrollBars = ScrollBars.None;
+        tips.SetToolTip(txtInput, HintDetail);
         txtInput.TextChanged += delegate { UpdateSendButton(); };
         txtInput.KeyDown += delegate(object s, KeyEventArgs e)
         {
+            // Ctrl+V：剪贴板里是图片（或图片文件的副本）就先落盘，再把路径写进输入框。
+            // 文本框本身不认图片，不拦这一步就会"按了没反应"。
+            if (e.Control && e.KeyCode == Keys.V)
+            {
+                if (TryPasteImage()) { e.SuppressKeyPress = true; e.Handled = true; }
+                return;
+            }
             if (e.KeyCode == Keys.Enter && !e.Shift)
             {
                 e.SuppressKeyPress = true;
                 SendMessage();
             }
+        };
+        // 直接把图片文件拖进输入框（截图工具存盘后最常见的操作）
+        txtInput.AllowDrop = true;
+        txtInput.DragEnter += delegate(object s, DragEventArgs e)
+        {
+            if (HasImageDrop(e.Data)) e.Effect = DragDropEffects.Copy;
+        };
+        txtInput.DragDrop += delegate(object s, DragEventArgs e)
+        {
+            string[] imgs = ImagePathsFrom(e.Data);
+            if (imgs.Length > 0) AttachImages(imgs);
         };
         inputCard.Controls.Add(txtInput);
 
@@ -10678,11 +16593,14 @@ class MainForm : Form, IAgentUI
         btnPlus.KeepText = true;
         btnPlus.ShowCaret = false;
         btnPlus.Icon = "plus";
-        btnPlus.IconSize = 16;
-        btnPlus.FillColor = Theme.Chip;
-        btnPlus.HoverColor = Theme.ChipHover;
-        btnPlus.IconColor = Theme.FgMid;
-        btnPlus.Radius = 9;
+        btnPlus.IconSize = 15;
+        btnPlus.IconYOffset = 1.5f;
+        btnPlus.Align = ContentAlignment.MiddleCenter;
+        btnPlus.FillColor = Theme.Clear;
+        btnPlus.HoverColor = Theme.Hover;
+        btnPlus.IconColor = Theme.Fg;
+        btnPlus.Radius = Theme.RadRow;
+        btnPlus.Padding = new Padding(0);
         btnPlus.Text = "";
         btnPlus.Items.Add("选择工作目录…");
         btnPlus.Items.Add("清空当前对话");
@@ -10692,16 +16610,17 @@ class MainForm : Form, IAgentUI
         inputCard.Controls.Add(btnPlus);
 
         permChip = new UiDrop();
-        permChip.Icon = "lock";
-        permChip.IconSize = 13;
-        permChip.IconGap = 6;
-        permChip.FillColor = Theme.Chip;
-        permChip.HoverColor = Theme.ChipHover;
-        permChip.TextColor = Theme.FgMid;
-        permChip.Radius = 9;
-        permChip.Font = Theme.F(9f);
-        permChip.Padding = new Padding(10, 0, 10, 0);
-        permChip.ShowCaret = true;
+        permChip.Icon = "warnCircle";
+        permChip.IconSize = 14;
+        permChip.IconYOffset = 1f;
+        permChip.IconGap = 7;
+        permChip.FillColor = Theme.Clear;
+        permChip.HoverColor = Theme.Hover;
+        permChip.TextColor = Theme.PermWarn;
+        permChip.Radius = Theme.RadRow;
+        permChip.Font = Theme.F(9.5f);
+        permChip.Padding = new Padding(Theme.Sp4, 0, Theme.Sp12, 0);
+        permChip.ShowCaret = false;
         permChip.KeepText = true;                  // 文字自己刷，走 UpdatePermChip()
         permChip.Text = Perm.Label(config.permission);
         permChip.Click += delegate { TogglePermPopover(); };   // 自绘一列三档（Codex 那样）
@@ -10712,17 +16631,17 @@ class MainForm : Form, IAgentUI
         planChip.Icon = "eye";
         planChip.IconSize = 13;
         planChip.IconGap = 6;
-        planChip.FillColor = Theme.Chip;
-        planChip.HoverColor = Theme.ChipHover;
+        planChip.FillColor = Theme.Clear;
+        planChip.HoverColor = Theme.Hover;
         planChip.TextColor = Theme.FgDim;
-        planChip.Radius = 9;
-        planChip.Font = Theme.F(9f);
-        planChip.Padding = new Padding(10, 0, 10, 0);
+        planChip.Radius = Theme.RadRow;
+        planChip.Font = Theme.F(9.5f);
+        planChip.Padding = new Padding(Theme.Sp4, 0, Theme.Sp12, 0);
+        planChip.ShowCaret = false;
         planChip.KeepText = true;
         planChip.Click += delegate { TogglePlanMode(); };
         tips.SetToolTip(planChip, "计划模式：只调研、只出计划，不改文件（点一下切换）");
         inputCard.Controls.Add(planChip);
-        UpdatePlanChip();
 
         cmbModel = new ModelChip();
         cmbModel.SelectedIndexChanged += delegate { OnModelChanged(); };
@@ -10731,13 +16650,13 @@ class MainForm : Form, IAgentUI
 
         btnSend = new UiButton();
         btnSend.Icon = "send";
-        btnSend.IconSize = 18;
+        btnSend.IconSize = 14;
         btnSend.IconColor = Color.White;
         btnSend.IconWeight = 1.9f;
         btnSend.Text = "";
-        btnSend.Radius = 20;
-        btnSend.FillColor = Theme.AccentIdle;
-        btnSend.HoverColor = Theme.Accent;
+        btnSend.Radius = 14;                       // 28 直径的圆钮（Codex 那个深色 ↑）
+        btnSend.FillColor = Theme.SendIdle;
+        btnSend.HoverColor = Theme.SendOn;
         btnSend.BorderColor = Theme.Clear;
         btnSend.Click += delegate
         {
@@ -10758,68 +16677,92 @@ class MainForm : Form, IAgentUI
 
     void LayoutUi()
     {
-        if (side == null || ClientSize.Width < 200) return;
+        // 最小化那一瞬间客户区会被压到 237x39 这种怪尺寸，仍然 >200，于是以前会**真的按它排版**：
+        // side 高 = 39-56 = -17（被 WinForms 夹成 0）、main 宽 = 237-412 = -175（同样夹成 0）。
+        // 还原时靠再来一次 Resize 才能恢复 —— 万一那次 Resize 不触发（尺寸没变、或还原路径不同），
+        // 界面就停在"所有面板 0 尺寸"的状态，看着就是大片空白 + 控件点不到。
+        // 所以这里把阈值提到"真的能放下标题栏 + 一点内容"，退化尺寸一律不排。
+        if (side == null || ClientSize.Width < 200 || ClientSize.Height < D(37) + 100) return;
         int W = ClientSize.Width, H = ClientSize.Height;
-        side.SetBounds(0, D(40), D(288), H - D(40));
-        main.SetBounds(D(288), D(40), W - D(288), H - D(40));
+        // 外壳：顶上 37（Codex 量出来就是 37）是自绘标题栏，下面左侧栏 / 右主区
+        int chromeH = D(37);
+        side.Visible = sideOpen;
+        int sideW = sideOpen ? D(275) : 0;
+        side.SetBounds(0, chromeH, sideW, H - chromeH);
+        main.SetBounds(sideW, chromeH, W - sideW, H - chromeH);
 
-        int mx = D(16);
-        UiDrop[] menus = new UiDrop[] { mApp, mEdit, mView, mHelp };
+        // 标题栏左边三个：← → 会话来回、▯ 收起/展开侧栏
+        int tiw = D(24), tiy = (chromeH - tiw) / 2;
+        btnBack.SetBounds(D(10), tiy, tiw, tiw);
+        btnFwd.SetBounds(D(38), tiy, tiw, tiw);
+        btnSide.SetBounds(D(66), tiy, tiw, tiw);
+
+        int mx = D(112);
+        UiDrop[] menus = new UiDrop[] { mFile, mEdit, mView, mHelp };
         foreach (UiDrop b in menus)
         {
-            b.SetBounds(mx, D(7), b.PreferredWidth() + D(6), D(26));
-            mx = b.Right + D(2);
+            b.SetBounds(mx, D(5), b.PreferredWidth() + D(8), chromeH - D(10));
+            mx = b.Right + D(4);
         }
 
         // 右上角三个窗口按钮（贴边，和 Windows 11 一致）
-        int wbW = D(46), wbH = D(40);
+        int wbW = D(46), wbH = chromeH;
         btnClose.SetBounds(W - wbW, 0, wbW, wbH);
         btnMax.SetBounds(W - wbW * 2, 0, wbW, wbH);
         btnMin.SetBounds(W - wbW * 3, 0, wbW, wbH);
 
         // ---- 侧栏 ----
-        mark.SetBounds(D(18), D(16), D(26), D(26));
-        lblLogo.Location = new Point(D(52), D(19));
-        int pw = Ui.TextWidth(pill.Text, pill.Font) + D(14);
-        pill.SetBounds(D(52) + Ui.TextWidth(lblLogo.Text, lblLogo.Font) + D(10), D(22), pw, D(17));
-        btnNew.SetBounds(D(14), D(62), D(260), D(40));
-        btnPlugins.SetBounds(D(14), D(112), D(260), D(36));
+        if (sideOpen)
+        {
+            // 注意：侧栏里的坐标是"相对侧栏面板"的，侧栏自己被摆在标题栏下面（+37），
+            // 所以这里的数值都要比目标绝对位置少 37。
+            // 侧栏左内边距统一 Sp12（原来 11/14/15/17/8 五种），右内边距也统一 Sp12
+            sideTitle.SetBounds(D(Theme.Sp12), D(5), sideTitle.PreferredWidth() + D(6), D(30));
+            int hw = D(26), hy2 = D(Theme.Sp12);
+            btnSearch.SetBounds(sideW - D(Theme.Sp12) - hw, hy2, hw, hw);
+            btnBell.SetBounds(btnSearch.Left - D(Theme.Sp8) - hw, hy2, hw, hw);
 
-        lblSec.Location = new Point(D(20), D(166));
-        btnNewWs.SetBounds(D(248), D(158), D(28), D(26));
-        btnSort.SetBounds(D(218), D(158), D(28), D(26));
-        btnSearch.SetBounds(D(188), D(158), D(28), D(26));
-        searchBox.SetBounds(D(14), D(156), D(260), D(30));
+            int navY = D(38), navH = D(32);
+            UiButton[] navs = new UiButton[] { navNew, navPlugins, navExplore, navSettings };
+            for (int i = 0; i < navs.Length; i++)
+                navs[i].SetBounds(D(Theme.Sp12), navY + i * navH, sideW - D(Theme.Sp24), navH);
 
-        int listTop = D(196);
-        int listBottom = side.Height - D(96);
-        list.SetBounds(0, listTop, D(288), Math.Max(D(40), listBottom - listTop));
+            lblSec.Location = new Point(D(Theme.Sp24), navY + navs.Length * navH + D(Theme.Sp24));
+            searchBox.SetBounds(D(Theme.Sp12), lblSec.Top - D(Theme.Sp4), sideW - D(Theme.Sp24), D(30));
 
-        avatar.SetBounds(D(16), side.Height - D(56), D(24), D(24));
-        lblUser.SetBounds(D(48), side.Height - D(54), D(288) - D(48) - D(46), D(20));
-        btnUserDir.SetBounds(D(248), side.Height - D(56), D(28), D(26));
-        dot.SetBounds(D(18), side.Height - D(27), D(7), D(7));
-        lblFoot.SetBounds(D(32), side.Height - D(32), D(288) - D(48), D(18));
+            int listTop = navY + navs.Length * navH + D(50);
+            int listBottom = side.Height - D(84);
+            list.SetBounds(0, listTop, sideW, Math.Max(D(40), listBottom - listTop));
 
-        // ---- 顶栏 ----
-        int hy = D(13);
-        lblTitle.Location = new Point(D(24), hy + D(1));
-        modeChip.SetBounds(lblTitle.Right + D(12), hy,
-            D(30) + Ui.TextWidth(modeChip.Text, modeChip.Font) + D(20), D(28));
+            avatar.SetBounds(D(Theme.Sp16), side.Height - D(63), D(22), D(22));
+            lblUser.SetBounds(D(48), side.Height - D(62), sideW - D(48) - D(44), D(20));
+            btnUserDir.SetBounds(sideW - D(Theme.Sp12) - D(26), side.Height - D(65), D(26), D(26));
+        }
 
-        int rx = main.Width - D(18);
-        hSettings.SetBounds(rx - D(28), hy, D(28), D(28)); rx -= D(34);
-        hDir.SetBounds(rx - D(28), hy, D(28), D(28)); rx -= D(34);
-        hRefresh.SetBounds(rx - D(28), hy, D(28), D(28)); rx -= D(34);
-        hNew.SetBounds(rx - D(28), hy, D(28), D(28)); rx -= D(40);
-        lblBadge.Location = new Point(Math.Max(D(24), rx - lblBadge.Width), hy + D(6));
+        // ---- 主区顶上那一行：页签在左、会话名靠右、四个小图标最右 ----
+        int hy = D(7);
+        // 页签条只占左边一小段：它是整块不透明的，铺满整行会把右边那四个小图标盖掉
+        // （实测过：图标全在，就是点不到，因为压在页签条底下）。
+        tabs.SetBounds(0, hy, D(240), D(30));
+        int rxi = main.Width - D(Theme.Sp16);
+        UiButton[] hicons = new UiButton[] { hSettings, hDir, hRefresh, hNew };
+        for (int i = 0; i < hicons.Length; i++)
+        {
+            hicons[i].SetBounds(rxi - D(26), hy, D(26), D(26));
+            rxi -= D(30);
+        }
+        // 标题的左右边界：左边不能压 TabsBar，右边不能压四个小图标；放不下就省略号。
+        int iconsLeft = hNew.Left;
+        int titleMinX = tabs.Right + D(12);
+        int titleX = Math.Max(titleMinX, iconsLeft - D(10) - Ui.TextWidth(lblTitle.Text, lblTitle.Font));
+        lblTitle.SetBounds(titleX, hy + D(4), Math.Max(0, iconsLeft - D(8) - titleX), D(24));
 
-        tabs.SetBounds(0, D(54), main.Width, D(38));
-        int composerH = D(150);
-        int statusH = D(28);
-        contentHost.SetBounds(0, D(92), main.Width, Math.Max(D(60), main.Height - D(92) - composerH - statusH));
-        composerHost.SetBounds(0, main.Height - composerH - statusH, main.Width, composerH);
-        statusBar.SetBounds(0, main.Height - statusH, main.Width, statusH);
+        // ---- 内容区 + 输入卡 ----
+        int composerH = D(152);
+        contentHost.SetBounds(0, D(40), main.Width, Math.Max(D(60), main.Height - D(40) - composerH));
+        // 浏览器和对话区同位置（盖在上面），输入条不遮 —— 边看网页边追问
+        if (browserHost != null)
+            browserHost.SetBounds(0, D(40), main.Width, Math.Max(D(60), main.Height - D(40) - composerH));
 
         int colW = Math.Min(D(1040), Math.Max(D(320), contentHost.Width - D(80)));
         int colX = (contentHost.Width - colW) / 2;
@@ -10827,48 +16770,53 @@ class MainForm : Form, IAgentUI
         trace.SetBounds(colX, D(8), colW, Math.Max(D(30), contentHost.Height - D(16)));
         heroPanel.SetBounds(0, 0, contentHost.Width, contentHost.Height);
 
-        int heroW = Math.Min(D(760), Math.Max(D(320), heroPanel.Width - D(60)));
+        // 空状态：云朵 + 大字，位置照 Codex 量的（云朵中心比内容区中线高 43，大字低 28）
+        int markSize = D(48);
+        int markCy = heroPanel.Height / 2 - D(43);
+        int titleCy = heroPanel.Height / 2 + D(28);
+        heroMark.SetBounds(heroPanel.Width / 2 - markSize / 2, markCy - markSize / 2, markSize, markSize);
+        int heroW = Math.Min(D(900), Math.Max(D(320), heroPanel.Width - D(60)));
         int heroX = (heroPanel.Width - heroW) / 2;
-        int heroY = Math.Max(D(16), heroPanel.Height / 3 - D(40));
-        heroMark.SetBounds(heroX + heroW / 2 - D(23), heroY, D(46), D(46));
-        heroTitle.SetBounds(heroX, heroY + D(64), heroW, D(36));
-        heroSub.SetBounds(heroX, heroY + D(104), heroW, D(24));
-        int chipsY = heroY + D(148);
-        int totalW = 0;
-        for (int i = 0; i < heroChips.Count; i++)
-        {
-            heroChips[i].Width = heroChips[i].PreferredWidth();
-            totalW += heroChips[i].Width + (i > 0 ? D(8) : 0);
-        }
-        int cx = heroX + Math.Max(0, (heroW - totalW) / 2);
-        for (int i = 0; i < heroChips.Count; i++)
-        {
-            heroChips[i].SetBounds(cx, chipsY, heroChips[i].Width, D(30));
-            cx += heroChips[i].Width + D(8);
-        }
+        heroTitle.SetBounds(heroX, titleCy - D(21), heroW, D(42));
 
-        // ---- 输入卡 ----
-        int cardW = Math.Min(D(930), Math.Max(D(360), composerHost.Width - D(80)));
+        // ---- 输入卡（Codex：739x100，离窗口底 16；上面露一条灰底摆三个药丸）----
+        if (inputCard == null || pillProj == null || lblStatus == null || dotStatus == null) return;
+        composerHost.SetBounds(0, main.Height - composerH, main.Width, composerH);
+        composerHost.Invalidate();          // 灰底跟着卡片走，重排后要重画
+        int cardW = Math.Min(D(739), Math.Max(D(320), composerHost.Width - D(80)));
+        int cardH = D(100);
+        int cardX = (composerHost.Width - cardW) / 2;
+        inputCard.SetBounds(cardX, D(36), cardW, cardH);
+
         int inset = inputCard.InsetPx;
-        inputCard.SetBounds((composerHost.Width - cardW) / 2, D(10), cardW, composerH - D(20));
-        int cardH = inputCard.Height;
-        int ix = inset + D(16), iy = inset + D(12);
-        int rowH = D(30);
-        int rowY = cardH - inset - D(12) - rowH;
-        txtInput.SetBounds(ix, iy - D(2), cardW - inset * 2 - D(32), Math.Max(D(24), rowY - iy - D(6)));
+        int ix = inset + D(Theme.Sp12), iy = inset + D(Theme.Sp12);
+        int rowH = D(Theme.RowHeight);
+        int rowY = cardH - inset - D(Theme.Sp12) - rowH;
+        txtInput.SetBounds(ix, iy, cardW - inset * 2 - D(Theme.Sp24), Math.Max(D(24), rowY - iy - D(Theme.Sp8)));
 
-        btnPlus.SetBounds(ix, rowY, D(32), rowH);
-        permChip.SetBounds(ix + D(38), rowY, permChip.PreferredWidth() + D(8), rowH);
-        planChip.SetBounds(ix + D(38) + permChip.Width + D(6), rowY, planChip.PreferredWidth() + D(8), rowH);
-        int rx2 = cardW - inset - D(14);
-        btnSend.SetBounds(rx2 - D(38), rowY - D(5), D(38), D(38));
-        rx2 -= D(48);
-        cmbModel.SetBounds(rx2 - cmbModel.PreferredWidth() - D(8), rowY, cmbModel.PreferredWidth() + D(8), rowH);
+        btnPlus.SetBounds(ix - D(Theme.Sp4), rowY, D(Theme.RowHeight), rowH);
+        permChip.SetBounds(ix + D(Theme.RowHeight), rowY, permChip.PreferredWidth() + D(Theme.Sp8), rowH);
+        planChip.SetBounds(ix + D(Theme.RowHeight) + permChip.Width + D(Theme.Sp8), rowY, planChip.PreferredWidth() + D(Theme.Sp8), rowH);
+        int rx2 = cardW - inset - D(Theme.Sp12);
+        btnSend.SetBounds(rx2 - D(Theme.RowHeight), rowY, D(Theme.RowHeight), rowH);
+        rx2 -= D(38);
+        int mw = cmbModel.PreferredWidth() + D(Theme.Sp8);
+        cmbModel.SetBounds(rx2 - mw, rowY, mw, rowH);
 
-        // ---- 状态条 ----
-        dotStatus.SetBounds(D(18), D(11), D(7), D(7));
-        lblStatus.Location = new Point(D(32), D(6));
-        lblStats.Location = new Point(Math.Max(D(200), statusBar.Width - D(18) - lblStats.Width), D(6));
+        // 药丸行：项目 / 本地·云端 / 分支（摆在卡片上方那条灰底上，左边对齐卡片内文）
+        // 药丸起点 = 卡左 + 和卡片内文同一个内边距（原来是硬编码 28，为"绕开 inset"凑的数）
+        int ppx = cardX + D(Theme.Sp12);
+        UiButton[] pills = new UiButton[] { pillProj, pillEnv, pillBranch };
+        for (int i = 0; i < pills.Length; i++)
+        {
+            if (!pills[i].Visible) continue;
+            int pw = pills[i].PreferredWidth() + D(Theme.Sp8);
+            pills[i].SetBounds(ppx, D(Theme.Sp4), pw, D(30));
+            ppx += pw + D(Theme.Sp16);
+        }
+        // 运行状态：小圆点 + 一句话，挂在药丸行最右边（原来那条底部横带没了）
+        lblStatus.Location = new Point(cardX + cardW - D(Theme.Sp12) - lblStatus.Width, D(Theme.Sp8));
+        dotStatus.SetBounds(lblStatus.Left - D(Theme.Sp12), D(Theme.Sp12), D(8), D(8));
     }
 
     // ============================ 菜单动作 ============================
@@ -10883,8 +16831,22 @@ class MainForm : Form, IAgentUI
         case "导出交付记录…": ExportDelivery(); break;
         case "重启并升级（用 .new）…": ConfirmUpgrade(); break;
         case "回滚这次改动（用快照）…": ConfirmRollback(); break;
+        case "内置浏览器": ToggleBrowser(); break;
             case "设置…": OpenSettings(); break;
             case "退出": Close(); break;
+            case "关闭窗口": Close(); break;
+            case "展开 / 收起侧栏": ToggleSidebar(); break;
+            case "显示键盘快捷键": ShowShortcuts(); break;
+            case "会话：新的在前": sortDesc = true; RefreshSessionList(); break;
+            case "会话：旧的在前": sortDesc = false; RefreshSessionList(); break;
+            case "切换暗色模式":
+            case "切换浅色模式":
+                config.dark = !config.dark;
+                SaveConfig();
+                try { SaveCurrentSession(); } catch { }
+                try { Process.Start(Application.ExecutablePath); } catch { }
+                Application.Exit();
+                break;
             case "复制全部对话":
                 {
                     string all = rtb.AllText();
@@ -10895,19 +16857,41 @@ class MainForm : Form, IAgentUI
             case "放大字号": AdjustZoom(1f); break;
             case "缩小字号": AdjustZoom(-1f); break;
             case "重置字号": AdjustZoom(0f); break;
+            case "全部展开长内容": rtb.ExpandAll(); trace.ExpandAll(); break;
+            case "全部收起长内容": rtb.CollapseAll(); trace.CollapseAll(); break;
             case "显示对话": tabs.SelectedIndex = 0; SwitchTab(); break;
             case "显示轨迹": tabs.SelectedIndex = 1; SwitchTab(); break;
             case "关于 Ahz Scribe": OpenSettings(); break;
             case "使用说明":
-                MessageBox.Show(this,
+                UiMsg.Show(this,
                     "· 在底部输入框写任务，Enter 发送，Shift+Enter 换行\n"
                     + "· 写文件 / 改文件 / 执行命令前会弹窗征求同意\n"
-                    + "· 顶部「对话 / 轨迹」可以在正文和工具步骤之间切换\n"
-                    + "· 底部左侧可以切换「标准模式 / 完全权限」\n"
+                    + "· 输入框左下角「⚠ …」是权限档（仅可查看 / 工作区内修改 / 完全访问），点它换档\n"
+                    + "· 输入框上面那三颗药丸：工作目录 / 本地或云端 / git 分支\n"
+                    + "· 左上「对话 / 轨迹」在正文和工具步骤之间切换（Ctrl+1 / Ctrl+2）\n"
+                    + "· 标题栏左边 ← → 在逛过的会话之间来回，方框按钮收起 / 展开侧栏\n"
+                    + "· 全部快捷键：帮助 → 显示键盘快捷键（Ctrl+/）\n"
                     + "· 模型和提供商在「设置」里管理（本地 Ollama 或云端接口）",
                     "Ahz Scribe 使用说明", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 break;
         }
+    }
+
+    // 帮助 → 显示键盘快捷键
+    void ShowShortcuts()
+    {
+        UiMsg.Show(this,
+            "Ctrl+N         新聊天\n"
+            + "Ctrl+O         选择工作目录\n"
+            + "Ctrl+W         关闭窗口\n"
+            + "Ctrl+,         设置\n"
+            + "Ctrl+B         展开 / 收起侧栏\n"
+            + "Ctrl+1 / 2     对话页 / 轨迹页\n"
+            + "Ctrl+= / -     放大 / 缩小字号        Ctrl+0  重置字号\n"
+            + "Ctrl+Shift+C   复制全部对话\n"
+            + "Ctrl+/         这份快捷键表\n\n"
+            + "输入框里：Enter 发送，Shift+Enter 换行，Ctrl+V 可以直接粘图片。",
+            "键盘快捷键", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     void SwitchTab()
@@ -10917,6 +16901,7 @@ class MainForm : Form, IAgentUI
         rtb.Visible = !traceMode;
         // 对话区已经有东西了就不能再让空状态大标题盖上来（它会整块挡住对话区 = 一次"闪屏"）
         heroPanel.Visible = !traceMode && !HasMessages() && !rtb.HasContent;
+        SyncHeroChrome();
         if (traceMode) trace.BringToFront();
         else if (heroPanel.Visible) heroPanel.BringToFront();
         // 切页时只在"本来就在跟最新"的情况下滚到底：用户往上翻历史时不会被拽走
@@ -10959,12 +16944,40 @@ class MainForm : Form, IAgentUI
         SetPerm(autoYes ? Perm.Full : Perm.Workspace, save);
     }
 
+    // 权限档刚变过：给 chip 一次短暂的强调底色，让"真的改了"看得见（700ms 自己褪掉）。
+    // 以前只有文字变化，切到同一档附近时看不出反馈（用户报的"操作后没有视觉确认"）。
+    System.Windows.Forms.Timer _permFlashTimer;
+
+    void FlashPermChip()
+    {
+        if (permChip == null) return;
+        try
+        {
+            permChip.FillColor = Theme.AccentSoft;
+            permChip.Invalidate();
+            if (_permFlashTimer == null)
+            {
+                _permFlashTimer = new System.Windows.Forms.Timer();
+                _permFlashTimer.Interval = 700;
+                _permFlashTimer.Tick += delegate
+                {
+                    _permFlashTimer.Stop();
+                    if (permChip != null) { permChip.FillColor = Theme.Clear; permChip.Invalidate(); }
+                };
+            }
+            _permFlashTimer.Stop();
+            _permFlashTimer.Start();
+        }
+        catch (Exception ex) { Log.Swallow(ex, "权限 chip 反馈"); }
+    }
+
     void SetPerm(string level, bool save)
     {
         config.permission = level;
         config.auto_yes = Perm.AutoYes(level);     // 老字段跟着同步，别处的判断不用全改
-        if (save) config.Save();
+        if (save) SaveConfig();
         UpdatePermChip();
+        FlashPermChip();
         UpdatePlanChip();
         if (chkAutoYes != null) chkAutoYes.Checked = config.auto_yes;
         // 只读档立刻生效：重建 ToolContext，别等下一轮（用户切了档就该马上管用）
@@ -10986,6 +16999,12 @@ class MainForm : Form, IAgentUI
     void UpdatePermChip()
     {
         string txt = Perm.Label(config.permission);
+        if (permChip != null)
+        {
+            // 「完全访问」这种不再逐条问的档，用橙色提醒一下（Codex 也是这个色）；其它档是灰的
+            Color want = Perm.AutoYes(config.permission) ? Theme.PermWarn : Theme.FgDim;
+            if (permChip.TextColor != want) { permChip.TextColor = want; permChip.Invalidate(); }
+        }
         if (permChip != null && permChip.Text != txt)
         {
             permChip.Text = txt;
@@ -11005,16 +17024,20 @@ class MainForm : Form, IAgentUI
     void UpdatePlanChip()
     {
         if (planChip == null) return;
-        planChip.Text = config.plan_mode ? "计划模式" : "直接动手";
-        planChip.TextColor = config.plan_mode ? Theme.Accent : Theme.FgDim;
-        planChip.FillColor = config.plan_mode ? Theme.AccentSoft : Theme.Chip;
+        // 关着的时候整颗藏起来 —— Codex 输入条左下角就只有 + 和权限那一颗，
+        // 计划模式开着才冒出来（免得常驻占地方，也免得忘了自己还开着）。
+        planChip.Text = "计划模式";
+        planChip.TextColor = Theme.Accent;
+        planChip.IconColor = Theme.Accent;
+        planChip.Visible = config.plan_mode;
         planChip.Invalidate();
+        LayoutUi();
     }
 
     void TogglePlanMode()
     {
         config.plan_mode = !config.plan_mode;
-        config.Save();
+        SaveConfig();
         UpdatePlanChip();
         try { if (runner != null) runner.RefreshSystemPrompt(); }
         catch (Exception ex) { Log.Swallow(ex, "切换计划模式"); }
@@ -11033,14 +17056,14 @@ class MainForm : Form, IAgentUI
         {
             string path = Deliver.Export(runner, config.cwd);
             lblStatus.Text = "已导出交付记录：" + path;
-            MessageBox.Show(this,
+            UiMsg.Show(this,
                 "已导出到：\n" + path + "\n\n内容：用户要求 / 改动的文件（带行数差）/ 跑过的命令与结果 / 结论。",
                 "导出交付记录", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
         catch (Exception ex)
         {
             Log.Swallow(ex, "导出交付记录");
-            MessageBox.Show(this, "导出失败：\n" + ex.Message, "导出交付记录", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            UiMsg.Show(this, "导出失败：\n" + ex.Message, "导出交付记录", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
@@ -11051,32 +17074,32 @@ class MainForm : Form, IAgentUI
         List<string> pending = Upgrader.PendingNewFiles(exeDir);
         if (pending.Count == 0)
         {
-            MessageBox.Show(this,
+            UiMsg.Show(this,
                 "没有待升级的 .new。\n\n先跑一遍  cmd /c build.cmd —— 窗口版正在运行时它会自动产出 .new，再来点这里。",
                 "重启并升级", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
-        if (MessageBox.Show(this,
+        if (UiMsg.Show(this,
             "将做三件事：\n1) 退出当前程序（会保存会话）\n2) 用这些文件替换正式版：" + string.Join("、", pending.ToArray())
             + "\n3) 替换完自动重新启动\n\n现在继续？",
             "重启并升级", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
         string msg;
         if (Upgrader.Schedule(exeDir, true, out msg)) Close();
-        else MessageBox.Show(this, msg, "重启并升级", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        else UiMsg.Show(this, msg, "重启并升级", MessageBoxButtons.OK, MessageBoxIcon.Warning);
     }
 
     // 「文件」菜单里的回滚：把文件恢复到改动前（最近一条快照）
     void ConfirmRollback()
     {
         if (runner == null) { lblStatus.Text = "还没有会话可以回滚"; return; }
-        if (MessageBox.Show(this,
+        if (UiMsg.Show(this,
             "把工作目录里的文件恢复到**改动前**（用最近一条 .snapshots 快照）？\n\n"
             + "适合场景：刚改完发现不对、或自我改造验证没过。\n回滚之后如果已经 build 出新版，"
             + "要再跑一次 build 才能让二进制和源码一致。",
             "回滚这次改动", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) return;
         string msg = Upgrader.RollbackTool(runner.Ctx, new Dictionary<string, object>());
         lblStatus.Text = "回滚完成";
-        MessageBox.Show(this, msg, "回滚这次改动", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        UiMsg.Show(this, msg, "回滚这次改动", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     // 输入条上那个权限 chip 的点击入口（顶栏那个走 TogglePermPopover(Control)）
@@ -11114,8 +17137,9 @@ class MainForm : Form, IAgentUI
     static ContextMenuStrip SkinMenu()
     {
         ContextMenuStrip m = new ContextMenuStrip();
+        MenuRound.Apply(m);
         m.ShowImageMargin = false;
-        m.BackColor = Color.White;
+        m.BackColor = Theme.Card;
         m.ForeColor = Theme.Fg;
         m.Font = Theme.F(9.5f);
         m.Padding = new Padding(Theme.Px(4), Theme.Px(5), Theme.Px(4), Theme.Px(5));
@@ -11136,7 +17160,7 @@ class MainForm : Form, IAgentUI
             config.think = true;
             if (chkThink != null) chkThink.Checked = true;
         }
-        if (save) config.Save();
+        if (save) SaveConfig();
         UpdateModelChip();
         ApplyModelInfo();
         if (modelPop != null) modelPop.RefreshEffort(config.effort);
@@ -11153,7 +17177,9 @@ class MainForm : Form, IAgentUI
     {
         Provider p = config.Current();
         if (p != null && p.type == "ollama") return "think=" + e;
-        return "reasoning_effort=" + e;
+        // 接口声明过档位的话，真正发出去的可能不是 low/medium/high（DeepSeek 是 low/high/max）
+        string real = Effort.ResolveFor(p, config.model, e);
+        return "reasoning_effort=" + (real == null ? e : real);
     }
 
     // 当前模型能不能调推理强度（见 Effort.Supported）
@@ -11162,14 +17188,21 @@ class MainForm : Form, IAgentUI
         Provider p = config.Current();
         if (p == null) return false;
         string tv = (p.type == "ollama" && runner != null) ? runner.ThinkingValues : "";
-        return Effort.Supported(p.type, config.model, tv);
+        return Effort.Supported(p, config.model, tv);
     }
 
     // 输入条上那个 chip 的文字：「厂商 / 模型 · 档位」（Codex 风格）
     void UpdateModelChip()
     {
         if (cmbModel == null || cmbModel.SelectedItem == null) return;
-        string t = Convert.ToString(cmbModel.SelectedItem) + " · " + Effort.Label(config.effort);
+        // Codex 的写法是「模型名 档位」（中间一个空格）——只要模型名，不要「厂商 / 」那半截，
+        // 厂商已经在输入框上方那颗「本地 / 云端」药丸上写着了。
+        ModelItem it = cmbModel.SelectedItem as ModelItem;
+        // 显示名优先用接口给的（DeepSeek-V4.1-Flash），没有才用 id（deepseek-flash）
+        string name = it != null
+            ? (it.Display != null && it.Display.Length > 0 ? it.Display : it.Model)
+            : Convert.ToString(cmbModel.SelectedItem);
+        string t = name + " " + Effort.Label(config.effort);
         if (cmbModel.Text == t) return;
         cmbModel.Text = t;
         cmbModel.Invalidate();
@@ -11194,6 +17227,8 @@ class MainForm : Form, IAgentUI
                 item.ProviderId = p.id;
                 item.ProviderName = p.name;
                 item.Model = m;
+                item.Display = p.DisplayName(m);       // 接口给了显示名就用显示名
+                item.Vision = p.CanSeeImages(m);
                 cmbModel.Items.Add(item);
                 if (p.id == cur.id && m == config.model) selected = cmbModel.Items.Count - 1;
             }
@@ -11215,7 +17250,7 @@ class MainForm : Form, IAgentUI
         if (item.ProviderId == config.provider && item.Model == config.model) return;
         config.provider = item.ProviderId;
         config.model = item.Model;
-        config.Save();
+        SaveConfig();
         runner.RebuildLlm();
         ApplyModelInfo();
         Write(OutKind.Info, "· 已切换模型：" + item.ToString() + "\n");
@@ -11232,9 +17267,11 @@ class MainForm : Form, IAgentUI
         catch (Exception ex)
         {
             // 后端连不上（比如 Ollama 没启动）不应该让程序打不开，只提示一下
-            Write(OutKind.Error, "× 连接不上「" + p.name + "」：" + ex.Message + "\n");
+            WriteError("连接不上「" + p.name + "」", ex.Message,
+                "本地模型：确认 Ollama 在运行（托盘图标，或执行 ollama serve）；云端接口：检查接口地址与 API Key");
             lblStats.Text = p.name + " / " + config.model + " · 连接失败";
             if (lblBadge != null) lblBadge.Text = p.name + " · " + config.model;
+            if (cmbModel != null) tips.SetToolTip(cmbModel, "⚠ " + lblStats.Text + "（设置里可以换模型 / 换接口）" + VisionNote());
             return;
         }
         string warn = runner.Warning();
@@ -11246,6 +17283,8 @@ class MainForm : Form, IAgentUI
             + " · 工具" + toolTxt + " · ctx " + config.num_ctx;
         if (Effort.IsSet(config.effort)) lblStats.Text += " · 推理" + Effort.Label(config.effort);
         if (lblBadge != null) lblBadge.Text = p.name + " · " + config.model;
+        // 悬停模型 chip：模型/上下文这些 + 能不能看图（接口声明过才说）
+        if (cmbModel != null) tips.SetToolTip(cmbModel, lblStats.Text + VisionNote());
     }
 
     void UpdateSendButton()
@@ -11254,17 +17293,18 @@ class MainForm : Form, IAgentUI
         if (running)
         {
             btnSend.Icon = "stop";
-            btnSend.IconSize = 15;
-            btnSend.FillColor = Theme.Fg;
-            btnSend.HoverColor = Color.Black;
+            btnSend.IconSize = 12;
+            btnSend.FillColor = Theme.SendOn;
+            btnSend.HoverColor = Theme.SendOnHover;
         }
         else
         {
             btnSend.Icon = "send";
-            btnSend.IconSize = 18;
+            btnSend.IconSize = 14;
             bool has = txtInput != null && txtInput.Text.Trim().Length > 0;
-            btnSend.FillColor = has ? Theme.Accent : Theme.AccentIdle;
-            btnSend.HoverColor = has ? Theme.AccentHover : Theme.Accent;
+            // 空输入是浅灰、有字变深（Codex 那个深色圆钮）—— 不是蓝色
+            btnSend.FillColor = has ? Theme.SendOn : Theme.SendIdle;
+            btnSend.HoverColor = has ? Theme.SendOnHover : Theme.SendOn;
         }
         btnSend.Invalidate();
     }
@@ -11274,9 +17314,49 @@ class MainForm : Form, IAgentUI
     void LoadSessions()
     {
         sessionStore = SessionStore.Load();
+        RepairSessionTitles();
         RefreshSessionList();
         if (sessionStore.sessions.Count > 0) LoadSessionById(sessionStore.sessions[0].id);
         else { currentSessionId = ""; ShowHero(true); }
+    }
+
+    // 「（系统提醒）…」「（踩坑本…」是框架注入的 user 消息，不是用户说的话。
+    // 以前 SaveCurrentSession 拿第一条 user 消息当标题，于是侧栏/标题栏全是同一句提醒。
+    static bool IsFrameworkUserText(string txt)
+    {
+        if (string.IsNullOrEmpty(txt)) return false;
+        txt = txt.TrimStart('\uFEFF', ' ', '\r', '\n', '\t');
+        return txt.StartsWith("（系统提醒）") || txt.StartsWith("（系统提醒 ·")
+            || txt.StartsWith("（踩坑本");
+    }
+
+    static string FirstUserTitle(List<Dictionary<string, object>> msgs)
+    {
+        if (msgs == null) return null;
+        foreach (Dictionary<string, object> m in msgs)
+        {
+            if (Json.Str(m, "role", "") != "user") continue;
+            string txt = Json.Str(m, "content", "");
+            if (string.IsNullOrEmpty(txt) || IsFrameworkUserText(txt)) continue;
+            txt = txt.Replace("\r", " ").Replace("\n", " ").Trim();
+            if (txt.Length == 0) continue;
+            return txt.Length > 22 ? txt.Substring(0, 22) + "…" : txt;
+        }
+        return null;
+    }
+
+    // 老会话的标题已经被写坏了：加载时先按消息回填一次（只改内存，等下次保存落盘）。
+    void RepairSessionTitles()
+    {
+        if (sessionStore == null || sessionStore.sessions == null) return;
+        foreach (Session s in sessionStore.sessions)
+        {
+            if (s == null) continue;
+            bool bad = string.IsNullOrEmpty(s.title) || s.title == "新会话" || IsFrameworkUserText(s.title);
+            if (!bad) continue;
+            string t = FirstUserTitle(s.messages);
+            if (!string.IsNullOrEmpty(t)) s.title = t;
+        }
     }
 
     static string ProjectName(string cwd)
@@ -11306,11 +17386,33 @@ class MainForm : Form, IAgentUI
         return null;
     }
 
+    // 保存失败不能只写日志：状态栏给一句，鼠标停上去看全文。
+    void ShowSaveWarning()
+    {
+        string err = "";
+        if (!string.IsNullOrEmpty(AgentConfig.LastSaveError)) err += AgentConfig.LastSaveError;
+        if (!string.IsNullOrEmpty(SessionStore.LastSaveError))
+            err += (err.Length > 0 ? "\n" : "") + SessionStore.LastSaveError;
+        if (err.Length == 0) return;
+        lblStatus.Text = "⚠ " + Txt.FirstLine(err);
+        lblStatus.ForeColor = Theme.Warn;
+        tips.SetToolTip(lblStatus, err);
+    }
+
+    // 所有 MainForm 里的 config.Save() 都走这里，保存失败统一进状态栏。
+    void SaveConfig()
+    {
+        if (config == null) return;
+        config.Save();
+        ShowSaveWarning();
+    }
+
     void SaveStore()
     {
         if (sessionStore == null) return;
         while (sessionStore.sessions.Count > 200) sessionStore.sessions.RemoveAt(sessionStore.sessions.Count - 1);
         sessionStore.Save();
+        ShowSaveWarning();
     }
 
     void NewSession()
@@ -11347,16 +17449,18 @@ class MainForm : Form, IAgentUI
         s.provider = config.provider;
         s.model = config.model;
         s.updated = DateTime.Now.ToString("yyyy-MM-dd HH:mm");
-        foreach (Dictionary<string, object> m in s.messages)
-        {
-            if (Json.Str(m, "role", "") != "user") continue;
-            string txt = Json.Str(m, "content", "");
-            if (txt.Length > 0) { s.title = txt.Length > 22 ? txt.Substring(0, 22) + "…" : txt; break; }
-        }
+        string title = FirstUserTitle(s.messages);
+        if (!string.IsNullOrEmpty(title)) s.title = title;
         SaveStore();
     }
 
     void LoadSessionById(string id)
+    {
+        LoadSessionById(id, true);
+    }
+
+    // record=false 是给 ← → 两个箭头用的（自己走过来的一步，不该再压一条历史）
+    void LoadSessionById(string id, bool record)
     {
         Session s = FindSession(id);
         if (s == null) return;
@@ -11376,22 +17480,43 @@ class MainForm : Form, IAgentUI
         RenderHistory();
         ShowHero(s.messages == null || s.messages.Count == 0);
         if (txtCwd != null) txtCwd.Text = config.cwd;
-        lblFoot.Text = ProjectName(config.cwd) + "  ·  " + config.cwd;
+        if (record) PushHistory(id);
+        UpdatePlacePills();
+        LoadGitBranch();
         LoadModels();
         ApplyModelInfo();
         RefreshSessionList();
     }
 
+    // 打开会话时最多往对话区摆多少条历史。
+    // 以前是"有多少摆多少"：891 条那条会话实测要 95 秒以上，窗口一直"(未响应)"。
+    // 老消息仍然在会话里（sessions.json 一条没少），只是不摆到界面上 ——
+    // 接着聊、分支、导出交付记录都不受影响。
+    const int RenderHistoryMax = 200;
+
     void RenderHistory()
     {
-        for (int i = 1; i < runner.Messages.Count; i++)
+        int total = runner.Messages.Count - 1;          // 减掉开头那条 system
+        int start = Math.Max(1, runner.Messages.Count - RenderHistoryMax);
+        if (start > 1)
+            Write(OutKind.Info, "· 这条会话共 " + total + " 条消息，为免卡顿只摆出最近 "
+                + RenderHistoryMax + " 条（模型看到的上下文不受影响）\n");
+        for (int i = start; i < runner.Messages.Count; i++)
         {
             Dictionary<string, object> m = runner.Messages[i];
             string role = Json.Str(m, "role", "");
             string content = Json.Str(m, "content", "");
+            // 先把"这条属于哪一步 + 时间"挂上，等块建出来时自动贴好（见 TranscriptView.PendingIdx）
+            rtb.PendingIdx = i;
+            long ts0 = Json.Long(m, "ts", 0);
+            rtb.PendingStamp = ts0 > 0
+                ? new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(ts0).ToLocalTime()
+                : (DateTime?)null;
             if (role == "user")
             {
-                Write(OutKind.User, "› " + content + "\n");
+                // 历史消息里存的是真路径；界面显示短标记，真路径走 PendingImages 贴到新块上。
+                rtb.PendingImages = Attach.Show.ImagePaths(content);
+                Write(OutKind.User, "› " + Attach.Show.Text(content) + "\n");
             }
             else if (role == "assistant")
             {
@@ -11406,19 +17531,17 @@ class MainForm : Form, IAgentUI
             }
             else if (role == "tool")
             {
-                Write(OutKind.ToolResult, "  └ " + Txt.FirstLine(content) + "\n");
-            }
-            // 历史里的每一条也要能"分支到新聊天"，并且带上当时的时间
-            rtb.FlushNow();
-            MsgBlock hb = rtb.LastBlock;
-            if (hb != null)
-            {
-                hb.MsgIdx = i;
-                long ts = Json.Long(m, "ts", 0);
-                hb.Stamp = ts > 0 ? new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(ts).ToLocalTime() : (DateTime?)null;
+                // 历史里的工具结果也摆全文（原来只有第一行，展开就是空的）
+                lastToolName = Json.Str(m, "tool_name", "");
+                Write(OutKind.ToolResult, "  └ " + Txt.Clip(content, 3000) + "\n");
             }
         }
-        rtb.FlushNow();      // 历史不要等攒批：切会话立刻就能看到
+        // 一次性刷出来：中途刷一次就要把所有块重排一遍（每条都刷 = 891 次，就是卡死的原因；
+        // 每 20 条刷一次实测仍有 3.4 秒，索性攒到最后刷一次）。
+        rtb.FlushNow();
+        rtb.PendingIdx = -1;            // 最后一条的标记别漏给下一条（比如马上要来的流式回答）
+        rtb.PendingStamp = null;
+        rtb.PendingImages = null;
         rtb.Follow = true;
         rtb.ScrollToEnd();   // 打开一个会话先看到最新的几条（跟聊天软件一致）
     }
@@ -11458,6 +17581,118 @@ class MainForm : Form, IAgentUI
         lblStatus.Text = "已把选中的 " + add.Length + " 个字填到输入框，可以直接发给我";
     }
 
+    // ---------- 内置浏览器 ----------
+
+    // 自测开关：--selftest=browse 时在程序自己的消息循环里跑一遍 browse_* 并把结果写日志。
+    // 为什么要这么做：进程内探针（DoEvents 泵）跑不了 Chromium（Cef.Initialize 需要真正的 Application.Run），
+    // 所以只能在真程序里自测。
+    void RunBrowseSelfTest()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "ahz-selftest-" + DateTime.Now.ToString("HHmmss"));
+        try
+        {
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(Path.Combine(dir, "one.html"),
+                "<!doctype html><meta charset=\"utf-8\"><title>第一页</title><body><h1>第一页</h1>"
+                + "<p>PAGE1-MARKER</p><a href=\"two.html\">进入第二页</a></body>", new UTF8Encoding(false));
+            File.WriteAllText(Path.Combine(dir, "two.html"),
+                "<!doctype html><meta charset=\"utf-8\"><title>第二页</title><body><h1>第二页</h1>"
+                + "<p>PAGE2-MARKER</p><a href=\"one.html\">回第一页</a></body>", new UTF8Encoding(false));
+        }
+        catch { }
+
+        string p1 = Path.Combine(dir, "one.html");
+        System.Threading.Thread t = new System.Threading.Thread(delegate()
+        {
+            StringBuilder log = new StringBuilder();
+            try
+            {
+                log.Append("open: ").Append(OneLine(BrowserHub.Open(p1))).Append("\n");
+                log.Append("read: ").Append(BrowserHub.Read(2000).IndexOf("PAGE1-MARKER") >= 0 ? "OK" : "FAIL").Append("\n");
+                log.Append("links: ").Append(BrowserHub.Links(10).IndexOf("进入第二页") >= 0 ? "OK" : "FAIL").Append("\n");
+                log.Append("click: ").Append(OneLine(BrowserHub.Click("进入第二页"))).Append("\n");
+                log.Append("back: ").Append(OneLine(BrowserHub.Back())).Append("\n");
+                log.Append("shot: ").Append(OneLine(BrowserHub.Shot(Path.Combine(dir, "shot.png")))).Append("\n");
+            }
+            catch (Exception ex) { log.Append("EX ").Append(ex.Message).Append("\n"); }
+            try { Log.Audit("浏览器自测结果：\n" + log.ToString()); } catch { }
+            try { BeginInvoke(new MethodInvoker(delegate { Application.Exit(); })); } catch { }
+        });
+        t.IsBackground = true;
+        t.Start();
+    }
+
+    static string OneLine(string s)
+    {
+        if (s == null) return "null";
+        s = s.Replace("\r", " ").Replace("\n", " | ");
+        return s.Length > 220 ? s.Substring(0, 220) + "…" : s;
+    }
+
+    void ToggleBrowser()
+    {
+        try { ToggleBrowserCore(); }
+        catch (Exception ex)
+        {
+            try
+            {
+                Log.Audit("内置浏览器打开失败：" + ex.GetType().Name + ": " + ex.Message);
+                if (ex.InnerException != null) Log.Audit("  inner: " + ex.InnerException.Message);
+            }
+            catch { }
+            try { lblStatus.Text = "内置浏览器打不开：" + Txt.FirstLine(ex.Message); } catch { }
+        }
+    }
+
+    void ToggleBrowserCore()
+    {
+        if (browserHost == null || browser == null) return;
+        bool want = !browserHost.Visible;
+        browserHost.Visible = want;
+        browserOpen = want;
+        if (want)
+        {
+            browserHost.BringToFront();
+            lblStatus.Text = "内置浏览器 · 正在准备（第一次要等 IE 内核起来，稍等一下）";
+            // 这里绝不能 Application.DoEvents()：工具调用已经是从 BeginInvoke 回到 UI 线程的，
+            // 再泵一次消息会让 ToggleBrowser 重入自己（栈溢出 / 卡死就是这么来的）。
+            if (browser.CurrentUrl.Length == 0) browser.Go(browser.StartPage());
+            browser.FocusAddress();
+            // 自证几何：面板/宿主/主区/Web/右簇各多宽，卡住或错位时一眼能看出来（写进 Ahz错误日志）
+            try
+            {
+                Log.Audit("内置浏览器几何 · 面板=" + browser.Width + " 宿主=" + browserHost.Width
+                    + " 主区=" + main.Width + " 窗口客户区=" + ClientSize.Width
+                    + " Web=" + ((browser.Web as Control) == null ? -1 : ((Control)browser.Web).Width));
+            }
+            catch { }
+            lblStatus.Text = "内置浏览器 · 看完点「交给 AS」，我就用 web_open 读这一页";
+        }
+        else
+        {
+            lblStatus.Text = "已收起浏览器";
+            try { rtb.Focus(); } catch { }
+        }
+    }
+
+    // 「交给 AS」：只把地址塞进输入框，由用户自己按回车 —— 不在人没同意时直接花 token
+    void AskAgentAboutPage(string url)
+    {
+        if (url == null || url.Trim().Length == 0) return;
+        FillInputWith("用 web_open 打开这个页面，把要点讲给我（正文太长就摘要，别贴原文）：\n" + url.Trim());
+        lblStatus.Text = "已把地址填到输入框，回车就让我读这一页";
+    }
+
+    // 和"选中文字 → 填到输入框"同一个动作：追加、不覆盖，滚到末尾、抢焦点
+    void FillInputWith(string text)
+    {
+        if (text == null) return;
+        string cur = txtInput.Text;
+        txtInput.Text = (cur.Trim().Length > 0 ? cur.TrimEnd() + "\n\n" : "") + text + "\n";
+        txtInput.SelectionStart = txtInput.TextLength;
+        txtInput.Focus();
+    }
+
     void OpenChanges(MsgBlock b, int fileIdx)
     {
         if (b == null) return;
@@ -11476,7 +17711,7 @@ class MainForm : Form, IAgentUI
     {
         List<FileChange> list = Changes.Get(b.CardIndex);
         if (list == null || list.Count == 0) { lblStatus.Text = "这一轮的改动记录已不在内存里"; return; }
-        if (MessageBox.Show(this, "把这一轮改的 " + list.Count + " 个文件恢复原样？\n\n"
+        if (UiMsg.Show(this, "把这一轮改的 " + list.Count + " 个文件恢复原样？\n\n"
                 + "新文件会被删除，改动过的文件会写回改动前的内容。", "撤销这一轮的改动",
                 MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) return;
         int ok, fail;
@@ -11534,7 +17769,17 @@ class MainForm : Form, IAgentUI
         }
         heroPanel.Visible = show && !hasUser && tabs.SelectedIndex == 0;
         if (heroPanel.Visible) heroPanel.BringToFront();
+        SyncHeroChrome();
         RefreshSessionList();
+    }
+
+    // 空态顶上干干净净：会话名和「对话 / 轨迹」页签都不摆（Codex 那一屏就一个云朵 + 一句大字），
+    // 有内容了再放回来（Ctrl+1 / Ctrl+2 和视图菜单随时还能切）。
+    void SyncHeroChrome()
+    {
+        bool hero = heroPanel != null && heroPanel.Visible;
+        if (lblTitle != null) lblTitle.Visible = !hero;
+        if (tabs != null) tabs.Visible = !hero;
     }
 
     void ClearCurrentChat(bool unused)
@@ -11553,10 +17798,12 @@ class MainForm : Form, IAgentUI
         if (Directory.Exists(config.cwd)) dlg.SelectedPath = config.cwd;
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
         config.cwd = dlg.SelectedPath;
-        config.Save();
+        SaveConfig();
         if (txtCwd != null) txtCwd.Text = config.cwd;
         runner.SetWorkingDir(config.cwd);
         NewSession();
+        UpdatePlacePills();
+        LoadGitBranch();
     }
 
     void AdjustZoom(float delta)
@@ -11574,6 +17821,11 @@ class MainForm : Form, IAgentUI
         List<Session> items = new List<Session>(sessionStore.sessions);
         items.Sort(delegate(Session a, Session b)
         {
+            string ga = SessionGroup(a), gb = SessionGroup(b);
+            bool da = ga == "默认工作区", db = gb == "默认工作区";
+            if (da != db) return da ? -1 : 1;          // 默认工作区固定排最上面
+            int c = string.Compare(ga, gb, StringComparison.OrdinalIgnoreCase);
+            if (c != 0) return c;                      // 同项目连续摆，避免同名分组重复出现
             string x = a.updated == null ? "" : a.updated;
             string y = b.updated == null ? "" : b.updated;
             return sortDesc ? string.CompareOrdinal(y, x) : string.CompareOrdinal(x, y);
@@ -11584,7 +17836,7 @@ class MainForm : Form, IAgentUI
         List<Control> rows = new List<Control>();
         foreach (Session s in items)
         {
-            string proj = ProjectName(s.cwd);
+            string proj = SessionGroup(s);
             if (f.Length > 0
                 && (s.title == null || s.title.ToLowerInvariant().IndexOf(f) < 0)
                 && proj.ToLowerInvariant().IndexOf(f) < 0) continue;
@@ -11618,6 +17870,15 @@ class MainForm : Form, IAgentUI
         LayoutUi();
     }
 
+    string SessionGroup(Session s)
+    {
+        // 当前工作目录统一显示成「默认工作区」，和 DeepSeek Harness/Codex 的默认工作区对齐。
+        string sc = (s.cwd == null ? "" : s.cwd).TrimEnd('\\');
+        string cc = (config.cwd == null ? "" : config.cwd).TrimEnd('\\');
+        if (sc.Length > 0 && string.Equals(sc, cc, StringComparison.OrdinalIgnoreCase)) return "默认工作区";
+        return ProjectName(s.cwd);
+    }
+
     void EnsureSession()
     {
         if (sessionStore == null) sessionStore = new SessionStore();
@@ -11640,7 +17901,7 @@ class MainForm : Form, IAgentUI
         int before = CountPluginTools();
         using (PluginsForm dlg = new PluginsForm(config, delegate { runner.ReloadTools(); }))
             dlg.ShowDialog(this);
-        config.Save();
+        SaveConfig();
         runner.ReloadTools();
         int after = CountPluginTools();
         List<PluginInfo> all = Plugins.Load();
@@ -11663,7 +17924,7 @@ class MainForm : Form, IAgentUI
             dlg.Icon = Theme.AppIcon();          // 设置窗口也挂程序图标，别只剩它顶默认图标
             if (dlg.ShowDialog(this) != DialogResult.OK) return;
             config = dlg.Result;
-            config.Save();
+            SaveConfig();
             rtb.AutoFollow = config.follow_output;
             suppressModelChange = true;
             txtCwd.Text = config.cwd;
@@ -11673,10 +17934,11 @@ class MainForm : Form, IAgentUI
             if (cmbCtx.SelectedIndex < 0) cmbCtx.SelectedItem = "8192";
             suppressModelChange = false;
             SetPerm(config.permission, false);        // 权限档：顶栏 / 输入条跟着设置页一起变
-            runner = new AgentRunner(config, this);
-            rtb.ClearAll();
-            trace.ClearAll();
-            lblFoot.Text = ProjectName(config.cwd) + "  ·  " + config.cwd;
+            // 注意：这里**不能**重建 runner、也不能清对话区 —— 那等于"一保存设置就把上下文扔了"。
+            // 只把新配置交给 runner（换连接、换工具表、重拼系统提示），历史一条不动。
+            runner.ApplyConfig(config);
+            UpdatePlacePills();
+            LoadGitBranch();
             LoadModels();
             ApplyModelInfo();
             Write(OutKind.Info, "· 设置已保存\n");
@@ -11690,6 +17952,17 @@ class MainForm : Form, IAgentUI
         return s.Replace("✗", "×").Replace("✓", "√").Replace("⚠", "!").Replace("🧠 ", "").Replace("🧠", "");
     }
 
+    // "read_file(a.txt)" → "read_file"；"read_file" / "自动验证(cmd)" 这类也认。
+    // 只用来给折叠摘要行报工具名，认不出就返回原文（截短）。
+    static string ToolNameOf(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        int i = s.IndexOf('(');
+        string n = (i < 0 ? s : s.Substring(0, i)).Trim();
+        if (n.Length > 24) n = n.Substring(0, 24);
+        return n;
+    }
+
     public void Write(OutKind kind, string text)
     {
         if (string.IsNullOrEmpty(text)) return;
@@ -11701,8 +17974,23 @@ class MainForm : Form, IAgentUI
                 {
                     string body = t.Trim();
                     if (body.StartsWith("› ")) body = body.Substring(2);
+                    // 「（系统提醒）…」不是用户说的话，是框架每步注入的提醒。摆成一个大「你」块，
+                    // 历史里堆十几遍看着就像刷屏（2026-10-15 用户报的就是这个）。这里当成小字提示渲染。
+                    if (body.StartsWith("（系统提醒）"))
+                    {
+                        rtb.Break();
+                        rtb.AddChunk(OutKind.Info, "· " + body + "\n");
+                        rtb.FlushNow();
+                        break;
+                    }
                     rtb.Break();
-                    rtb.AddChunk(OutKind.User, "你\n" + body + "\n");
+                    // 真路径留在 runner.Messages 里；界面只显示短标记，图片从侧信道贴到块上。
+                    List<string> imgs = Attach.Show.ImagePaths(body);
+                    string shown = Attach.Show.Text(body);
+                    if (imgs.Count > 0) rtb.PendingImages = imgs;
+                    // 不再拼「你\n」标签：区分用户/AI 已经交给气泡本身（靠右 + 蓝底 + 描边），
+                    // 留着它等于每条用户消息头上多一行噪声，复制出来也多两个字。
+                    rtb.AddChunk(OutKind.User, shown + "\n");
                     rtb.FlushNow();
                     if (rtb.LastBlock != null && runner != null)
                         rtb.LastBlock.MsgIdx = runner.Messages.Count - 1;   // 这句是第几条，分支时要按它切
@@ -11741,6 +18029,7 @@ class MainForm : Form, IAgentUI
                 {
                     string body = t.Trim();
                     if (body.StartsWith("● ")) body = body.Substring(2);
+                    lastToolName = ToolNameOf(body);        // 下面那条工具结果的摘要行要报工具名
                     stepNo++;
                     rtb.Break();
                     rtb.AddChunk(OutKind.ToolCall, "• " + body + "\n");
@@ -11752,10 +18041,11 @@ class MainForm : Form, IAgentUI
                 {
                     string body = t.Trim();
                     if (body.StartsWith("└ ")) body = body.Substring(2);
+                    // 摘要行要报"是谁跑的"：工具名跟着这一批文字走（建块时贴到 MsgBlock.FoldTool）
                     rtb.Break();
-                    rtb.AddChunk(OutKind.ToolResult, body + "\n");
+                    rtb.AddToolChunk(body + "\n", lastToolName);
                     trace.Break();
-                    trace.AddChunk(OutKind.ToolResult, "    " + body + "\n");
+                    trace.AddToolChunk("    " + body + "\n", lastToolName);
                     break;
                 }
             case OutKind.Error:
@@ -11818,11 +18108,11 @@ class MainForm : Form, IAgentUI
         catch { }
     }
 
+
     public int Approve(string toolName, string[] preview)
     {
         if (InvokeRequired)
-        {
-            object result = null;
+        {            object result = null;
             try
             {
                 result = Invoke(new Func<int>(delegate { return Approve(toolName, preview); }));
@@ -11837,13 +18127,38 @@ class MainForm : Form, IAgentUI
         }
     }
 
+    // 统一错误呈现（2026-10-16）：一句"发生了什么" + 一句"为什么" + 一句"怎么办"。
+    // 以前八处各写各的，用户只看到一串原始报错，不知道下一步该干什么（用户报的"错误状态无友好提示"）。
+    internal static string ErrorText(string what, string why, string howto)
+    {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("\n× ").Append(what).Append('\n');
+        if (!string.IsNullOrEmpty(why)) sb.Append("    原因：").Append(Txt.FirstLine(why)).Append('\n');
+        if (!string.IsNullOrEmpty(howto)) sb.Append("    怎么办：").Append(howto).Append('\n');
+        return sb.ToString();
+    }
+
+    void WriteError(string what, string why, string howto)
+    {
+        Write(OutKind.Error, ErrorText(what, why, howto));
+    }
+
+    string _lastStatus;      // 同值不重绘（状态栏每条 token 被刷一次的话，状态点会跟着闪）
+
     public void Status(string text)
     {
-        if (InvokeRequired) { SafeUi(delegate { lblStatus.Text = text; }); return; }
-        lblStatus.Text = text;
+        if (_lastStatus == text) return;
+        _lastStatus = text;
+        if (InvokeRequired) { SafeUi(delegate { ApplyStatus(text); }); return; }
+        ApplyStatus(text);
+    }
+
+    void ApplyStatus(string text)
+    {
+        if (lblStatus.Text != text) lblStatus.Text = text;
         UpdatePlanChip();      // /计划 开|关 是在 AgentRunner 里切的，chip 得跟着刷新
-        dotStatus.DotColor = running ? Theme.Accent : Theme.Ok;
-        dotStatus.Invalidate();
+        Color want = running ? Theme.Accent : Theme.Ok;
+        if (dotStatus.DotColor != want) { dotStatus.DotColor = want; dotStatus.Invalidate(); }
     }
 
     // 越权访问：同一个弹窗，但默认按钮是「拒绝」（按 Enter 不会放行）
@@ -11863,12 +18178,232 @@ class MainForm : Form, IAgentUI
         }
     }
 
+    // ============================ 粘贴 / 拖入图片 ============================
+    // 输入框是自绘 TextBox，天生不认图片：不接这一段，Ctrl+V 和拖进来都会"按了没反应"。
+
+    static bool IsImageFile(string p)
+    {
+        return Vision.IsImageExt(p);      // 判定只留一份（Vision.IsImageExt），避免两处规则漂移
+    }
+
+    static string AttachDir()
+    {
+        string d = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "attachments");
+        try { if (!Directory.Exists(d)) Directory.CreateDirectory(d); } catch { }
+        return d;
+    }
+
+    static string[] ImagePathsFrom(IDataObject data)
+    {
+        List<string> ok = new List<string>();
+        if (data == null) return ok.ToArray();
+        try
+        {
+            if (!data.GetDataPresent(DataFormats.FileDrop)) return ok.ToArray();
+            string[] fs = data.GetData(DataFormats.FileDrop) as string[];
+            if (fs == null) return ok.ToArray();
+            foreach (string p in fs)
+                if (p != null && File.Exists(p) && IsImageFile(p)) ok.Add(p);
+        }
+        catch { }
+        return ok.ToArray();
+    }
+
+    static bool HasImageDrop(IDataObject data)
+    {
+        if (data == null) return false;
+        try { if (data.GetDataPresent(DataFormats.Bitmap)) return true; }
+        catch { }
+        return ImagePathsFrom(data).Length > 0;
+    }
+
+    // 返回 true 表示"这一下 Ctrl+V 归我处理"，false 表示是普通文字，交给文本框自己粘
+    bool TryPasteImage()
+    {
+        try
+        {
+            if (Clipboard.ContainsImage())
+            {
+                Image img = Clipboard.GetImage();
+                if (img != null)
+                {
+                    string p = SavePastedImage(img);
+                    img.Dispose();
+                    if (p != null)
+                    {
+                        AttachImages(new string[] { p });
+                        return true;
+                    }
+                }
+            }
+        }
+        catch { }
+        try
+        {
+            if (Clipboard.ContainsFileDropList())
+            {
+                System.Collections.Specialized.StringCollection sc = Clipboard.GetFileDropList();
+                List<string> imgs = new List<string>();
+                foreach (string f in sc)
+                    if (f != null && File.Exists(f) && IsImageFile(f)) imgs.Add(f);
+                if (imgs.Count > 0) { AttachImages(imgs.ToArray()); return true; }
+            }
+        }
+        catch { }
+        return false;
+    }
+
+    string SavePastedImage(Image img)
+    {
+        try
+        {
+            string p = Path.Combine(AttachDir(), "shot-" + DateTime.Now.ToString("yyyyMMdd-HHmmss-fff") + ".png");
+            img.Save(p, System.Drawing.Imaging.ImageFormat.Png);
+            return p;
+        }
+        catch (Exception ex)
+        {
+            lblStatus.Text = "图片保存失败：" + ex.Message;
+            return null;
+        }
+    }
+
+    void AttachImages(string[] paths)
+    {
+        if (paths == null || paths.Length == 0) return;
+        StringBuilder sb = new StringBuilder();
+        int n = 0;
+        foreach (string p in paths)
+        {
+            if (p == null || !File.Exists(p)) continue;
+            string full = Path.GetFullPath(p);
+            string name = Path.GetFileName(full);
+            string mark = "[图片 " + name + "]";
+            if (_attachPaths.ContainsKey(mark))
+            {
+                int k = 2;
+                while (_attachPaths.ContainsKey("[图片 " + name + " (" + k + ")]")) k++;
+                mark = "[图片 " + name + " (" + k + ")]";
+            }
+            _attachPaths[mark] = full;
+            if (sb.Length > 0) sb.Append('\n');
+            sb.Append(mark);
+            n++;
+        }
+        if (n == 0) return;
+        InsertText(sb.ToString());
+        lblStatus.Text = "已加入 " + n + " 张图片，可以直接发给我" + VisionNote();
+    }
+
+    // 当前这个模型能不能看图（接口声明过就按接口说，本地按 /api/show 的能力探测）。
+    // 粘图的时候直接告诉用户，省得发过去才发现模型"瞎"。
+    string VisionNote()
+    {
+        try
+        {
+            Provider p = config.Current();
+            if (p == null) return "";
+            bool? v = p.CanSeeImages(config.model);
+            if (v == null && p.type == "ollama" && runner != null)
+                v = runner.Capabilities.Contains("vision");
+            if (v == true) return "（这个模型能看图）";
+            if (v == false) return "（注意：当前模型 " + p.DisplayName(config.model) + " 是纯文本，看不到图；换带视觉的模型才行）";
+            return "";
+        }
+        catch { return ""; }
+    }
+
+    static string QuotePath(string p)
+    {
+        return p.IndexOf(' ') >= 0 ? "\"" + p + "\"" : p;
+    }
+
+    // 发送前把输入框里的 [图片 xxx.png] 换回真实路径；模型只认路径，不认短标记。
+    string ExpandAttachMarks(string text)
+    {
+        if (string.IsNullOrEmpty(text) || _attachPaths.Count == 0) return text;
+        foreach (KeyValuePair<string, string> kv in _attachPaths)
+            text = text.Replace(kv.Key, QuotePath(kv.Value));
+        return text;
+    }
+
+    void InsertText(string t)
+    {
+        if (txtInput == null || t == null || t.Length == 0) return;
+        string cur = txtInput.Text;
+        bool needNl = cur.Length > 0 && !cur.EndsWith("\n");
+        txtInput.Text = cur + (needNl ? "\n" : "") + t + "\n";
+        txtInput.SelectionStart = txtInput.TextLength;
+        txtInput.Focus();
+        UpdateSendButton();
+    }
+
     // ============================ 发送 ============================
+
+    // 智能意图澄清（2026-10-16）：跑在回合工作线程上。
+    //   返回 null / 空 → 不澄清，用原指令；返回别的字符串 = 用户选中项（或第 3 次自动用推荐项）的 command。
+    // 任何一步出问题（没开关 / 没有可用提供商 / 超时 / 非 200 / JSON 解析失败 / options < 2 / 用户跳过）
+    // 都退化成"按原指令执行"，绝不阻塞主流程。
+    string ClarifyText(string text)
+    {
+        try
+        {
+            if (config == null || !config.clarify) return null;
+            if (Clarify.LooksStructured(text)) return null;   // 「/计划 开」这类精确命令不拿去问
+            string model;
+            Provider p = Clarify.PickProvider(config, out model);
+            if (p == null) return null;                       // 找不到 deepseek 提供商 / Key 为空 / 模型列表为空 → 静默跳过
+
+            Clarify.Result r = Clarify.Ask(config, text);
+            if (!Clarify.ShouldAsk(config, r)) return null;    // 无歧义 / options 不足 2 项 → 原指令直接下发
+
+            // 同一条原始输入已经弹过 2 次澄清：第 3 次不再弹，直接用推荐项（第一个选项）的 command
+            if (Clarify.Count(text) >= Clarify.AskLimit)
+            {
+                string auto = Clarify.CommandOf(r, 0);
+                if (auto != null)
+                {
+                    Log.Audit("意图澄清 · 同一指令已问过 " + Clarify.Count(text) + " 次，改用推荐项：" + Txt.FirstLine(auto));
+                    Write(OutKind.Info, "· 这条指令已经确认过 " + Clarify.Count(text) + " 次，这次按推荐项「"
+                        + (r.First() == null ? "" : r.First().label) + "」执行\n");
+                    return auto;
+                }
+                return null;
+            }
+
+            int pick = AskClarifyOnUi(r);
+            Clarify.Bump(text);                                // 弹过才算一次
+            if (pick < 0) return null;                         // 跳过 / ESC / 关窗 = 用原指令
+            string cmd = Clarify.CommandOf(r, pick);
+            return cmd;                                        // 原样下发，不二次拼接
+        }
+        catch (Exception ex) { Log.Swallow(ex, "意图澄清"); return null; }
+    }
+
+    // 弹窗一律回 UI 线程（工作线程直接 new Form 会出跨线程的怪问题）。取不到结果就按跳过处理。
+    int AskClarifyOnUi(Clarify.Result r)
+    {
+        object box = null;
+        try
+        {
+            if (IsDisposed || !IsHandleCreated) return -1;
+            box = Invoke(new Func<int>(delegate
+            {
+                using (ClarifyForm dlg = new ClarifyForm(r.title, r.options))
+                {
+                    dlg.ShowDialog(this);
+                    return dlg.SelectedIndex;
+                }
+            }));
+        }
+        catch (Exception ex) { Log.Swallow(ex, "意图澄清弹窗"); return -1; }
+        return box == null ? -1 : (int)box;
+    }
 
     void SendMessage()
     {
         if (running) return;
-        string text = txtInput.Text.Trim();
+        string text = ExpandAttachMarks(txtInput.Text.Trim());
         if (text.Length == 0) return;
         txtInput.Clear();
         tabs.SelectedIndex = 0;
@@ -11886,15 +18421,30 @@ class MainForm : Form, IAgentUI
         trace.Break();
         trace.AddChunk(OutKind.Info, "· 第 " + turnNo + " 轮\n");
         runner.Cancelled = false;
-        Thread t = new Thread(delegate()
+        Task.Run(async delegate
         {
-            try { runner.RunTurn(text); }
+            // 进执行引擎之前先问一句"你到底要哪一种"（意图澄清）。
+            // 检测 + 网络都在这个回合线程上；弹窗走 Invoke 回 UI 线程。
+            // 检测失败 / 超时 / 用户跳过 → 用原 text 继续，行为与以前完全一致。
+            try
+            {
+                string use = ClarifyText(text);
+                if (use != null && use.Length > 0 && use != text) text = use;
+            }
+            catch (Exception ex) { Log.Swallow(ex, "意图澄清"); }
+            try { await runner.RunTurnAsync(text); }
             catch (LocalAgentException ex)
             {
-                if (ex.Message != "__CANCELLED__") SafeWrite(OutKind.Error, "\n× " + ex.Message + "\n");
+                if (ex.Message != "__CANCELLED__")
+                    SafeWrite(OutKind.Error, MainForm.ErrorText("本轮中断", ex.Message,
+                        "可以直接重发上一句话重试；若是连接问题，先在设置里点「重新加载模型」"));
                 else SafeWrite(OutKind.Error, "\n! 已中断本轮\n");
             }
-            catch (Exception ex) { SafeWrite(OutKind.Error, "\n× 出错：" + ex.Message + "\n"); }
+            catch (Exception ex)
+            {
+                SafeWrite(OutKind.Error, MainForm.ErrorText("本次操作出错", ex.Message,
+                    "可以把上面的错误发给我，或换个说法重试一次"));
+            }
             finally
             {
                 running = false;
@@ -11909,8 +18459,6 @@ class MainForm : Form, IAgentUI
                 });
             }
         });
-        t.IsBackground = true;
-        t.Start();
     }
 
     // ============================ 窗口事件 ============================
@@ -11921,6 +18469,8 @@ class MainForm : Form, IAgentUI
     const int WM_NCCALCSIZE = 0x0083;
     const int WM_NCHITTEST = 0x0084;
     const int WM_ACTIVATEAPP = 0x001C;
+    const int WM_DPICHANGED = 0x02E0;
+
     const int HTCLIENT = 1;
     const int HTCAPTION = 2;
 
@@ -11986,6 +18536,25 @@ class MainForm : Form, IAgentUI
             return;
         }
 
+        if (m.Msg == WM_DPICHANGED)
+        {
+            // PerMonitorV2：窗口跨屏时按新 DPI 重排，不再重启进程。
+            int dpi = (int)(((long)m.WParam >> 16) & 0xFFFF);
+            int old = (int)Math.Round(Theme.Dpi * 96);
+            if (dpi > 0 && Math.Abs(dpi - old) > 8)
+            {
+                try
+                {
+                    Theme.Dpi = dpi / 96f;
+                    BeginInvoke(new MethodInvoker(delegate
+                    {
+                        try { LayoutUi(); Invalidate(true); } catch { }
+                    }));
+                }
+                catch { }
+            }
+        }
+
         base.WndProc(ref m);
     }
 
@@ -12008,7 +18577,7 @@ class MainForm : Form, IAgentUI
         }
 
         // 顶部这一条当标题栏用：拖动、双击最大化、贴边分屏都由系统处理
-        if (pt.Y >= 0 && pt.Y <= D(40))
+        if (pt.Y >= 0 && pt.Y <= D(37))
         {
             foreach (Control c in Controls)
                 if (c.Visible && c.Bounds.Contains(pt)) return 0;   // 按钮/面板自己处理点击
@@ -12033,20 +18602,43 @@ class MainForm : Form, IAgentUI
     protected override void OnPaint(PaintEventArgs e)
     {
         base.OnPaint(e);
-        // 顶部这一条就是自绘标题栏，只画一条和下面内容区的分隔线
-        using (Pen p = new Pen(Theme.LineSoft, Theme.Pxf(1f)))
-            e.Graphics.DrawLine(p, 0, D(40) - 1, ClientSize.Width, D(40) - 1);
+        // 顶部这一条是自绘标题栏：跟侧栏一个浅灰色（Codex 的标题栏和侧栏本来就是一块），
+        // 底边留一条分隔线。
+        using (SolidBrush b = new SolidBrush(Theme.Chrome))
+            e.Graphics.FillRectangle(b, 0, 0, ClientSize.Width, D(37));
+        using (Pen p = new Pen(Theme.Line, Theme.Pxf(1f)))
+            e.Graphics.DrawLine(p, 0, D(37) - 1, ClientSize.Width, D(37) - 1);
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
         try
         {
+            if (_popFilter != null) { Application.RemoveMessageFilter(_popFilter); _popFilter = null; }
             if (runner != null) runner.Cancel();
             SaveCurrentSession();
         }
         catch { }
         base.OnFormClosing(e);
+    }
+
+    // 给 PopoverDismissFilter 用：点在 chip（或它的子控件）上不算"点别处"。
+    internal bool IsPopoverAnchor(Control c)
+    {
+        for (Control x = c; x != null; x = x.Parent)
+        {
+            if (x == cmbModel || x == permChip || x == modeChip) return true;
+        }
+        return false;
+    }
+
+    internal void ClosePopoversFromFilter()
+    {
+        if (modelPop != null || permPop != null)
+        {
+            CloseModelPopover();
+            ClosePermPopover();
+        }
     }
 
     // ---------------- 输入条上的模型浮层（自绘，不用 ContextMenuStrip） ----------------
@@ -12061,7 +18653,7 @@ class MainForm : Form, IAgentUI
     {
         ModelPopover p = modelPop;
         modelPop = null;
-        if (cmbModel != null) { cmbModel.Expanded = false; cmbModel.Invalidate(); }
+        if (cmbModel != null) { cmbModel.Expanded = false; cmbModel.Active = false; cmbModel.Invalidate(); }
         if (p != null)
         {
             try { p.Hide(); p.Dispose(); }
@@ -12114,6 +18706,7 @@ class MainForm : Form, IAgentUI
         };
         modelPop = p;
         cmbModel.Expanded = true;
+        cmbModel.Active = true;          // 浮层开着 → chip 浮出一块浅灰底（Codex 那样）
         cmbModel.Invalidate();
         // 浮层自己不抢焦点（Show() 会顺手激活新窗口，让主窗口"失活"）。所以：
         //   1. 临时压住"失活就关"的判断，等真正弹出来再放开；
@@ -12148,11 +18741,64 @@ class MainForm : Form, IAgentUI
         ClosePermPopover();
     }
 
+    bool _wasMinimized;
+    Size _restoreSize;
+    bool _restoringSize;
+    bool _restorePending;
+
     protected override void OnResize(EventArgs e)
     {
         base.OnResize(e);
+        if (_restoringSize || _restorePending) return;
         CloseModelPopover();      // 窗口尺寸一变，浮层的绝对位置也过期了
         ClosePermPopover();
+
+        if (WindowState == FormWindowState.Minimized)
+        {
+            // 最小化前记下真正的普通尺寸。WM_NCCALCSIZE 抹平非客户区后，
+            // Win32 会把"窗口尺寸"当成客户区反推，还原时每轮多出 22×56（150%）。
+            // 系统还原路径改不动，就在还原的第一时间把窗口尺寸压回这一份。
+            _wasMinimized = true;
+            return;
+        }
+
+        // 最小化→还原：客户区是系统刚还给我们的。先压回最小化前的普通尺寸，再重排 + 整窗重画。
+        // 这样既修掉"每轮长大一圈"，也不会停在最小化时算出来的退化布局上。
+        if (_wasMinimized)
+        {
+            _wasMinimized = false;
+            // WinForms 在还原消息里会按系统给的新窗口尺寸再盖一次；同步 Size= 会被盖回去。
+            // 等这一轮尺寸消息走完，再把窗口压回最小化前记下的普通尺寸。
+            if (IsHandleCreated && _restoreSize.Width > 0 && _restoreSize.Height > 0)
+            {
+                _restorePending = true;
+                BeginInvoke(new MethodInvoker(delegate
+                {
+                    try
+                    {
+                        if (WindowState == FormWindowState.Normal && Size != _restoreSize)
+                        {
+                            _restoringSize = true;
+                            try { Size = _restoreSize; }
+                            catch { }
+                            finally { _restoringSize = false; }
+                        }
+                        LayoutUi();
+                        Invalidate(true);
+                        Update();
+                    }
+                    finally { _restorePending = false; }
+                }));
+                return;
+            }
+            LayoutUi();
+            Invalidate(true);
+            Update();
+            return;
+        }
+
+        // 普通状态下的尺寸变化（用户拖动缩放 / 最大化→还原）才是下一次最小化的基准。
+        if (WindowState == FormWindowState.Normal) _restoreSize = Size;
     }
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
@@ -12182,6 +18828,32 @@ class MainForm : Form, IAgentUI
                 return true;
             }
         }
+
+        // 菜单里写的那几列快捷键：真的能用（不做"看着有、按了没反应"的假提示）
+        bool ctrl = (keyData & Keys.Control) == Keys.Control;
+        bool shift = (keyData & Keys.Shift) == Keys.Shift;
+        Keys code = keyData & Keys.KeyCode;
+        if (ctrl && tabs != null)
+        {
+            if (code == Keys.N) { NewSession(); return true; }
+            if (code == Keys.O) { PickFolder(); return true; }
+            if (shift && code == Keys.B) { ToggleBrowser(); return true; }
+            if (code == Keys.B) { ToggleSidebar(); return true; }
+            if (code == Keys.D1) { tabs.SelectedIndex = 0; SwitchTab(); return true; }
+            if (code == Keys.D2) { tabs.SelectedIndex = 1; SwitchTab(); return true; }
+            if (code == Keys.Oemcomma) { OpenSettings(); return true; }
+            if (code == Keys.Oemplus || code == Keys.Add) { AdjustZoom(1f); return true; }
+            if (code == Keys.OemMinus || code == Keys.Subtract) { AdjustZoom(-1f); return true; }
+            if (code == Keys.D0) { AdjustZoom(0f); return true; }
+            if (code == Keys.OemQuestion) { ShowShortcuts(); return true; }
+            if (shift && code == Keys.C)
+            {
+                string all = rtb != null ? rtb.AllText() : "";
+                if (all.Length > 0) { try { Clipboard.SetText(all); } catch { } lblStatus.Text = "已复制整段对话"; }
+                return true;
+            }
+        }
+        if (ctrl && code == Keys.W) { Close(); return true; }
         return base.ProcessCmdKey(ref msg, keyData);
     }
 }
@@ -12193,6 +18865,8 @@ class ModelItem
     public string ProviderId;
     public string ProviderName;
     public string Model;
+    public string Display;      // 接口给的显示名（没有就跟 Model 一样）
+    public bool? Vision;        // 能不能看图（null = 接口没说）
     public override string ToString() { return ProviderName + " / " + Model; }
 }
 
@@ -12204,9 +18878,9 @@ class PluginInstallForm : Form
     private readonly AgentConfig _c;
     private readonly Action<string> _onInstalled;
     private FieldBox _addrBox, _marketUrlBox;
-    private TextBox _txtAddr, _txtMarketUrl;
-    private CheckBox _chkOverwrite;
-    private RichTextBox _preview;
+    private UiEditor _txtAddr, _txtMarketUrl;
+    private UiCheck _chkOverwrite;
+    private UiDiff _preview;
     private ListBox _market;
     private Label _lblMsg, _lblMarketSrc, _lblPreviewHead, _lblMarketHead;
     private RoundedPanel _previewCard, _marketCard;
@@ -12257,27 +18931,27 @@ class PluginInstallForm : Form
 
         Label h1 = new Label();
         h1.Text = "从地址安装";
-        h1.Font = Theme.FB(12f);
+        h1.Font = Theme.FB(10.5f);
         h1.ForeColor = Theme.Fg;
         h1.BackColor = Theme.Bg;
         h1.AutoSize = true;
-        h1.Location = new Point(26, 18);
+        h1.Location = new Point(Theme.Px(Theme.Sp24), Theme.Px(Theme.Sp16));
         _body.Controls.Add(h1);
 
         Label hint = new Label();
         hint.Text = "可以填：json 直链 / GitHub 的 作者/仓库（会去找仓库根目录的 plugin.json）/ 本地 json 路径";
         hint.ForeColor = Theme.FgDim;
         hint.BackColor = Theme.Bg;
-        hint.Font = Theme.F(8.6f);
+        hint.Font = Theme.F(8.5f);
         hint.AutoSize = true;
-        hint.Location = new Point(28, 44);
+        hint.Location = new Point(Theme.Px(Theme.Sp24), Theme.Px(Theme.Sp24) + Theme.Px(Theme.Sp24));
         _body.Controls.Add(hint);
 
         _addrBox = new FieldBox(false);
         _addrBox.BackColor = Theme.Bg;
         _addrBox.SetBounds(26, 70, 520, 34);
         _body.Controls.Add(_addrBox);
-        _txtAddr = (TextBox)_addrBox.Inner;
+        _txtAddr = (UiEditor)_addrBox.Inner;
 
         _btnFetch = MakeButton("获取", 556, 70, 92, 34);
         _btnFetch.Click += delegate { FetchPreview(); };
@@ -12291,9 +18965,11 @@ class PluginInstallForm : Form
         _btnInstall.Click += delegate { DoInstall(); };
         _body.Controls.Add(_btnInstall);
 
-        _chkOverwrite = new CheckBox();
-        _chkOverwrite.Text = "覆盖已存在的插件";
-        _chkOverwrite.AutoSize = true;
+        _chkOverwrite = new UiCheck();
+        _chkOverwrite.Label = "覆盖已存在的插件";
+        _chkOverwrite.AccessibleName = "覆盖已存在的插件";
+        _chkOverwrite.Font = Theme.F(9.5f);
+        _chkOverwrite.Size = new Size(Theme.Px(220), Theme.Px(23));
         _chkOverwrite.ForeColor = Theme.FgMid;
         _chkOverwrite.BackColor = Theme.Bg;
         _chkOverwrite.Location = new Point(556, 112);
@@ -12309,23 +18985,16 @@ class PluginInstallForm : Form
         _body.Controls.Add(_lblPreviewHead);
 
         _previewCard = new RoundedPanel();
-        _previewCard.Radius = 12;
+        _previewCard.Radius = Theme.RadCard;
         _previewCard.Fill = Theme.Card;
         _previewCard.BorderColor = Theme.Line;
         _previewCard.BackColor = Theme.Bg;
-        _previewCard.Padding = new Padding(14, 12, 14, 12);
+        _previewCard.Padding = new Padding(Theme.Sp16, Theme.Sp12, Theme.Sp16, Theme.Sp12);
         _previewCard.SetBounds(26, 140, 722, 180);
         _body.Controls.Add(_previewCard);
 
-        _preview = new RichTextBox();
+        _preview = new UiDiff();
         _preview.Dock = DockStyle.Fill;
-        _preview.BorderStyle = BorderStyle.None;
-        _preview.ReadOnly = true;
-        _preview.WordWrap = true;
-        _preview.ScrollBars = RichTextBoxScrollBars.Vertical;
-        _preview.BackColor = Theme.Card;
-        _preview.ForeColor = Theme.FgMid;
-        _preview.Font = Theme.F(9.5f);
         _preview.Text = "还没有获取内容。填好地址点「获取」，这里会显示这个插件声明了什么。";
         _previewCard.Controls.Add(_preview);
 
@@ -12333,7 +19002,7 @@ class PluginInstallForm : Form
         warn.Text = "⚠ 插件能让 agent 跑 PowerShell 命令、发网络请求。只装你信任的来源，装完先看一眼上面的预览。";
         warn.ForeColor = Theme.Warn;
         warn.BackColor = Theme.Bg;
-        warn.Font = Theme.F(8.6f);
+        warn.Font = Theme.F(8.5f);
         warn.AutoSize = true;
         warn.Location = new Point(28, 328);
         _body.Controls.Add(warn);
@@ -12342,7 +19011,7 @@ class PluginInstallForm : Form
         _lblMarketHead.Text = "插件市场";
         _lblMarketHead.ForeColor = Theme.Fg;
         _lblMarketHead.BackColor = Theme.Bg;
-        _lblMarketHead.Font = Theme.FB(12f);
+        _lblMarketHead.Font = Theme.FB(10.5f);
         _lblMarketHead.AutoSize = true;
         _lblMarketHead.Location = new Point(26, 362);
         _body.Controls.Add(_lblMarketHead);
@@ -12350,7 +19019,7 @@ class PluginInstallForm : Form
         _lblMarketSrc = new Label();
         _lblMarketSrc.ForeColor = Theme.FgFaint;
         _lblMarketSrc.BackColor = Theme.Bg;
-        _lblMarketSrc.Font = Theme.F(8.4f);
+        _lblMarketSrc.Font = Theme.F(8.5f);
         _lblMarketSrc.AutoSize = false;
         _lblMarketSrc.SetBounds(120, 368, 628, 18);
         _body.Controls.Add(_lblMarketSrc);
@@ -12359,7 +19028,7 @@ class PluginInstallForm : Form
         _marketUrlBox.BackColor = Theme.Bg;
         _marketUrlBox.SetBounds(26, 394, 470, 34);
         _body.Controls.Add(_marketUrlBox);
-        _txtMarketUrl = (TextBox)_marketUrlBox.Inner;
+        _txtMarketUrl = (UiEditor)_marketUrlBox.Inner;
         _txtMarketUrl.Text = _c.plugin_market_url == null ? "" : _c.plugin_market_url;
 
         _btnSaveUrl = MakeButton("保存地址", 506, 394, 110, 34);
@@ -12377,18 +19046,18 @@ class PluginInstallForm : Form
         _body.Controls.Add(_btnReloadMarket);
 
         _marketCard = new RoundedPanel();
-        _marketCard.Radius = 12;
-        _marketCard.Fill = Color.White;
+        _marketCard.Radius = Theme.RadCard;
+        _marketCard.Fill = Theme.Card;
         _marketCard.BorderColor = Theme.Line;
         _marketCard.BackColor = Theme.Bg;
-        _marketCard.Padding = new Padding(5);
+        _marketCard.Padding = new Padding(Theme.Sp4);
         _marketCard.SetBounds(26, 438, 722, 130);
         _body.Controls.Add(_marketCard);
 
-        _market = new ListBox();
+        _market = new UiList();
         _market.Dock = DockStyle.Fill;
         _market.BorderStyle = BorderStyle.None;
-        _market.BackColor = Color.White;
+        _market.BackColor = Theme.Card;
         _market.ForeColor = Theme.Fg;
         _market.Font = Theme.F(9.5f);
         _market.IntegralHeight = false;
@@ -12410,7 +19079,7 @@ class PluginInstallForm : Form
         _lblMsg = new Label();
         _lblMsg.ForeColor = Theme.FgDim;
         _lblMsg.BackColor = Theme.Bg;
-        _lblMsg.Font = Theme.F(8.8f);
+        _lblMsg.Font = Theme.F(9.5f);
         _lblMsg.AutoSize = false;
         _lblMsg.SetBounds(344, 582, 404, 26);
         _body.Controls.Add(_lblMsg);
@@ -12430,7 +19099,7 @@ class PluginInstallForm : Form
         _btnClose.BorderColor = Theme.Line;
         _btnClose.FillColor = Color.White;
         _btnClose.HoverColor = Theme.Hover;
-        _btnClose.Radius = 10;
+        _btnClose.Radius = Theme.RadCard;
         _btnClose.Font = Theme.F(9.5f);
         _btnClose.Size = new Size(96, 36);
         _btnClose.Click += delegate { Close(); };
@@ -12447,7 +19116,7 @@ class PluginInstallForm : Form
     void LayoutBody()
     {
         int w = _body.ClientSize.Width;
-        int m = Theme.Px(26);
+        int m = Theme.Px(Theme.Sp24);
         int inner = Math.Max(Theme.Px(360), w - m * 2);
         _addrBox.SetBounds(m, Theme.Px(70), Math.Max(Theme.Px(200), inner - Theme.Px(202)), Theme.Px(34));
         _btnFetch.SetBounds(m + inner - Theme.Px(192), Theme.Px(70), Theme.Px(92), Theme.Px(34));
@@ -12469,8 +19138,8 @@ class PluginInstallForm : Form
         b.BorderColor = Theme.Line;
         b.FillColor = Color.White;
         b.HoverColor = Theme.Hover;
-        b.Radius = 9;
-        b.Font = Theme.F(9f);
+        b.Radius = Theme.RadRow;
+        b.Font = Theme.F(9.5f);
         b.SetBounds(x, y, w, h);
         return b;
     }
@@ -12514,7 +19183,7 @@ class PluginInstallForm : Form
         SetMsg(msg);
         _pendingText = null;
         if (_onInstalled != null) _onInstalled(path);
-        MessageBox.Show(this, msg + "\n\n可以在「插件」窗口里启用/停用它。", "安装完成",
+        UiMsg.Show(this, msg + "\n\n可以在「插件」窗口里启用/停用它。", "安装完成",
             MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
@@ -12539,7 +19208,7 @@ class PluginInstallForm : Form
         _txtAddr.Text = e.url;
         FetchPreview();
         if (_pendingText == null) return;
-        if (MessageBox.Show(this, "要安装「" + (e.name == null ? e.url : e.name) + "」吗？\n\n插件能让 agent 跑命令，只装你信任的来源。",
+        if (UiMsg.Show(this, "要安装「" + (e.name == null ? e.url : e.name) + "」吗？\n\n插件能让 agent 跑命令，只装你信任的来源。",
                 "安装插件", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) return;
         DoInstall();
     }
@@ -12576,8 +19245,8 @@ class PluginsForm : Form
     private readonly MethodInvoker _onChanged;
     private ListBox _list;
     private Label _lblName, _lblMeta, _lblDesc, _lblPath, _lblToolsHead;
-    private CheckBox _chkEnabled;
-    private RichTextBox _detail;
+    private UiCheck _chkEnabled;
+    private UiDiff _detail;
     private RoundedPanel _card;
     private UiButton _btnReload, _btnOpen, _btnSample, _btnClose, _btnInstall;
     private List<PluginInfo> _plugins = new List<PluginInfo>();
@@ -12602,7 +19271,8 @@ class PluginsForm : Form
         MinimizeBox = false;
         MaximizeBox = false;
         ShowInTaskbar = false;
-        FormBorderStyle = FormBorderStyle.Sizable;
+        FormBorderStyle = FormBorderStyle.None;
+        Padding = new Padding(0, Theme.Px(40), 0, 0);
 
         BuildChrome();
         if (Theme.Dpi > 1.01f)
@@ -12612,6 +19282,17 @@ class PluginsForm : Form
             MinimumSize = new Size(Theme.Px(760), Theme.Px(520));
         }
         Reload();
+        ChromeBar bar = new ChromeBar("Ahz Scribe — 插件");
+        bar.Bounds = new Rectangle(0, 0, ClientSize.Width, Theme.Px(40));
+        bar.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+        bar.Closed += delegate { Close(); };
+        Controls.Add(bar);
+        bar.BringToFront();
+        SizeGrip grip = new SizeGrip(this);
+        grip.SetBounds(ClientSize.Width - grip.Width, ClientSize.Height - grip.Height, grip.Width, grip.Height);
+        Controls.Add(grip);
+        grip.BringToFront();
+        Height += Theme.Px(40);
     }
 
     protected override void OnHandleCreated(EventArgs e)
@@ -12656,19 +19337,19 @@ class PluginsForm : Form
         nav.Controls.Add(hint);
 
         RoundedPanel listCard = new RoundedPanel();
-        listCard.Radius = 10;
-        listCard.Fill = Color.White;
+        listCard.Radius = Theme.RadCard;
+        listCard.Fill = Theme.Card;
         listCard.BorderColor = Theme.Line;
         listCard.BackColor = Theme.Side;
-        listCard.Padding = new Padding(5);
+        listCard.Padding = new Padding(Theme.Sp4);
         listCard.SetBounds(14, 76, 222, 400);
-        listCard.Anchor = AnchorStyles.Top | AnchorStyles.Left;
+        // 残留的 Anchor 删掉：缩放 + 锚点会互相打架（算出来的位置会跑到窗口外面），这里不用它
         nav.Controls.Add(listCard);
 
-        _list = new ListBox();
+        _list = new UiList();
         _list.Dock = DockStyle.Fill;
         _list.BorderStyle = BorderStyle.None;
-        _list.BackColor = Color.White;
+        _list.BackColor = Theme.Card;
         _list.ForeColor = Theme.Fg;
         _list.Font = Theme.F(9.5f);
         _list.DrawMode = DrawMode.OwnerDrawFixed;
@@ -12746,7 +19427,7 @@ class PluginsForm : Form
         Panel body = new Panel();
         body.Dock = DockStyle.Fill;
         body.BackColor = Theme.Bg;
-        body.Padding = new Padding(26, 22, 26, 0);
+        body.Padding = new Padding(Theme.Sp24, Theme.Sp24, Theme.Sp24, 0);
 
         _lblName = new Label();
         _lblName.Text = "（没有插件）";
@@ -12760,14 +19441,16 @@ class PluginsForm : Form
         _lblMeta = new Label();
         _lblMeta.ForeColor = Theme.FgDim;
         _lblMeta.BackColor = Theme.Bg;
-        _lblMeta.Font = Theme.F(9f);
+        _lblMeta.Font = Theme.F(9.5f);
         _lblMeta.AutoSize = true;
         _lblMeta.Location = new Point(28, 50);
         body.Controls.Add(_lblMeta);
 
-        _chkEnabled = new CheckBox();
-        _chkEnabled.Text = "启用这个插件（启用的插件，它的工具会出现在模型的工具列表里）";
-        _chkEnabled.AutoSize = true;
+        _chkEnabled = new UiCheck();
+        _chkEnabled.Label = "启用这个插件（启用的插件，它的工具会出现在模型的工具列表里）";
+        _chkEnabled.AccessibleName = "启用这个插件";
+        _chkEnabled.Font = Theme.F(9.5f);
+        _chkEnabled.Size = new Size(Theme.Px(680), Theme.Px(23));
         _chkEnabled.ForeColor = Theme.FgMid;
         _chkEnabled.BackColor = Theme.Bg;
         _chkEnabled.Location = new Point(26, 76);
@@ -12791,7 +19474,7 @@ class PluginsForm : Form
         _lblPath = new Label();
         _lblPath.ForeColor = Theme.FgFaint;
         _lblPath.BackColor = Theme.Bg;
-        _lblPath.Font = Theme.F(8.4f);
+        _lblPath.Font = Theme.F(8.5f);
         _lblPath.AutoSize = false;
         _lblPath.SetBounds(26, 150, 560, 20);
         body.Controls.Add(_lblPath);
@@ -12800,7 +19483,7 @@ class PluginsForm : Form
         _lblToolsHead.Text = "工具";
         _lblToolsHead.ForeColor = Theme.Fg;
         _lblToolsHead.BackColor = Theme.Bg;
-        _lblToolsHead.Font = Theme.FB(10f);
+        _lblToolsHead.Font = Theme.FB(10.5f);
         _lblToolsHead.AutoSize = true;
         _lblToolsHead.Location = new Point(26, 182);
         body.Controls.Add(_lblToolsHead);
@@ -12810,32 +19493,25 @@ class PluginsForm : Form
         _card.Fill = Theme.Card;
         _card.BorderColor = Theme.Line;
         _card.BackColor = Theme.Bg;
-        _card.Padding = new Padding(14, 12, 14, 12);
+        _card.Padding = new Padding(Theme.Sp16, Theme.Sp12, Theme.Sp16, Theme.Sp12);
         _card.SetBounds(26, 210, 600, 300);
         body.Controls.Add(_card);
 
-        _detail = new RichTextBox();
+        _detail = new UiDiff();
         _detail.Dock = DockStyle.Fill;
-        _detail.BorderStyle = BorderStyle.None;
-        _detail.ReadOnly = true;
-        _detail.WordWrap = true;
-        _detail.ScrollBars = RichTextBoxScrollBars.Vertical;
-        _detail.BackColor = Theme.Card;
-        _detail.ForeColor = Theme.FgMid;
-        _detail.Font = Theme.F(9.5f);
         _card.Controls.Add(_detail);
 
         Label foot = new Label();
         foot.Text = "插件工具默认每次都要你点「允许」才会执行（shell 类型始终需要确认）。插件文件放在程序目录的 plugins\\ 里，一个 json 就是一个插件。";
         foot.ForeColor = Theme.FgFaint;
         foot.BackColor = Theme.Bg;
-        foot.Font = Theme.F(8.4f);
+        foot.Font = Theme.F(8.5f);
         foot.AutoSize = false;
         foot.SetBounds(26, 522, 600, 40);
         body.Controls.Add(foot);
         body.Resize += delegate
         {
-            int m = Theme.Px(26);
+            int m = Theme.Px(Theme.Sp24);
             int w = Math.Max(Theme.Px(260), body.ClientSize.Width - m * 2);
             _lblDesc.SetBounds(m, Theme.Px(108), w, Theme.Px(40));
             _lblPath.SetBounds(m, Theme.Px(150), w, Theme.Px(20));
@@ -12858,7 +19534,7 @@ class PluginsForm : Form
         _btnClose.FillColor = Theme.Accent;
         _btnClose.HoverColor = Theme.AccentHover;
         _btnClose.TextColor = Color.White;
-        _btnClose.Radius = 10;
+        _btnClose.Radius = Theme.RadCard;
         _btnClose.Font = Theme.F(9.5f);
         _btnClose.Size = new Size(96, 36);
         _btnClose.Click += delegate { Close(); };
@@ -12881,7 +19557,7 @@ class PluginsForm : Form
         b.BorderColor = Theme.Line;
         b.FillColor = Color.White;
         b.HoverColor = Theme.Hover;
-        b.Radius = 9;
+        b.Radius = Theme.RadRow;
         b.Font = Theme.F(9f);
         return b;
     }
@@ -12993,7 +19669,7 @@ class PluginsForm : Form
         string sub = p.Error != null ? "读取失败"
             : (on ? p.Tools.Count + " 个工具" + (np > 0 ? " · " + np + " 条技能" : "") : "已停用");
         Rectangle sr = new Rectangle(e.Bounds.X + pad, e.Bounds.Y + Theme.Px(21), e.Bounds.Width - pad * 2, Theme.Px(15));
-        TextRenderer.DrawText(e.Graphics, sub, Theme.F(8.2f), sr, p.Error != null ? Theme.Err : Theme.FgFaint,
+        TextRenderer.DrawText(e.Graphics, sub, Theme.F(8.5f), sr, p.Error != null ? Theme.Err : Theme.FgFaint,
             TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
     }
 }
@@ -13008,38 +19684,41 @@ class SettingsForm : Form
     private int _page;
 
     private ListBox _lstProviders;
-    private TextBox _txtName;
-    private ComboBox _cmbType;
-    private TextBox _txtBase;
-    private TextBox _txtKey;
-    private TextBox _txtModels;
-    private CheckBox _chkShowKey;
+    private UiEditor _txtName;
+    private UiDrop _cmbType;                  // 原来是系统 ComboBox（FlatStyle=Flat），和另外两个下拉不是一套质感
+    private UiEditor _txtBase;
+    private UiPasswordBox _txtKey;
+    private UiEditor _txtModels;
+    private UiCheck _chkShowKey;
     private Label _lblHint;
     private bool _loading;
 
-    private TextBox _txtCwd;
+    private UiEditor _txtCwd;
     private UiDrop _cmbCtx;
-    private NumericUpDown _numSteps;
-    private NumericUpDown _numTimeout;
-    private CheckBox _chkThink;
+    private UiNumber _numSteps;
+    private UiNumber _numTimeout;
+    private UiCheck _chkThink;
     private UiDrop _cmbPerm;
     private Action<string> _onPermChanged;    // 设置页改权限档时通知主窗口刷新 chip
-    private CheckBox _chkOutside;
-    private CheckBox _chkVerify;
-    private CheckBox _chkHideThink;
+    private UiCheck _chkOutside;
+    private UiCheck _chkVerify;
+    private UiCheck _chkHideThink;
+    private UiCheck _chkClarify;         // 意图澄清开关（默认开）
+    private UiCheck _chkRemote;
     private Panel _navPanel;
     private Label _lblSec;
     private UiButton _btnAddProvider, _btnDelProvider, _btnFetch;
     private RoundedPanel _lstCard;
     private FieldBox _modelsBox;
     private string _autoBase = "";      // 上一次"自动填进去"的接口地址（用户手改过就不再覆盖）
+    private readonly ToolTip _tip = new ToolTip();   // 模型列表明细（接口声明了哪些能力）挂在它上面
     private FieldBox _cwdBox;
     private UiButton _btnPickCwd;
     private RoundedPanel _generalCard, _aboutCard;
     // 运行日志页（位置一律由 LayoutLogPage 按页面尺寸算，不用 Anchor）
     private Panel _logPage;
     private Label _logHead, _logTip;
-    private TextBox _logBox;
+    private UiDiff _logBox;
     private UiButton _btnLogRefresh, _btnLogOpen, _btnLogClear;
 
     public SettingsForm(AgentConfig config)
@@ -13063,7 +19742,8 @@ class SettingsForm : Form
         BackColor = Theme.Bg;
         ForeColor = Theme.Fg;
         Font = Theme.F(9.5f);
-        FormBorderStyle = FormBorderStyle.FixedDialog;
+        FormBorderStyle = FormBorderStyle.None;
+        Padding = new Padding(0, Theme.Px(40), 0, 0);
         MinimizeBox = false;
         MaximizeBox = false;
         ShowInTaskbar = false;
@@ -13076,6 +19756,13 @@ class SettingsForm : Form
         LoadProviders();
         LoadGeneral();
         ApplyDpiScale();
+        ChromeBar bar = new ChromeBar("Ahz Scribe — 设置");
+        bar.Bounds = new Rectangle(0, 0, ClientSize.Width, Theme.Px(40));
+        bar.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+        bar.Closed += delegate { Close(); };
+        Controls.Add(bar);
+        bar.BringToFront();
+        Height += Theme.Px(40);
     }
 
     protected override void OnHandleCreated(EventArgs e)
@@ -13084,18 +19771,74 @@ class SettingsForm : Form
         Native.RoundWindow(Handle);
     }
 
+    protected override void OnShown(EventArgs e)
+    {
+        base.OnShown(e);
+        Theme.DarkenTree(this);
+    }
+
     // 和主窗口一样：按屏幕 DPI 等比放大，否则 150% 缩放下字挤在一起
     void ApplyDpiScale()
     {
         Theme.EnsureDpi();
-        if (Theme.Dpi <= 1.01f) return;
-        Theme.ScaleBounds(this, Theme.Dpi);
-        Size = new Size(Theme.Px(1000), Theme.Px(660));
-        MinimumSize = new Size(Theme.Px(820), Theme.Px(540));
+        if (Theme.Dpi > 1.01f)
+        {
+            Theme.ScaleBounds(this, Theme.Dpi);
+            Size = new Size(Theme.Px(1000), Theme.Px(660));
+            MinimumSize = new Size(Theme.Px(820), Theme.Px(540));
+        }
+        // 这三步在 100% 缩放下也要跑：页面刚建出来时还是 200×100 的隐藏尺寸，
+        // 不重排会出现"卡片装不下最后一个复选框"（以前只在 DPI>1 时调用，100% 下同样有坑）。
+        LayoutGeneralFields();
         LayoutModelPage();     // 按放大后的页面尺寸重新摆一遍（否则底部按钮会被推到可视区外）
         LayoutOtherPages();
         LayoutLogPage();
         RepositionFields(this);   // 输入框内部文字也重摆一遍（防"比框宽 / 偏下"）
+        LayoutFields(this);       // 下拉那类"没有 Inner"的 FieldBox：把子控件铺满框内
+    }
+
+    // 通用设置页的"审批与安全"卡片：权限下拉和下面的复选框按实际高度顺排。
+    // 不能只写死 y=80/112：_cmbPerm 的高度已经含 DPI（Theme.Px(CtrlHeight)），
+    // ScaleBounds 之后会再长一截，写死 112 的复选框就会被下拉压住（2026-10-18 验收 P0）。
+    void LayoutGeneralFields()
+    {
+        if (_cmbPerm == null || _chkOutside == null) return;
+        // _cmbPerm 的 y/宽已经是放大后的值；高度在 Build 时先乘过一次 DPI，这里拉回本 DPI 下的 CtrlHeight。
+        _cmbPerm.Height = Theme.Px(Theme.CtrlHeight);
+        int left = _chkOutside.Left;
+        int y = _cmbPerm.Bottom + Theme.Px(Theme.Sp8);
+        _chkOutside.Location = new Point(left, y);
+        y = _chkOutside.Bottom + Theme.Px(Theme.Sp4);
+        _chkVerify.Location = new Point(left, y);
+        y = _chkVerify.Bottom + Theme.Px(Theme.Sp4);
+        _chkHideThink.Location = new Point(left, y);
+        y = _chkHideThink.Bottom + Theme.Px(Theme.Sp4);
+        _chkClarify.Location = new Point(left, y);
+        y = _chkClarify.Bottom + Theme.Px(Theme.Sp4);
+        _chkRemote.Location = new Point(left, y);
+    }
+
+    // 和 RepositionFields 成对：FieldBox 里的 Inner 被换成 UiDrop 之后，ScaleBounds 不递归进
+    // FieldBox、Reposition 又只管 Inner —— 结果就是"小下拉框待在大空框左上角"。
+    // 这里统一补一刀：子控件按框当前尺寸铺满（留 1px 给外框描边）。
+    static void LayoutFields(Control root)
+    {
+        foreach (Control c in root.Controls)
+        {
+            FieldBox fb = c as FieldBox;
+            if (fb != null)
+            {
+                if (fb.Inner != null) fb.Reposition();
+                else
+                {
+                    int i = Theme.Px(1);
+                    foreach (Control kid in fb.Controls)
+                        kid.SetBounds(i, i, Math.Max(Theme.Px(10), fb.ClientSize.Width - i * 2),
+                            Math.Max(Theme.Px(10), fb.ClientSize.Height - i * 2));
+                }
+            }
+            if (c.Controls.Count > 0) LayoutFields(c);
+        }
     }
 
     // 递归把所有 FieldBox 的内部输入框重摆一次
@@ -13115,7 +19858,7 @@ class SettingsForm : Form
     {
         _navPanel = new Panel();
         _navPanel.Dock = DockStyle.Left;
-        _navPanel.Width = 214;
+        _navPanel.Width = 212;                    // 栅格：212 = 侧栏内边距 Sp16 两侧 + 行宽 180
         _navPanel.BackColor = Theme.Side;
         _navPanel.Paint += delegate(object s, PaintEventArgs e)
         {
@@ -13125,7 +19868,9 @@ class SettingsForm : Form
 
         LogoMark logo = new LogoMark();
         logo.BackColor = Theme.Side;
-        logo.SetBounds(20, 22, 24, 24);
+        // 这里一律写逻辑值：ApplyDpiScale() 还会对整窗做一次 ScaleBounds，
+        // 先乘 Theme.Px 等于乘两次（2026-10-18 验收：导航按钮 405 > 父容器 318）。
+        logo.SetBounds(Theme.Sp16, Theme.Sp24, Theme.Sp24, Theme.Sp24);
         _navPanel.Controls.Add(logo);
 
         Label title = new Label();
@@ -13134,11 +19879,13 @@ class SettingsForm : Form
         title.ForeColor = Theme.Fg;
         title.AutoSize = true;
         title.BackColor = Theme.Side;
-        title.Location = new Point(54, 24);
+        title.Location = new Point(Theme.Sp16 + 34, Theme.Sp24);
         _navPanel.Controls.Add(title);
 
         string[] names = new string[] { "通用设置", "模型", "运行日志", "关于" };
         string[] icons = new string[] { "gear", "spark", "list", "info" };
+        // 和主窗体同一套节奏：行高 36、行间距 40、左内边距走令牌（逻辑值，交给 ScaleBounds）
+        int navRowH = 36, navStep = 40, navTop = 72;
         _nav = new UiButton[names.Length];
         for (int i = 0; i < names.Length; i++)
         {
@@ -13147,17 +19894,17 @@ class SettingsForm : Form
             b.Tag = i;
             b.Icon = icons[i];
             b.IconSize = 16;
-            b.IconGap = 9;
+            b.IconGap = Theme.Sp8;
             b.Align = ContentAlignment.MiddleLeft;
-            b.Padding = new Padding(12, 0, 0, 0);
+            b.Padding = new Padding(Theme.Sp12, 0, 0, 0);
             b.FillColor = Theme.Clear;
             b.HoverColor = Theme.Hover;
             b.TextColor = Theme.FgMid;
             b.ActiveFill = Theme.AccentSoft;
             b.ActiveText = Theme.Accent;
-            b.Radius = 9;
+            b.Radius = Theme.RadMenu;              // 标题栏那些小按钮吸附 RadMenu
             b.Font = Theme.F(9.5f);
-            b.SetBounds(16, 74 + i * 42, 182, 36);
+            b.SetBounds(Theme.Sp16, navTop + i * navStep, 180, navRowH);
             b.Click += delegate(object s, EventArgs e) { ShowPage((int)((UiButton)s).Tag); };
             _navPanel.Controls.Add(b);
             _nav[i] = b;
@@ -13167,9 +19914,10 @@ class SettingsForm : Form
         _lblSec.Text = "改完记得点右下角「保存」";
         _lblSec.ForeColor = Theme.FgFaint;
         _lblSec.BackColor = Theme.Side;
-        _lblSec.Font = Theme.F(8.2f);
+        _lblSec.Font = Theme.F(8.5f);
         _lblSec.AutoSize = false;
-        _lblSec.SetBounds(20, 74 + names.Length * 42 + 16, 182, 40);
+        _lblSec.SetBounds(Theme.Sp16, navTop + names.Length * navStep + Theme.Sp16,
+            180, 40);
         _navPanel.Controls.Add(_lblSec);
 
         Panel bottom = new Panel();
@@ -13187,7 +19935,7 @@ class SettingsForm : Form
         ok.FillColor = Theme.Accent;
         ok.HoverColor = Theme.AccentHover;
         ok.TextColor = Color.White;
-        ok.Radius = 10;
+        ok.Radius = Theme.RadCard;
         ok.Font = Theme.F(9.5f);
         ok.Size = new Size(96, 36);
         ok.Click += delegate { Save(); };
@@ -13197,7 +19945,7 @@ class SettingsForm : Form
         cancel.BorderColor = Theme.Line;
         cancel.FillColor = Color.White;
         cancel.HoverColor = Theme.Hover;
-        cancel.Radius = 10;
+        cancel.Radius = Theme.RadCard;
         cancel.Font = Theme.F(9.5f);
         cancel.Size = new Size(88, 36);
         cancel.Click += delegate { DialogResult = DialogResult.Cancel; Close(); };
@@ -13206,8 +19954,8 @@ class SettingsForm : Form
         bottom.Controls.Add(cancel);
         bottom.Layout += delegate
         {
-            cancel.Location = new Point(bottom.ClientSize.Width - 22 - cancel.Width, 14);
-            ok.Location = new Point(cancel.Left - 10 - ok.Width, 14);
+            cancel.Location = new Point(bottom.ClientSize.Width - Theme.Px(22) - cancel.Width, Theme.Px(14));
+            ok.Location = new Point(cancel.Left - Theme.Px(10) - ok.Width, Theme.Px(14));
         };
 
         _content = new Panel();
@@ -13258,7 +20006,7 @@ class SettingsForm : Form
         b.BorderColor = Theme.Line;
         b.FillColor = Color.White;
         b.HoverColor = Theme.Hover;
-        b.Radius = 9;
+        b.Radius = Theme.RadRow;
         b.Font = Theme.F(9f);
         b.SetBounds(x, y, w, h);
         return b;
@@ -13283,13 +20031,13 @@ class SettingsForm : Form
         l.AutoSize = true;
         l.ForeColor = Theme.Fg;
         l.BackColor = Theme.Bg;
-        l.Font = Theme.FB(11f);
+        l.Font = Theme.FB(10.5f);
         return l;
     }
 
-    FieldBox MakeField(Panel p, int x, int y, int w, int h, bool multiline)
+    FieldBox MakeField(Panel p, int x, int y, int w, int h, bool multiline, bool password = false)
     {
-        FieldBox f = new FieldBox(multiline);
+        FieldBox f = new FieldBox(multiline, password);
         f.SetBounds(x, y, w, h);
         f.BackColor = p.BackColor;
         p.Controls.Add(f);
@@ -13299,8 +20047,8 @@ class SettingsForm : Form
     static RoundedPanel Card(Panel p, int x, int y, int w, int h)
     {
         RoundedPanel c = new RoundedPanel();
-        c.Radius = 12;
-        c.Fill = Color.White;
+        c.Radius = 10;
+        c.Fill = Theme.Card;
         c.BorderColor = Theme.Line;
         c.BackColor = p.BackColor;
         c.SetBounds(x, y, w, h);
@@ -13322,7 +20070,7 @@ class SettingsForm : Form
         p.Controls.Add(Label2("工作目录", 28, 96));
         FieldBox cwd = MakeField(p, 120, 90, 560, 34, false);
         _cwdBox = cwd;
-        _txtCwd = (TextBox)cwd.Inner;
+        _txtCwd = (UiEditor)cwd.Inner;
         UiButton pick = Btn("选择…", 692, 90, 84, 34);
         _btnPickCwd = pick;
         pick.Click += delegate
@@ -13339,16 +20087,19 @@ class SettingsForm : Form
 
         p.Controls.Add(Label2("上下文 num_ctx", 28, 168));
         FieldBox ctx = MakeField(p, 164, 162, 130, 34, false);
+        ctx.DrawBorder = false;                   // 同三个下拉：外框描边关掉，只留里面这颗 UiDrop 自己的描边
+        ctx.Radius = Theme.RadRow;
         ctx.Controls.Remove(ctx.Inner);
         _cmbCtx = new UiDrop();
         _cmbCtx.Text = "8192";
         _cmbCtx.FillColor = Color.White;
+        _cmbCtx.BorderColor = Theme.Line;
         _cmbCtx.HoverColor = Theme.Hover;
-        _cmbCtx.BorderColor = Theme.Clear;
-        _cmbCtx.Radius = 8;
-        _cmbCtx.Font = Theme.F(9f);
+        _cmbCtx.Radius = Theme.RadRow;
+        _cmbCtx.Font = Theme.F(9.5f);
         _cmbCtx.AddRange(new object[] { "2048", "4096", "8192", "16384", "32768" });
-        _cmbCtx.SetBounds(4, 3, 122, 28);
+        // 摆位交给 LayoutFields（DPI 放大后它会按 FieldBox 的实际尺寸铺满，不再"小下拉框待在空框左上角"）
+        _cmbCtx.SetBounds(Theme.Px(1), Theme.Px(1), ctx.Width - Theme.Px(2), Theme.Px(Theme.CtrlHeight));
         ctx.Controls.Add(_cmbCtx);
         Label ctxHint = Label2("本地模型越大越慢；云端模型由服务商决定", 306, 169);
         ctxHint.ForeColor = Theme.FgFaint;
@@ -13358,11 +20109,10 @@ class SettingsForm : Form
         p.Controls.Add(Label2("单轮最多工具步数", 28, 216));
         FieldBox steps = MakeField(p, 176, 210, 92, 34, false);
         steps.Controls.Remove(steps.Inner);
-        _numSteps = new NumericUpDown();
+        _numSteps = new UiNumber();
         _numSteps.Minimum = 1;
         _numSteps.Maximum = 200;
-        _numSteps.BorderStyle = BorderStyle.None;
-        _numSteps.BackColor = Color.White;
+        _numSteps.BackColor = Theme.Card;
         _numSteps.ForeColor = Theme.Fg;
         _numSteps.Font = Theme.F(9.5f);
         _numSteps.SetBounds(10, 8, 72, 22);
@@ -13371,11 +20121,10 @@ class SettingsForm : Form
         p.Controls.Add(Label2("命令超时（秒）", 300, 216));
         FieldBox timeout = MakeField(p, 424, 210, 100, 34, false);
         timeout.Controls.Remove(timeout.Inner);
-        _numTimeout = new NumericUpDown();
+        _numTimeout = new UiNumber();
         _numTimeout.Minimum = 5;
         _numTimeout.Maximum = 3600;
-        _numTimeout.BorderStyle = BorderStyle.None;
-        _numTimeout.BackColor = Color.White;
+        _numTimeout.BackColor = Theme.Card;
         _numTimeout.ForeColor = Theme.Fg;
         _numTimeout.Font = Theme.F(9.5f);
         _numTimeout.SetBounds(10, 8, 80, 22);
@@ -13387,7 +20136,7 @@ class SettingsForm : Form
         ch.Text = "审批与安全";
         ch.Font = Theme.FB(10f);
         ch.ForeColor = Theme.Fg;
-        ch.BackColor = Color.White;
+        ch.BackColor = Theme.Card;
         ch.AutoSize = true;
         ch.Location = new Point(20, 18);
         card.Controls.Add(ch);
@@ -13396,16 +20145,19 @@ class SettingsForm : Form
         // 权限档：三档（仅可查看 / 工作区内修改 / 完全权限），和输入条上那个浮层是同一套取值
         Label pl = new Label();
         pl.Text = "权限档";
-        pl.Font = Theme.F(9f);
+        pl.Font = Theme.F(9.5f);
         pl.ForeColor = Theme.FgMid;
-        pl.BackColor = Color.White;
+        pl.BackColor = Theme.Card;
         pl.AutoSize = true;
         pl.Location = new Point(20, 85);
         card.Controls.Add(pl);
         _cmbPerm = new UiDrop();
-        _cmbPerm.Font = Theme.F(9f);
-        _cmbPerm.Radius = 8;
-        _cmbPerm.Padding = new Padding(10, 0, 10, 0);
+        _cmbPerm.FillColor = Color.White;         // 原来没设 → 落到 UiButton 默认的灰底，和另外两个下拉不是一套
+        _cmbPerm.BorderColor = Theme.Line;
+        _cmbPerm.HoverColor = Theme.Hover;
+        _cmbPerm.Font = Theme.F(9.5f);
+        _cmbPerm.Radius = Theme.RadRow;
+        _cmbPerm.Padding = new Padding(Theme.Sp12, 0, Theme.Sp12, 0);
         for (int i = 0; i < Perm.Labels.Length; i++) _cmbPerm.Items.Add(Perm.Labels[i]);
         _cmbPerm.SelectedItem = Perm.Label(_c.permission);
         _cmbPerm.SelectedIndexChanged += delegate
@@ -13415,21 +20167,27 @@ class SettingsForm : Form
             _c.auto_yes = Perm.AutoYes(lv);
             if (_onPermChanged != null) _onPermChanged(lv);
         };
-        _cmbPerm.SetBounds(90, 80, 150, 26);
+        _cmbPerm.SetBounds(90, 80, 150, Theme.Px(Theme.CtrlHeight));
         card.Controls.Add(_cmbPerm);
         _chkOutside = Check2(card, "允许访问工作目录以外的路径（关闭沙箱）", 20, 112);
         _chkVerify = Check2(card, "改完文件后自动跑一次项目验证（测试/编译），失败自动回灌给模型", 20, 142);
         _chkHideThink = Check2(card, "思考过程只进「轨迹」页（对话区不被长思考一直往上顶，推荐开）", 20, 172);
+        // 意图澄清：发指令后先跑一次歧义检测（固定用 deepseek-flash），有歧义就弹框让你选具体方向
+        _chkClarify = Check2(card, "发指令前先做一次意图澄清（用 deepseek-flash 判歧义，模糊时弹框让你选具体方向）", 20, 202);
+        _chkRemote = Check2(card, "高危操作走「Ahz 通信台」远程审批（需要先启动控制台；通信台不可用时回退本地弹窗）", 20, 232);
     }
 
-    CheckBox Check2(Control parent, string text, int x, int y)
+    UiCheck Check2(Control parent, string text, int x, int y)
     {
-        CheckBox c = new CheckBox();
-        c.Text = text;
+        UiCheck c = new UiCheck();
+        c.Label = text;
         c.Location = new Point(x, y);
-        c.AutoSize = true;
+        c.Font = Theme.F(9.5f);
         c.ForeColor = Theme.FgMid;
         c.BackColor = parent.BackColor;
+        int w = Math.Min(Theme.Px(700), Ui.TextWidth(text, c.Font) + Theme.Px(34));
+        c.Size = new Size(Math.Max(Theme.Px(120), w), Theme.Px(23));
+        c.AccessibleName = text;
         parent.Controls.Add(c);
         return c;
     }
@@ -13446,6 +20204,8 @@ class SettingsForm : Form
         _chkOutside.Checked = _c.allow_outside;
         _chkVerify.Checked = _c.auto_verify;
         _chkHideThink.Checked = _c.hide_thinking;
+        _chkClarify.Checked = _c.clarify;
+        _chkRemote.Checked = _c.remote_approval;
     }
 
     // ---------- 模型 ----------
@@ -13546,15 +20306,15 @@ class SettingsForm : Form
 
         RoundedPanel listCard = Card(p, 24, 92, 240, 396);
         _lstCard = listCard;
-        listCard.Padding = new Padding(5);
-        _lstProviders = new ListBox();
+        listCard.Padding = new Padding(Theme.Sp4);
+        _lstProviders = new UiList();
         _lstProviders.Dock = DockStyle.Fill;
         _lstProviders.BorderStyle = BorderStyle.None;
-        _lstProviders.BackColor = Color.White;
+        _lstProviders.BackColor = Theme.Card;
         _lstProviders.ForeColor = Theme.Fg;
         _lstProviders.Font = Theme.F(9.5f);
         _lstProviders.DrawMode = DrawMode.OwnerDrawFixed;
-        _lstProviders.ItemHeight = 30;
+        _lstProviders.ItemHeight = Theme.RowHeight;
         _lstProviders.IntegralHeight = false;
         _lstProviders.DrawItem += delegate(object s, DrawItemEventArgs e)
         {
@@ -13567,7 +20327,7 @@ class SettingsForm : Form
             TextRenderer.DrawText(e.Graphics, pv.name, Theme.F(9.5f), tr, Theme.Fg,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine);
             string sub = pv.type == "ollama" ? "本地" : "云端";
-            TextRenderer.DrawText(e.Graphics, sub, Theme.F(8.2f), tr, Theme.FgFaint,
+            TextRenderer.DrawText(e.Graphics, sub, Theme.F(8.5f), tr, Theme.FgFaint,
                 TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
         };
         _lstProviders.SelectedIndexChanged += delegate { LoadProviderFields(); };
@@ -13583,8 +20343,8 @@ class SettingsForm : Form
         {
             Provider sel = _lstProviders.SelectedItem as Provider;
             if (sel == null) return;
-            if (_c.providers.Count <= 1) { MessageBox.Show(this, "至少要保留一个提供商。", "Ahz Scribe"); return; }
-            if (MessageBox.Show(this, "确定删除「" + sel.name + "」？", "Ahz Scribe", MessageBoxButtons.OKCancel) != DialogResult.OK) return;
+            if (_c.providers.Count <= 1) { UiMsg.Show(this, "至少要保留一个提供商。", "Ahz Scribe"); return; }
+            if (UiMsg.Show(this, "确定删除「" + sel.name + "」？", "Ahz Scribe", MessageBoxButtons.OKCancel) != DialogResult.OK) return;
             _c.providers.Remove(sel);
             RefreshProviderList();
             _lblHint.Text = "已删除「" + sel.name + "」";
@@ -13594,7 +20354,7 @@ class SettingsForm : Form
         int lx = 272, fx = 380;
         p.Controls.Add(Label2("名称", lx, 88));
         FieldBox nameB = MakeField(p, fx, 80, 370, 34, false);      // 四行输入框统一 370 宽，看着才齐
-        _txtName = (TextBox)nameB.Inner;
+        _txtName = (UiEditor)nameB.Inner;
         _txtName.TextChanged += delegate
         {
             StoreProviderFields();
@@ -13603,21 +20363,24 @@ class SettingsForm : Form
 
         p.Controls.Add(Label2("类型", lx, 136));
         FieldBox typeB = MakeField(p, fx, 128, 370, 34, false);
+        typeB.DrawBorder = false;                 // 外框不画描边：三个下拉统一"白底 + 1px Line 描边"，不再套双层框
+        typeB.Radius = Theme.RadRow;
         typeB.Controls.Remove(typeB.Inner);
-        _cmbType = new ComboBox();
-        _cmbType.DropDownStyle = ComboBoxStyle.DropDownList;
-        _cmbType.FlatStyle = FlatStyle.Flat;
-        _cmbType.BackColor = Color.White;
-        _cmbType.ForeColor = Theme.Fg;
+        _cmbType = new UiDrop();
+        _cmbType.FillColor = Color.White;
+        _cmbType.BorderColor = Theme.Line;
+        _cmbType.HoverColor = Theme.Hover;
+        _cmbType.Radius = Theme.RadRow;
         _cmbType.Font = Theme.F(9.5f);
         _cmbType.Items.AddRange(new object[] { "本地 Ollama", "OpenAI 兼容接口（DeepSeek / OpenAI / Kimi / 智谱 …）" });
-        _cmbType.SetBounds(8, 5, 344, 24);
+        _tip.SetToolTip(_cmbType, "本地 Ollama / OpenAI 兼容接口（DeepSeek / OpenAI / Kimi / 智谱 …）");
+        _cmbType.SetBounds(Theme.Px(1), Theme.Px(1), typeB.Width - Theme.Px(2), Theme.Px(Theme.CtrlHeight));
         _cmbType.SelectedIndexChanged += delegate { StoreProviderFields(); };
         typeB.Controls.Add(_cmbType);
 
         p.Controls.Add(Label2("接口地址", lx, 184));
         FieldBox baseB = MakeField(p, fx, 176, 370, 34, false);
-        _txtBase = (TextBox)baseB.Inner;
+        _txtBase = (UiEditor)baseB.Inner;
         _txtBase.TextChanged += delegate { StoreProviderFields(); };
         Label bh = Label2("例如 https://api.deepseek.com/v1 或 http://127.0.0.1:11434", fx, 214);
         bh.ForeColor = Theme.FgFaint;
@@ -13625,8 +20388,8 @@ class SettingsForm : Form
         p.Controls.Add(bh);
 
         p.Controls.Add(Label2("API Key", lx, 246));
-        FieldBox keyB = MakeField(p, fx, 238, 370, 34, false);      // 智谱的 Key 很长，这里给满剩下的宽度
-        _txtKey = (TextBox)keyB.Inner;
+        FieldBox keyB = MakeField(p, fx, 238, 370, 34, false, true);      // 智谱的 Key 很长，这里给满剩下的宽度
+        _txtKey = (UiPasswordBox)keyB.Inner;
         _txtKey.UseSystemPasswordChar = true;
         _txtKey.TextChanged += delegate
         {
@@ -13636,21 +20399,24 @@ class SettingsForm : Form
                 && _txtBase.Text.Trim().Length > 0 && _txtKey.Text.Trim().Length > 0)
                 _lblHint.Text = "点「从接口拉取模型」就能拿到这个 Key 能用的模型";
         };
-        _chkShowKey = new CheckBox();
-        _chkShowKey.Text = "显示";
+        _chkShowKey = new UiCheck();
+        _chkShowKey.Label = "显示";
+        _chkShowKey.AccessibleName = "显示 API Key";
+        _chkShowKey.Font = Theme.F(9.5f);
+        _chkShowKey.Size = new Size(Theme.Px(84), Theme.Px(23));
         // 「显示」挪到"API Key"标签和输入框之间：这样密钥框能吃到整行剩下的宽度（长 Key 才看得全）
         _chkShowKey.Location = new Point(lx + 62, 246);
-        _chkShowKey.AutoSize = true;
         _chkShowKey.ForeColor = Theme.FgMid;
+        _chkShowKey.BackColor = p.BackColor;
         _chkShowKey.CheckedChanged += delegate { _txtKey.UseSystemPasswordChar = !_chkShowKey.Checked; };
         p.Controls.Add(_chkShowKey);
 
         p.Controls.Add(Label2("模型列表（每行一个）", lx, 286));
         FieldBox modelsB = MakeField(p, fx, 306, 370, 172, true);
         _modelsBox = modelsB;
-        _txtModels = (TextBox)modelsB.Inner;
+        _txtModels = (UiEditor)modelsB.Inner;
         _txtModels.Multiline = true;
-        _txtModels.ScrollBars = ScrollBars.Vertical;
+        _txtModels.ScrollBars = ScrollBars.None;
         _txtModels.WordWrap = false;
         _txtModels.TextChanged += delegate
         {
@@ -13666,9 +20432,11 @@ class SettingsForm : Form
         // 提示语放在按钮下面一整行：原来贴在按钮右边，长一点就被挤出屏幕外（"格式乱了"）
         _lblHint = Label2("", fx, 526);
         _lblHint.AutoSize = false;
+        _lblHint.AutoEllipsis = true;
         _lblHint.TextAlign = ContentAlignment.MiddleLeft;
         _lblHint.SetBounds(fx, 526, 540, 22);
         _lblHint.ForeColor = Theme.FgDim;
+        _lblHint.TextChanged += delegate { _tip.SetToolTip(_lblHint, _lblHint.Text); };
         p.Controls.Add(_lblHint);
 
         // 页面一改尺寸就重排：按钮按"当前页面高度"算位置，绝不再被推到可视区外
@@ -13695,6 +20463,8 @@ class SettingsForm : Form
                 int cardTop = Theme.Px(264);
                 int cardH = Theme.Px(182);
                 if (_chkHideThink != null) cardH = Math.Max(cardH, _chkHideThink.Bottom + Theme.Px(18));
+                if (_chkClarify != null) cardH = Math.Max(cardH, _chkClarify.Bottom + Theme.Px(18));
+                if (_chkRemote != null) cardH = Math.Max(cardH, _chkRemote.Bottom + Theme.Px(18));
                 _generalCard.SetBounds(Theme.Px(24), cardTop, Math.Max(Theme.Px(300), pageW - Theme.Px(48)), cardH);
             }
         }
@@ -13715,20 +20485,20 @@ class SettingsForm : Form
         _logTip.ForeColor = Theme.FgDim;
         p.Controls.Add(_logTip);
 
-        _logBox = new TextBox();
+        _logBox = new UiDiff();
         _logBox.Multiline = true;
         _logBox.ReadOnly = true;
-        _logBox.ScrollBars = ScrollBars.Both;
-        _logBox.WordWrap = false;
+        _logBox.ScrollBars = ScrollBars.None;
+        _logBox.WordWrap = true;
         _logBox.Font = new Font("Consolas", 9.5f);
-        _logBox.BackColor = Color.White;
+        _logBox.BackColor = Theme.Card;
         _logBox.ForeColor = Theme.Fg;
-        _logBox.BorderStyle = BorderStyle.FixedSingle;
+        _logBox.BorderStyle = BorderStyle.None;
         // 位置/大小交给 LayoutLogPage：Anchor 在 DPI 放大后会把控件推出可视区
         p.Controls.Add(_logBox);
 
         _btnLogRefresh = Btn("刷新", 0, 0, 88, 34);
-        _btnLogRefresh.Click += delegate { LoadLogText(); };
+        _btnLogRefresh.Click += delegate { RequestLogRefresh(); };
         p.Controls.Add(_btnLogRefresh);
 
         _btnLogOpen = Btn("打开日志文件", 0, 0, 140, 34);
@@ -13753,12 +20523,40 @@ class SettingsForm : Form
         LoadLogText();
     }
 
+    // 日志页刷新（2026-10-16 防抖版）：
+    //   1) 只读末尾 64KB —— 日志可以很大，整读会把 UI 拖住；
+    //   2) 内容没变就一个像素都不动 —— 也不动滚动位置（以前每次都 ScrollToCaret 把用户顶到底部）；
+    //   3) 短时间内的多次请求合并成一次（120ms），连点刷新也不会反复整屏重排。
+    string _logShown;
+    System.Windows.Forms.Timer _logDebounce;
+
+    void RequestLogRefresh()
+    {
+        if (_logDebounce == null)
+        {
+            _logDebounce = new System.Windows.Forms.Timer();
+            _logDebounce.Interval = 120;
+            _logDebounce.Tick += delegate { _logDebounce.Stop(); LoadLogText(); };
+        }
+        _logDebounce.Stop();
+        _logDebounce.Start();
+    }
+
     void LoadLogText()
     {
         if (_logBox == null) return;
-        _logBox.Text = Log.Read();
-        _logBox.SelectionStart = _logBox.TextLength;
-        _logBox.ScrollToCaret();
+        string text;
+        try { text = Log.ReadTail(64 * 1024); }
+        catch (Exception ex) { Log.Swallow(ex, "读日志尾巴"); return; }
+        if (text == _logShown) return;              // 没变就一个像素都不动
+        bool atBottom = _logBox.SelectionStart >= _logBox.TextLength - 1;
+        _logShown = text;
+        _logBox.Text = text;
+        if (atBottom)                                // 用户本来就在底部才跟着走，否则保住他的浏览位置
+        {
+            _logBox.SelectionStart = _logBox.TextLength;
+            _logBox.ScrollToCaret();
+        }
     }
 
     // 位置全按页面实际尺寸算：日志框撑满（底部给按钮留一条），按钮排在框下面
@@ -13767,18 +20565,18 @@ class SettingsForm : Form
         if (_logPage == null || _logBox == null || _btnLogRefresh == null) return;
         int pageW = _logPage.ClientSize.Width;
         int pageH = _logPage.ClientSize.Height;
-        int pad = Theme.Px(28);
+        int pad = Theme.Px(Theme.Sp24);
         int top = Theme.Px(92);
         int btnH = Theme.Px(34);
-        int gap = Theme.Px(12);
-        int boxH = Math.Max(Theme.Px(120), pageH - top - btnH - gap - Theme.Px(24));
+        int gap = Theme.Px(Theme.Sp12);
+        int boxH = Math.Max(Theme.Px(120), pageH - top - btnH - gap - Theme.Px(Theme.Sp24));
         _logBox.SetBounds(pad, top, Math.Max(Theme.Px(200), pageW - pad * 2), boxH);
 
         int by = top + boxH + gap;
         int w1 = Theme.Px(88), w2 = Theme.Px(140), w3 = Theme.Px(88);
         _btnLogRefresh.SetBounds(pad, by, w1, btnH);
-        _btnLogOpen.SetBounds(pad + w1 + Theme.Px(10), by, w2, btnH);
-        _btnLogClear.SetBounds(pad + w1 + Theme.Px(10) + w2 + Theme.Px(10), by, w3, btnH);
+        _btnLogOpen.SetBounds(pad + w1 + Theme.Px(Theme.Sp8), by, w2, btnH);
+        _btnLogClear.SetBounds(pad + w1 + Theme.Px(Theme.Sp8) + w2 + Theme.Px(Theme.Sp8), by, w3, btnH);
     }
 
     void LayoutModelPage()
@@ -13811,6 +20609,7 @@ class SettingsForm : Form
     {
         StoreProviderFields();
         ContextMenuStrip m = new ContextMenuStrip();
+        MenuRound.Apply(m);
         m.Items.Add("空白（自己填接口地址）", null, delegate { AddProviderFromPreset(null); });
         m.Items.Add(new ToolStripSeparator());
         foreach (Preset ps in Presets)
@@ -13904,8 +20703,49 @@ class SettingsForm : Form
         _txtBase.Text = p.base_url;
         _txtKey.Text = p.api_key;
         _txtModels.Text = p.models == null ? "" : string.Join("\r\n", p.models.ToArray());
-        _lblHint.Text = "";
+        // 之前"拉取"时接口声明过的能力，这里不联网就能标一眼
+        _lblHint.Text = CapabilitySummary(p);
+        _tip.SetToolTip(_modelsBox, CapabilityDetail(p));
         _loading = false;
+    }
+
+    // 接口声明过什么能力（读 config 里存着的那份，不联网）
+    static string CapabilitySummary(Provider p)
+    {
+        int vis = 0, eff = 0, known = 0;
+        if (p != null && p.model_meta != null)
+            foreach (KeyValuePair<string, ModelMeta> kv in p.model_meta)
+            {
+                ModelMeta m = kv.Value;
+                if (m == null) continue;
+                known++;
+                if (m.vision == true) vis++;
+                if (m.efforts != null && m.efforts.Count >= 2) eff++;
+            }
+        if (known == 0) return "";
+        return "接口声明过：" + (vis > 0 ? ("能看图 " + vis + " 个") : "没有能看图的")
+            + " · " + (eff > 0 ? ("能调档 " + eff + " 个") : "都不支持调档")
+            + "（明细：鼠标停在上面那栏模型列表上）";
+    }
+
+    // 每个模型一行明细：显示名 / 能不能看图 / 档位 / 上下文长度
+    static string CapabilityDetail(Provider p)
+    {
+        if (p == null || p.model_meta == null || p.model_meta.Count == 0)
+            return "还没从接口拉过这个提供商的清单 —— 点「从接口拉取模型」，接口声明的能力会一起记下来。";
+        StringBuilder sb = new StringBuilder();
+        foreach (KeyValuePair<string, ModelMeta> kv in p.model_meta)
+        {
+            ModelMeta m = kv.Value;
+            if (m == null) continue;
+            if (sb.Length > 0) sb.Append("\n");
+            sb.Append(m.Display(m.id));
+            sb.Append(m.vision == true ? "：能看图" : (m.vision == false ? "：纯文本" : "：看图能力未知"));
+            if (m.efforts != null && m.efforts.Count >= 2)
+                sb.Append(" · 档位 " + string.Join("/", m.efforts.ToArray()));
+            if (m.ctx > 0) sb.Append(" · 上下文 " + m.ctx);
+        }
+        return sb.ToString();
     }
 
     void StoreProviderFields()
@@ -13943,7 +20783,7 @@ class SettingsForm : Form
         if (p.base_url.Trim().Length == 0)
         {
             _lblHint.Text = "先填接口地址";
-            MessageBox.Show(this, "还没有填接口地址。\n在「名称」里写平台名（deepseek / glm / kimi …）会自动填上。",
+            UiMsg.Show(this, "还没有填接口地址。\n在「名称」里写平台名（deepseek / glm / kimi …）会自动填上。",
                 "拉取模型列表", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
@@ -13953,19 +20793,19 @@ class SettingsForm : Form
         try
         {
             ILlm llm = LlmFactory.Create(p, "");
-            List<string> models = llm.ListModels();
+            List<ModelMeta> infos = llm.ListModelInfos();
             llm.Close();
-            if (models.Count == 0)
+            if (infos.Count == 0)
             {
                 _lblHint.Text = "接口没返回任何模型";
                 return;
             }
-            _lblHint.Text = MergeModelList(models);
+            _lblHint.Text = MergeModelList(p, infos);
         }
         catch (Exception ex)
         {
             _lblHint.Text = "拉取失败";
-            MessageBox.Show(this, ex.Message + "\n\n检查一下接口地址、API Key，以及这个平台是否兼容 OpenAI 的 /models 接口。",
+            UiMsg.Show(this, ex.Message + "\n\n检查一下接口地址、API Key，以及这个平台是否兼容 OpenAI 的 /models 接口。",
                 "拉取模型列表失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
         finally
@@ -13974,8 +20814,9 @@ class SettingsForm : Form
         }
     }
 
-    // 把拉到的模型并进"模型列表"：已有的保留，只补新的（换 Key / 重拉都不会把你手写的删掉）
-    string MergeModelList(List<string> fetched)
+    // 把拉到的模型并进"模型列表"：已有的保留，只补新的（换 Key / 重拉都不会把你手写的删掉）；
+    // 顺手把接口给的能力标签（显示名 / 能不能看图 / 档位 / 上下文）存进这个提供商。
+    string MergeModelList(Provider p, List<ModelMeta> infos)
     {
         List<string> have = new List<string>();
         foreach (string line in _txtModels.Text.Replace("\r\n", "\n").Split('\n'))
@@ -13984,18 +20825,29 @@ class SettingsForm : Form
             if (m.Length > 0 && !have.Contains(m)) have.Add(m);
         }
         int added = 0;
-        foreach (string m in fetched)
+        foreach (ModelMeta mi in infos)
         {
-            if (m == null || m.Trim().Length == 0) continue;
-            if (!have.Contains(m)) { have.Add(m); added++; }
+            if (mi == null || mi.id == null || mi.id.Trim().Length == 0) continue;
+            if (!have.Contains(mi.id)) { have.Add(mi.id); added++; }
+            if (p != null) p.SetMeta(mi);        // 能力标签：拉一次记一次
         }
         _loading = true;
         _txtModels.Text = string.Join("\r\n", have.ToArray());
         _loading = false;
         StoreProviderFields();
-        return added > 0
-            ? ("接口返回 " + fetched.Count + " 个，新增 " + added + " 个（共 " + have.Count + " 个）")
-            : ("接口返回 " + fetched.Count + " 个，都已经在列表里了");
+        _tip.SetToolTip(_modelsBox, CapabilityDetail(p));
+        // 提示语一行放不下太多字：这里只报"个数"，明细挂在模型列表的悬停提示里
+        int vis = 0, eff = 0;
+        foreach (ModelMeta mi in infos)
+        {
+            if (mi == null) continue;
+            if (mi.vision == true) vis++;
+            if (mi.efforts != null && mi.efforts.Count >= 2) eff++;
+        }
+        string head = added > 0
+            ? ("接口返回 " + infos.Count + " 个，新增 " + added + " 个（共 " + have.Count + " 个）")
+            : ("接口返回 " + infos.Count + " 个，都已经在列表里了");
+        return head + " · 能看图 " + vis + " 个 · 能调档 " + eff + " 个";
     }
 
     // ---------- 关于 ----------
@@ -14033,11 +20885,11 @@ class SettingsForm : Form
             + "· 写文件 / 改文件 / 执行命令前会征求你同意\n"
             + "· 危险命令（format、diskpart、shutdown 等）直接拒绝\n"
             + "· 对话记录保存在程序目录的 sessions.json\n\n"
-            + "API Key 保存在程序目录的 config.json 里（明文），请注意保管。";
+            + "API Key 保存在程序目录的 config.json 里（DPAPI 加密，仅当前 Windows 用户可解）。";
         d.Location = new Point(22, 20);
         d.AutoSize = true;
         d.ForeColor = Theme.FgMid;
-        d.BackColor = Color.White;
+        d.BackColor = Theme.Card;
         card.Controls.Add(d);
     }
 
@@ -14056,6 +20908,8 @@ class SettingsForm : Form
         _c.allow_outside = _chkOutside.Checked;
         _c.auto_verify = _chkVerify.Checked;
         _c.hide_thinking = _chkHideThink.Checked;
+        _c.clarify = _chkClarify.Checked;
+        _c.remote_approval = _chkRemote.Checked;
 
         // 保证当前选中的提供商/模型仍然有效
         Provider cur = _c.Current();
@@ -14110,6 +20964,14 @@ static class CliProgram
                 continue;
             }
             if (a == "-y" || a == "--yes") { config.auto_yes = true; continue; }
+            // 高危操作改走「Ahz 通信台」网页控制台审批（等用户在手机/网页上点批准或拒绝）
+            if (a == "--remote-approval") { config.remote_approval = true; continue; }
+            if (a == "--remote-wait" && i + 1 < args.Length)
+            {
+                int v; if (int.TryParse(args[++i], out v) && v > 0) config.remote_approval_wait = v;
+                continue;
+            }
+            if (a == "--remote-script" && i + 1 < args.Length) { config.remote_approval_script = args[++i]; continue; }
             if (a == "--models") { listOnly = true; continue; }
             // ---- 快照：列出 / 恢复（升级需求 P0-2，弥补这台机器没有 git）----
             if (a == "--snapshots") { snapList = true; continue; }
@@ -14145,7 +21007,7 @@ static class CliProgram
             try
             {
                 ILlm probe = LlmFactory.Create(provider, config.model);
-                List<string> names = probe.ListModels();
+                List<string> names = LlmFactory.Ids(probe.ListModelInfos());
                 probe.Close();
                 foreach (string nm in names) Console.WriteLine(nm);
                 return 0;
@@ -14286,7 +21148,7 @@ static class Program
         System.Threading.Mutex single = new System.Threading.Mutex(true, "AhzScribe_SingleInstance", out createdNew);
         if (!createdNew)
         {
-            MessageBox.Show("Ahz Scribe 已经在运行了。\n请使用已打开的那个窗口；数据文件不能被两个实例同时写。",
+            UiMsg.Show("Ahz Scribe 已经在运行了。\n请使用已打开的那个窗口；数据文件不能被两个实例同时写。",
                 "Ahz Scribe", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return 0;
         }
@@ -14306,7 +21168,7 @@ static class Program
         }
         catch (Exception ex)
         {
-            MessageBox.Show("Ahz Scribe 启动失败：\n" + ex.Message, "Ahz Scribe", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            UiMsg.Show("Ahz Scribe 启动失败：\n" + ex.Message, "Ahz Scribe", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 1;
         }
         finally
@@ -14317,3 +21179,8 @@ static class Program
 #endif
     }
 }
+
+
+
+
+

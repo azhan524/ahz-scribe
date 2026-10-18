@@ -15,7 +15,15 @@ if not exist "%CSC%" (
     exit /b 1
 )
 
-set "REFS=/r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll"
+set "REFS=/r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll /r:System.Security.dll /r:System.Net.Http.dll"
+rem 内置浏览器的 Chromium 内核（CefSharp）：目录里有就带上引用，没有就退回 IE 内核编译
+if exist "%DIR%CefSharp.dll" set "REFS=%REFS% /r:%DIR%CefSharp.dll /r:%DIR%CefSharp.Core.dll /r:%DIR%CefSharp.WinForms.dll"
+rem 成熟编辑器 Scintilla：有 DLL 就旧栈输入条也启用（diff 仍保留 RichTextBox 回退）
+set "DEFS="
+if exist "%DIR%Scintilla.NET.dll" (
+    set "REFS=%REFS% /r:%DIR%Scintilla.NET.dll"
+    set "DEFS=/define:SCINTILLA"
+)
 set "SRC=%DIR%src\AhzScribe.cs"
 
 echo 编译器: %CSC%
@@ -28,14 +36,17 @@ rem   · 早先的版本更糟 —— 把"回退出 .new 成功了"当成"编译
 rem     BUILD_RESULT: UPDATED、退出 0，而正式版其实一个字都没更新。那正是本节要治的病。
 rem 所以：编译前记下 exe 的修改时间，编译后比对 —— 变了才算真的写成。
 for %%A in ("%DIR%AhzScribe.exe") do set "GUI_BEFORE=%%~tA"
+for %%A in ("%DIR%AhzScribe.exe") do set "GUI_BEFORE_SIZE=%%~zA"
 if not exist "%DIR%AhzScribe.exe" set "GUI_BEFORE=__none__"
 echo 正在编译窗口版 AhzScribe.exe ...
 "%CSC%" /nologo /target:winexe /out:"%DIR%AhzScribe.exe" /win32manifest:"%DIR%src\app.manifest" ^
-  %REFS% /win32icon:src\app.ico /optimize+ "%SRC%"
+  %DEFS% %REFS% /win32icon:src\app.ico /optimize+ "%SRC%"
 set "GUI_RC=%errorlevel%"
 for %%A in ("%DIR%AhzScribe.exe") do set "GUI_AFTER=%%~tA"
+for %%A in ("%DIR%AhzScribe.exe") do set "GUI_AFTER_SIZE=%%~zA"
 if not exist "%DIR%AhzScribe.exe" set "GUI_AFTER=__none__"
-if "%GUI_AFTER%"=="%GUI_BEFORE%" set "GUI_RC=1"
+rem 时间戳只到秒：同一秒内编译完会被误判成“没写成”，必须同时看文件大小。
+if "%GUI_AFTER%"=="%GUI_BEFORE%" if "%GUI_AFTER_SIZE%"=="%GUI_BEFORE_SIZE%" set "GUI_RC=1"
 
 if not "%GUI_RC%"=="0" (
     rem 正式版没更新（多半是程序还在运行占着 exe）→ 退到 .new，别让整次构建白费。
@@ -49,14 +60,16 @@ if not "%GUI_RC%"=="0" (
 
 rem ============ 命令行版 ============
 for %%A in ("%DIR%ahzscribe-cli.exe") do set "CLI_BEFORE=%%~tA"
+for %%A in ("%DIR%ahzscribe-cli.exe") do set "CLI_BEFORE_SIZE=%%~zA"
 if not exist "%DIR%ahzscribe-cli.exe" set "CLI_BEFORE=__none__"
 echo 正在编译命令行版 ahzscribe-cli.exe ...
 "%CSC%" /nologo /target:exe /define:CLI_BUILD /out:"%DIR%ahzscribe-cli.exe" ^
-  %REFS% /win32icon:src\app.ico /optimize+ "%SRC%"
+  %DEFS% %REFS% /win32icon:src\app.ico /optimize+ "%SRC%"
 set "CLI_RC=%errorlevel%"
 for %%A in ("%DIR%ahzscribe-cli.exe") do set "CLI_AFTER=%%~tA"
+for %%A in ("%DIR%ahzscribe-cli.exe") do set "CLI_AFTER_SIZE=%%~zA"
 if not exist "%DIR%ahzscribe-cli.exe" set "CLI_AFTER=__none__"
-if "%CLI_AFTER%"=="%CLI_BEFORE%" set "CLI_RC=1"
+if "%CLI_AFTER%"=="%CLI_BEFORE%" if "%CLI_AFTER_SIZE%"=="%CLI_BEFORE_SIZE%" set "CLI_RC=1"
 
 if not "%CLI_RC%"=="0" (
     call :try_new "ahzscribe-cli.exe" "/target:exe /define:CLI_BUILD /win32icon:src\app.ico /optimize+"
@@ -119,7 +132,7 @@ if exist "%DIR%devtools\filelock.cmd" (
     call "%DIR%devtools\filelock.cmd" --build-locked "%LOCKED%"
 )
 echo [*] 改写成 %OUTNAME%.new ...
-"%CSC%" /nologo /out:"%DIR%%OUTNAME%.new" %EXTRA% %REFS% "%SRC%"
+"%CSC%" /nologo /out:"%DIR%%OUTNAME%.new" %EXTRA% %DEFS% %REFS% "%SRC%"
 rem 必须先存下真实错误码：下面那些 if 命令会把它冲掉（errorlevel 是"上一条命令"的），
 rem 以前这里靠 IF 清 errorlevel 的副作用，结果外层把"回退成功"判成了"编译成功"。
 set "RC=%errorlevel%"
@@ -133,3 +146,5 @@ echo.
 echo [X] 编译失败，请把上面的报错发给我。
 echo BUILD_RESULT: FAILED
 exit /b 1
+
+

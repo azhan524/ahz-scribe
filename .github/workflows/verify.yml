@@ -1,0 +1,52 @@
+name: verify
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore Scintilla.NET for legacy build
+        shell: pwsh
+        run: |
+          dotnet restore migration\AhzScribe.Net10.Tests\AhzScribe.Net10.Tests.csproj
+          $pkg = Join-Path $env:USERPROFILE ".nuget\packages\scintilla.net\5.3.2.9"
+          Copy-Item (Join-Path $pkg "lib\net45\Scintilla.NET.dll") "Scintilla.NET.dll" -Force
+          New-Item -ItemType Directory -Force "packages\Scintilla.NET.5.3.2.9\build\x64" | Out-Null
+          Copy-Item (Join-Path $pkg "build\x64\Scintilla.dll") "packages\Scintilla.NET.5.3.2.9\build\x64\Scintilla.dll" -Force
+          Copy-Item (Join-Path $pkg "build\x64\Lexilla.dll") "packages\Scintilla.NET.5.3.2.9\build\x64\Lexilla.dll" -Force
+
+      - name: Build .NET Framework exe (system csc)
+        shell: cmd
+        run: build.cmd
+
+      - name: Build and run .NET 10 self-tests
+        shell: pwsh
+        run: |
+          dotnet build migration\AhzScribe.Net10.Tests\AhzScribe.Net10.Tests.csproj -c Release --nologo
+          $exe = "migration\AhzScribe.Net10.Tests\bin\Release\net10.0-windows\win-x64\AhzScribe.Net10.Tests.exe"
+          & $exe
+          if ($LASTEXITCODE -ne 0) { throw "NET10 tests failed: $LASTEXITCODE" }
+
+      - name: Publish self-contained .NET 10
+        shell: cmd
+        run: devtools\build-net10.cmd publish
+
+      - name: Browser UI lint
+        shell: pwsh
+        run: |
+          python tools\ui_lint.py browser-home.html
+          if ($LASTEXITCODE -ne 0) { throw "ui_lint failed: $LASTEXITCODE" }
+
+      # 说明：run-ui-tests.cmd / uiobserve 需要交互式桌面，GitHub 托管 runner 没有桌面，
+      # 这里只跑不依赖桌面的 .NET 10 自测；完整 UI 回归在本地 verify-all.cmd 跑。
