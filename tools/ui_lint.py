@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """审美体检（ui_lint）：把"好看"变成可判定的数字。
 
 用法：
@@ -13,6 +13,10 @@ import json
 import os
 import re
 import sys
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 EXTS = (".html", ".htm", ".css", ".scss", ".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte", ".md")
 TYPE_SCALE = {11, 12, 13, 14, 16, 18, 20, 24, 28, 32, 40, 48, 56, 64}
