@@ -3074,7 +3074,7 @@ class OpenAiLlm : ILlm
         req.ReadWriteTimeout = timeoutMs > 0 ? timeoutMs : 900000;
         req.KeepAlive = false;
         req.Accept = "application/json";
-        if (!string.IsNullOrEmpty(_p.api_key)) req.Headers["Authorization"] = "Bearer " + _p.api_key.Trim();
+        if (!string.IsNullOrEmpty(_p.api_key)) req.Headers[HttpRequestHeader.Authorization] = "Bearer " + _p.api_key.Trim();
         if (json != null)
         {
             byte[] data = Encoding.UTF8.GetBytes(json);
@@ -3212,6 +3212,8 @@ class OpenAiLlm : ILlm
             {
                 c.Timeout = System.Threading.Timeout.InfiniteTimeSpan;
                 hreq.Content = new StringContent(Json.Dump(payload), Encoding.UTF8, "application/json");
+                if (!string.IsNullOrEmpty(_p.api_key))
+                    hreq.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _p.api_key.Trim());
                 using (HttpResponseMessage resp = await c.SendAsync(hreq, HttpCompletionOption.ResponseHeadersRead, cts.Token))
                 {
                     if (!resp.IsSuccessStatusCode)
